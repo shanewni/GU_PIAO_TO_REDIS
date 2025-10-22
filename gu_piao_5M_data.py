@@ -522,7 +522,29 @@ class StockDataCollector:
         logging.error(f"所有服务器都无法获取 {full_code} 的数据")
         return None,None,None
     
+    def write_to_blk_files(self, market, stock_code):
+        """将股票代码写入两个blk文件"""
+        # 组合格式：market(1位) + stock_code(6位)
+        blk_code = f"{market}{stock_code}"
+        # 目标文件路径
+        file_paths = [
+            r"D:\zd_hbzq\T0002\blocknew\QBGRX.blk",
+            r"D:\new_tdx\T0002\blocknew\QBGRX.blk",
+            r"D:\zd_hbzq\T0002\blocknew\zxg.blk",
+            r"D:\new_tdx\T0002\blocknew\zxg.blk"
+        ]
+        
+        for file_path in file_paths:
+            try:
+                # 以追加模式写入，确保文件存在（不存在则创建）
+                with open(file_path, 'a', encoding='utf-8') as f:
+                    f.write(f"{blk_code}\n")
+                logging.info(f"成功将 {blk_code} 写入 {file_path}")
+            except Exception as e:
+                logging.error(f"写入文件 {file_path} 失败: {e}")
+
     def update_all_stocks(self):
+        self.stock_list = self.load_stock_list()
         """
         更新所有股票数据到Redis
         """
@@ -542,6 +564,7 @@ class StockDataCollector:
                     # ok = three_buy_variant(stock_data_frac,stock_data_high,stock_data_low)
                     ok = identify_three_buy_variant(stock_data_high,stock_data_low)
                     if  ok[-1] ==1.0 and full_code not in self.triggered_stocks:
+                        self.write_to_blk_files(market, stock_code)
                         logging.warning(f"强势背驰股票： {stock_code}")
                         winsound.Beep(1000, 500)  # 1000Hz频率，持续500毫秒
                         self.triggered_stocks.add(full_code)  # 记录已触发的股票
@@ -616,7 +639,7 @@ def main():
     主函数
     """
     # 配置参数
-    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\fl8.blk"
+    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\BSMJB.blk"
     UPDATE_INTERVAL = 2       # 更新间隔（秒）
     
     # 检查blk文件是否存在
