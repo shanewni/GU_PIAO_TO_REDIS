@@ -3,3 +3,4 @@ pyinstaller --onefile gu_piao_to_redis_id.py
 pyinstaller --onefile gu_piao_to_redis_junxian.py
 pyinstaller --onefile gu_piao_5M_data.py
 pyinstaller --onefile gu_piao_30M_data.py
+pyinstaller --onefile gu_piao_5M_jianlue_data.py

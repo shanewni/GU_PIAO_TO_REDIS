@@ -17,6 +17,7 @@ class StockSignalAnalyzer:
         self.blk_file_path = blk_file_path
         self.stock_list = self.load_stock_list()
         self.n = n  # NEAR_DOWN参数
+        self.triggered_stocks = set()  # 新增：用于记录已触发的股票代码
         self.servers = [
             ('152.136.167.10', 7709),
             ('36.153.42.16', 7709)
@@ -327,9 +328,10 @@ class StockSignalAnalyzer:
                     continue
 
                 signal, zg_value = self.calculate_buy_signal(kline_data)
-                if signal:
+                if signal and full_code not in self.triggered_stocks:
                     signal_count += 1
                     self.write_to_blk_files(market, stock_code)
+                    self.triggered_stocks.add(full_code)  # 记录已触发的股票
                     logging.warning(f"股票 {stock_code} 出现买入信号! ZG_VALUE: {zg_value:.2f}")
                     
             except Exception as e:

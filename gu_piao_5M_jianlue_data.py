@@ -14,7 +14,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('stock_data.log', encoding='utf-8'),
+        logging.FileHandler('stock_data_三段起爆.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -378,13 +378,13 @@ def identify_three_buy_variant(high, low):
         return pf_out
     
     # 取最近的3个向下线段
-    latest_seg, prev_seg, prev2_seg = down_segments[0], down_segments[1], down_segments[2]
+    latest_seg, prev_seg= down_segments[0], down_segments[1]
     
     # 条件1：低点依次降低
-    latest_low = low[latest_seg[1]]
-    prev_low = low[prev_seg[1]]
-    prev2_low = low[prev2_seg[1]]
-    if prev_low >= prev2_low or latest_low >= prev_low:
+    latest_high = high[latest_seg[0]]
+    prev_high = high[prev_seg[0]]
+
+    if latest_high >prev_high :
         return pf_out
     
     # 条件2：最后一根K线突破最近两个向下线段的起点高点之一
@@ -528,8 +528,8 @@ class StockDataCollector:
         blk_code = f"{market}{stock_code}"
         # 目标文件路径
         file_paths = [
-            r"D:\zd_hbzq\T0002\blocknew\QBGRX.blk",
-            r"D:\new_tdx\T0002\blocknew\QBGRX.blk",
+            r"D:\zd_hbzq\T0002\blocknew\JLQBG.blk",
+            r"D:\new_tdx\T0002\blocknew\JLQBG.blk",
             r"D:\zd_hbzq\T0002\blocknew\zxg.blk",
             r"D:\new_tdx\T0002\blocknew\zxg.blk"
         ]
@@ -566,7 +566,7 @@ class StockDataCollector:
                     if  ok[-1] ==1.0 and full_code not in self.triggered_stocks:
                         self.write_to_blk_files(market, stock_code)
                         logging.warning(f"强势背驰股票： {stock_code}")
-                        winsound.Beep(1000, 500)  # 1000Hz频率，持续500毫秒
+                        winsound.Beep(6000, 500)  # 1000Hz频率，持续500毫秒
                         self.triggered_stocks.add(full_code)  # 记录已触发的股票
                  
                     success_count += 1
