@@ -2,6 +2,7 @@ import logging
 import time
 import schedule
 import numpy as np
+import gupiaojichu
 from pytdx.hq import TdxHq_API
 
 # 配置日志
@@ -76,84 +77,6 @@ class StockSignalAnalyzer:
                 continue
         logging.error(f"所有服务器均无法获取 {full_code} 数据")
         return None
-
-    def identify_turns(self, high, low):
-        """对应通达信TDXDLL1(1,...)，即IdentifyTurns函数"""
-        data_len = len(high)
-        if len(low) != data_len:
-            raise ValueError("high和low长度必须一致")
-        if data_len <= 6:
-            return [0.0] * data_len
-
-        turns = []
-        # 处理中间部分
-        for i in range(4, data_len - 4):
-            current_high = high[i]
-            current_low = low[i]
-            
-            max_prev_next_high = float('-inf')
-            for j in range(i-4, i):
-                max_prev_next_high = max(max_prev_next_high, high[j])
-            for j in range(i+1, i+5):
-                max_prev_next_high = max(max_prev_next_high, high[j])
-            
-            min_prev_next_low = float('inf')
-            for j in range(i-4, i):
-                min_prev_next_low = min(min_prev_next_low, low[j])
-            for j in range(i+1, i+5):
-                min_prev_next_low = min(min_prev_next_low, low[j])
-            
-            if current_high >= max_prev_next_high:
-                turns.append((i, 1))
-            if current_low <= min_prev_next_low:
-                turns.append((i, -1))
-
-        # 处理最后4根K线
-        start = max(0, data_len - 4)
-        for i in range(start, data_len):
-            current_high = high[i]
-            current_low = low[i]
-            
-            start_prev = max(0, i - 4)
-            max_prev_high = float('-inf')
-            min_prev_low = float('inf')
-            for j in range(start_prev, i):
-                max_prev_high = max(max_prev_high, high[j])
-                min_prev_low = min(min_prev_low, low[j])
-            
-            if current_high >= max_prev_high:
-                turns.append((i, 1))
-            if current_low <= min_prev_low:
-                turns.append((i, -1))
-
-        # 合并连续相同类型转折点
-        new_turns = []
-        i = 0
-        while i < len(turns):
-            current_idx, current_type = turns[i]
-            current_val = high[current_idx] if current_type == 1 else low[current_idx]
-            
-            j = i + 1
-            while j < len(turns) and turns[j][1] == current_type:
-                j_idx = turns[j][0]
-                j_val = high[j_idx] if current_type == 1 else low[j_idx]
-                if (current_type == 1 and j_val > current_val) or \
-                   (current_type == -1 and j_val < current_val):
-                    current_idx = j_idx
-                    current_val = j_val
-                j += 1
-            new_turns.append((current_idx, current_type))
-            i = j
-
-        # 验证交替性
-        pf_out = [0.0] * data_len
-        for i in range(len(new_turns) - 1):
-            idx1, t1 = new_turns[i]
-            idx2, t2 = new_turns[i + 1]
-            if (t1 == 1 and t2 == -1) or (t1 == -1 and t2 == 1):
-                if idx1 < data_len:
-                    pf_out[idx1] = float(t1)
-        return pf_out
 
     def three_buy2(self, frac, high, low):
         """对应通达信TDXDLL1(6,...)，即ThreeBuy2函数"""
@@ -245,7 +168,7 @@ class StockSignalAnalyzer:
         data_len = len(high)
 
         # 计算TURNS和TURNS1
-        turns = self.identify_turns(high, low)
+        turns = gupiaojichu.identify_turns(data_len,high, low)
         turns1 = self.three_buy2(turns, high, low)
 
         # 寻找TURNS1中值为1的位置

@@ -15,128 +15,10 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('stock_data.log', encoding='utf-8'),
+        logging.FileHandler('stock_data_1.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
-
-def identify_turns(high, low):
-    """
-    识别价格转折点（高点和低点）
-    
-    参数:
-        high: 最高价序列（列表或类似可索引对象）
-        low: 最低价序列（列表或类似可索引对象）
-    
-    返回:
-        list: 转折点标记列表，1.0表示高点，-1.0表示低点，0.0表示无转折
-    """
-    data_len = len(high)
-    # 确保high和low长度一致
-    if len(low) != data_len:
-        raise ValueError("high和low必须具有相同的长度")
-    
-    # 数据量不足时直接返回全0
-    if data_len <= 6:
-        return [0.0] * data_len
-    
-    turns = []  # 存储候选转折点 (索引, 类型)，1为高点，-1为低点
-    
-    # 处理中间部分数据（前后都有足够数据）
-    for i in range(4, data_len - 4):
-        current_high = high[i]
-        current_low = low[i]
-        
-        # 计算前后4根K线的最高值（不含当前）
-        max_prev_next_high = float('-inf')
-        # 前4根（i-4到i-1）
-        for j in range(i - 4, i):
-            max_prev_next_high = max(max_prev_next_high, high[j])
-        # 后4根（i+1到i+4）
-        for j in range(i + 1, i + 5):
-            max_prev_next_high = max(max_prev_next_high, high[j])
-        
-        # 计算前后4根K线的最低值（不含当前）
-        min_prev_next_low = float('inf')
-        # 前4根（i-4到i-1）
-        for j in range(i - 4, i):
-            min_prev_next_low = min(min_prev_next_low, low[j])
-        # 后4根（i+1到i+4）
-        for j in range(i + 1, i + 5):
-            min_prev_next_low = min(min_prev_next_low, low[j])
-        
-        # 判断是否为高点
-        if current_high >= max_prev_next_high:
-            turns.append((i, 1))
-        # 判断是否为低点
-        if current_low <= min_prev_next_low:
-            turns.append((i, -1))
-    
-    # 处理最后4根K线（后面没有足够数据）
-    start = max(0, data_len - 4)
-    for i in range(start, data_len):
-        current_high = high[i]
-        current_low = low[i]
-        
-        # 只检查前4根数据
-        start_prev = max(0, i - 4)
-        max_prev_high = float('-inf')
-        min_prev_low = float('inf')
-        
-        for j in range(start_prev, i):
-            max_prev_high = max(max_prev_high, high[j])
-            min_prev_low = min(min_prev_low, low[j])
-        
-        # 判断是否为高点（只需大于前4根最高）
-        if current_high >= max_prev_high:
-            turns.append((i, 1))
-        # 判断是否为低点（只需小于前4根最低）
-        if current_low <= min_prev_low:
-            turns.append((i, -1))
-    
-    # 合并连续相同类型的转折点，保留最优值（高点保留最高，低点保留最低）
-    new_turns = []
-    i = 0
-    while i < len(turns):
-        current_index, current_type = turns[i]
-        current_high_val = high[current_index]
-        current_low_val = low[current_index]
-        
-        j = i + 1
-        while j < len(turns) and turns[j][1] == current_type:
-            j_index = turns[j][0]
-            if current_type == 1:  # 高点，保留更高的
-                if high[j_index] > current_high_val:
-                    current_index = j_index
-                    current_high_val = high[j_index]
-            else:  # 低点，保留更低的
-                if low[j_index] < current_low_val:
-                    current_index = j_index
-                    current_low_val = low[j_index]
-            j += 1
-        
-        new_turns.append((current_index, current_type))
-        i = j
-    
-    # 转折点数量不足时返回全0
-    if len(new_turns) <= 3:
-        return [0.0] * data_len
-    
-    # 验证转折点的交替性（高-低-高 或 低-高-低）
-    confirmed_turns = []
-    for i in range(len(new_turns) - 1):
-        idx1, t1 = new_turns[i]
-        idx2, t2 = new_turns[i + 1]
-        if (t1 == 1 and t2 == -1) or (t1 == -1 and t2 == 1):
-            confirmed_turns.append((idx1, t1))
-    
-    # 构建输出结果
-    pf_out = [0.0] * data_len
-    for index, frac in confirmed_turns:
-        if index < data_len:
-            pf_out[index] = float(frac)
-    
-    return pf_out
 
 def three_buy_variant(frac, high, low):
     """
@@ -196,7 +78,7 @@ def three_buy_variant(frac, high, low):
     down_segments.sort(key=lambda x: -x[1])  # 按end_idx降序排列
     
     # 至少需要3个向下线段才可能形成信号
-    if len(down_segments) < 3:
+    if len(down_segments) < 4:
         return pf_out
     
     # 取最近的3个向下线段
@@ -208,196 +90,29 @@ def three_buy_variant(frac, high, low):
     latest_low = low[latest_seg[1]]    # 最近线段终点（低点）的价格
     prev_low = low[prev_seg[1]]        # 前一线段终点（低点）的价格
     prev2_low = low[prev2_seg[1]]      # 前两线段终点（低点）的价格
+
+    latest_high = high[latest_seg[0]]    # 最近线段起点（高点）的价格
+    prev_high = high[prev_seg[0]]        # 前一线段起点（高点）的价格
+    prev2_high = high[prev2_seg[0]]      # 前两线段起点（高点）的价格
     
-    # 检查低点是否依次降低
-    if prev_low >= prev2_low:
-        return pf_out  # 前一线段低点不低于前两线段，不满足
-    if latest_low >= prev_low:
+
+    if prev_low >= prev2_low or prev_high > prev2_high:
+        return pf_out  # 最近线段低点不低于前一线段，不满足
+    
+    if latest_high < prev_high or latest_high < prev2_high:
+        return pf_out  # 最近线段高点不高于前一线段，不满足
+    
+    if latest_low <= prev_low:
         return pf_out  # 最近线段低点不低于前一线段，不满足
     
     # 5. 条件2：最后一根K线价格突破最近两个向下线段的起点高点之一
     last_k_idx = data_len - 1  # 最后一根K线的索引
-    last_k_price = high[last_k_idx]  # 最后一根K线的最高价（保持原逻辑）
-    
-    latest_seg_high = high[latest_seg[0]]  # 最近向下线段起点（高点）的价格
-    prev_seg_high = high[prev_seg[0]]      # 前一向下线段起点（高点）的价格
-    
-    if last_k_price > latest_seg_high and last_k_price > prev_seg_high:
-        # 所有条件满足，标记信号
-        pf_out[last_k_idx] = 1.0
-        return pf_out
-    
-    return pf_out
-
-def identify_three_buy_variant(high, low):
-    """
-    从高低点序列识别三买变体信号
-    
-    参数:
-        high: 最高价序列（列表或类似可索引对象）
-        low: 最低价序列（列表或类似可索引对象）
-    
-    返回:
-        list: 信号列表，1.0表示存在三买变体信号，0.0表示无
-    """
-    data_len = len(high)
-    # 确保输入序列长度一致
-    if len(low) != data_len:
-        raise ValueError("high和low必须具有相同的长度")
-    
-    # 初始化输出信号为全0
-    pf_out = [0.0] * data_len
-    
-    # 数据量不足时直接返回
-    if data_len <= 6:
-        return pf_out
-    
-    # --------------------------
-    # 第一步：识别转折点（整合identify_turns逻辑）
-    # --------------------------
-    turns = []  # 候选转折点 (索引, 类型)，1为高点，-1为低点
-    
-    # 处理中间部分数据（前后均有4根K线）
-    for i in range(4, data_len - 4):
-        current_high = high[i]
-        current_low = low[i]
-        
-        # 计算前后4根K线的最高值（不含当前）
-        max_prev_next_high = float('-inf')
-        for j in range(i - 4, i):
-            max_prev_next_high = max(max_prev_next_high, high[j])
-        for j in range(i + 1, i + 5):
-            max_prev_next_high = max(max_prev_next_high, high[j])
-        
-        # 计算前后4根K线的最低值（不含当前）
-        min_prev_next_low = float('inf')
-        for j in range(i - 4, i):
-            min_prev_next_low = min(min_prev_next_low, low[j])
-        for j in range(i + 1, i + 5):
-            min_prev_next_low = min(min_prev_next_low, low[j])
-        
-        # 判断高点/低点
-        if current_high >= max_prev_next_high:
-            turns.append((i, 1))
-        if current_low <= min_prev_next_low:
-            turns.append((i, -1))
-    
-    # 处理最后4根K线（后面无足够数据）
-    start = max(0, data_len - 4)
-    for i in range(start, data_len):
-        current_high = high[i]
-        current_low = low[i]
-        
-        # 只检查前4根数据
-        start_prev = max(0, i - 4)
-        max_prev_high = float('-inf')
-        min_prev_low = float('inf')
-        for j in range(start_prev, i):
-            max_prev_high = max(max_prev_high, high[j])
-            min_prev_low = min(min_prev_low, low[j])
-        
-        # 判断高点/低点
-        if current_high >= max_prev_high:
-            turns.append((i, 1))
-        if current_low <= min_prev_low:
-            turns.append((i, -1))
-    
-    # 合并连续相同类型的转折点（保留最优值）
-    new_turns = []
-    i = 0
-    while i < len(turns):
-        current_index, current_type = turns[i]
-        current_high_val = high[current_index]
-        current_low_val = low[current_index]
-        
-        j = i + 1
-        while j < len(turns) and turns[j][1] == current_type:
-            j_index = turns[j][0]
-            if current_type == 1 and high[j_index] > current_high_val:
-                current_index = j_index
-                current_high_val = high[j_index]
-            elif current_type == -1 and low[j_index] < current_low_val:
-                current_index = j_index
-                current_low_val = low[j_index]
-            j += 1
-        
-        new_turns.append((current_index, current_type))
-        i = j
-    
-    # 转折点数量不足时返回
-    if len(new_turns) <= 3:
-        return pf_out
-    
-    # 验证转折点交替性，生成最终转折点列表（frac）
-    frac = [0.0] * data_len
-    for i in range(len(new_turns) - 1):
-        idx1, t1 = new_turns[i]
-        idx2, t2 = new_turns[i + 1]
-        if (t1 == 1 and t2 == -1) or (t1 == -1 and t2 == 1):
-            if idx1 < data_len:
-                frac[idx1] = float(t1)
-    
-    # --------------------------
-    # 第二步：识别三买变体信号（整合three_buy_variant逻辑）
-    # --------------------------
-    # 提取所有转折点
-    turn_points = []
-    for i in range(data_len):
-        val = frac[i]
-        if val != 0.0:
-            turn_points.append((i, int(val)))
-    
-    # 构建交替线段
-    segments = []  # (起点索引, 终点索引, 方向)
-    i = 0
-    while i < len(turn_points):
-        idx1, dir1 = turn_points[i]
-        found = False
-        for j in range(i + 1, len(turn_points)):
-            idx2, dir2 = turn_points[j]
-            if dir2 == -dir1:
-                segments.append((idx1, idx2, dir1))
-                i = j
-                found = True
-                break
-        if not found:
-            break
-    
-    # 筛选向下线段（方向为1：高点到低点）
-    down_segments = [
-        (start, end) for start, end, dir in segments
-        if dir == 1
-    ]
-    
-    # 按结束位置从近到远排序
-    down_segments.sort(key=lambda x: -x[1])
-    
-    # 至少需要3个向下线段
-    if len(down_segments) < 3:
-        return pf_out
-    
-    # 取最近的3个向下线段
-    latest_seg, prev_seg, prev2_seg = down_segments[0], down_segments[1], down_segments[2]
-    
-    # 条件1：低点依次降低
-    latest_low = low[latest_seg[1]]
-    prev_low = low[prev_seg[1]]
-    prev2_low = low[prev2_seg[1]]
-    if prev_low >= prev2_low or latest_low >= prev_low:
-        return pf_out
-    
-    # 条件2：最后一根K线突破最近两个向下线段的起点高点之一
-    last_k_idx = data_len - 1
-    last_k_price = high[last_k_idx]
-    latest_seg_high = high[latest_seg[0]]
-    prev_seg_high = high[prev_seg[0]]
-    if last_k_price <= latest_seg_high and last_k_price <= prev_seg_high:
-        return pf_out
     
     # 所有条件满足，标记信号
     pf_out[last_k_idx] = 1.0
-    
     return pf_out
+
+
 
 class StockDataCollector:
     def __init__(self, blk_file_path):
