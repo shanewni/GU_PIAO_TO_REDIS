@@ -5,3 +5,7 @@ pyinstaller --onefile gu_piao_5M_data.py
 pyinstaller --onefile gu_piao_30M_data.py
 pyinstaller --onefile gu_piao_5M_jianlue_data.py
 pyinstaller --onefile gu_piao_5M_data_bixia.py
+pyinstaller --onefile gu_piao_30M_data_绝对中枢.py
+pyinstaller --onefile 30分钟三段强势起爆回调.py
+pyinstaller --onefile 5分钟底分型预警.py
+pyinstaller --onefile 30分钟三段强势起爆.py

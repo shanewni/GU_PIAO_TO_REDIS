@@ -9,6 +9,7 @@ import gupiaojichu
 import logging
 import json
 import winsound
+import numpy as np
 
 # 配置日志
 logging.basicConfig(
@@ -20,101 +21,28 @@ logging.basicConfig(
     ]
 )
 
-def three_buy_variant(frac, high, low):
-    """
-    识别三买变体信号
+def di_fen_xing(merged):
+    # 确保有至少3根K线才能形成分型
+    if len(merged) < 3:
+        return False
     
-    参数:
-        frac: 转折点标记列表（1.0为高点，-1.0为低点，0.0无转折）
-        high: 最高价序列
-        low: 最低价序列
+    # 获取最后三根K线（从左到右依次为前一根、中间根、后一根）
+    k1 = merged[-3]  # 倒数第三根K线（左侧）
+    k2 = merged[-2]  # 倒数第二根K线（中间）
+    k3 = merged[-1]  # 最后一根K线（右侧）
     
-    返回:
-        list: 信号列表，1.0表示存在三买变体信号，0.0表示无
-    """
-    data_len = len(high)
-    # 确保输入数组长度一致
-    if len(low) != data_len or len(frac) != data_len:
-        raise ValueError("frac、high、low必须具有相同的长度")
+    # 提取高低点（假设merged中每个元素为[high, low]结构）
+    k1_high, k1_low = k1.high, k1.low
+    k2_high, k2_low = k2.high, k2.low
+    k3_high, k3_low = k3.high, k3.low
     
-    # 初始化输出数组为0
-    pf_out = [0.0] * data_len
+    # 底分型条件：
+    # 1. 中间K线低点是三根中的最低点
+    # 2. 中间K线高点是三根中的最低点
+    is_bottom = (k2_low < k1_low and k2_low < k3_low and
+                 k2_high < k1_high and k2_high < k3_high)
     
-    if data_len <= 0:
-        return pf_out
-    
-    # 1. 提取所有转折点 (索引, 类型)，类型为1（高点）或-1（低点）
-    turn_points = []
-    for i in range(data_len):
-        val = frac[i]
-        if val != 0.0:
-            turn_points.append((i, int(val)))
-    
-    # 2. 构建线段（确保转折点方向交替）
-    segments = []  # 元素为 (起点索引, 终点索引, 方向)，方向为起点的类型（1或-1）
-    i = 0
-    while i < len(turn_points):
-        idx1, dir1 = turn_points[i]
-        found = False
-        # 寻找下一个相反方向的转折点
-        for j in range(i + 1, len(turn_points)):
-            idx2, dir2 = turn_points[j]
-            if dir2 == -dir1:  # 方向相反
-                segments.append((idx1, idx2, dir1))
-                i = j  # 跳到下一个线段的起点
-                found = True
-                break
-        if not found:
-            break  # 找不到相反方向的转折点，终止构建
-    
-    # 3. 筛选向下线段（方向为1：从高点到低点）
-    down_segments = []
-    for seg in segments:
-        start_idx, end_idx, direction = seg
-        if direction == 1:  # 高点到低点，属于向下线段
-            down_segments.append((start_idx, end_idx))
-    
-    # 按线段结束位置从近到远排序（最近的在前面）
-    down_segments.sort(key=lambda x: -x[1])  # 按end_idx降序排列
-    
-    # 至少需要3个向下线段才可能形成信号
-    if len(down_segments) < 4:
-        return pf_out
-    
-    # 取最近的3个向下线段
-    latest_seg = down_segments[0]    # 最近的向下线段
-    prev_seg = down_segments[1]      # 前一个向下线段
-    prev2_seg = down_segments[2]     # 前两个向下线段
-    
-    # 4. 条件1：低点依次降低（前2线段低点 > 前1线段低点 > 最近线段低点）
-    latest_low = low[latest_seg[1]]    # 最近线段终点（低点）的价格
-    prev_low = low[prev_seg[1]]        # 前一线段终点（低点）的价格
-    prev2_low = low[prev2_seg[1]]      # 前两线段终点（低点）的价格
-
-    latest_high = high[latest_seg[0]]    # 最近线段起点（高点）的价格
-    prev_high = high[prev_seg[0]]        # 前一线段起点（高点）的价格
-    prev2_high = high[prev2_seg[0]]      # 前两线段起点（高点）的价格
-
-    latest_seg = segments[0]    # 最近的向下线段
-    if latest_seg[2] != 1:
-        return pf_out  # 最近线段不是向下线段，不满足
-    
-
-    if  prev_high > prev2_high:
-        return pf_out  # 最近线段低点不低于前一线段，不满足
-    
-    if latest_high <= prev_high or latest_high <= prev2_high:
-        return pf_out  # 最近线段高点不高于前一线段，不满足
-    
-    if latest_low <= prev_low:
-        return pf_out  # 最近线段低点不低于前一线段，不满足
-    
-    # 5. 条件2：最后一根K线价格突破最近两个向下线段的起点高点之一
-    last_k_idx = data_len - 1  # 最后一根K线的索引
-    
-    # 所有条件满足，标记信号
-    pf_out[last_k_idx] = 1.0
-    return pf_out
+    return is_bottom
 
 
 
@@ -246,10 +174,7 @@ class StockDataCollector:
         blk_code = f"{market}{stock_code}"
         # 目标文件路径
         file_paths = [
-            r"D:\zd_hbzq\T0002\blocknew\QBGRX.blk",
-            r"D:\new_tdx\T0002\blocknew\QBGRX.blk",
-            r"D:\zd_hbzq\T0002\blocknew\zxg.blk",
-            r"D:\new_tdx\T0002\blocknew\zxg.blk"
+            r"D:\zd_hbzq\T0002\blocknew\QSGHDDFX.blk",
         ]
         
         for file_path in file_paths:
@@ -260,6 +185,7 @@ class StockDataCollector:
                 logging.info(f"成功将 {blk_code} 写入 {file_path}")
             except Exception as e:
                 logging.error(f"写入文件 {file_path} 失败: {e}")
+                
 
     def update_all_stocks(self):
         """
@@ -278,12 +204,12 @@ class StockDataCollector:
                 
                 if stock_data:
                     data_len = len(stock_data_high)
-                    stock_data_frac =gupiaojichu.identify_turns(data_len,stock_data_high,stock_data_low)
-                    ok = three_buy_variant(stock_data_frac,stock_data_high,stock_data_low)
+                    merged = gupiaojichu.merge_contained_bars(stock_data_high,stock_data_low,data_len)
+                    ok = di_fen_xing(merged)
                     # ok = identify_three_buy_variant(stock_data_high,stock_data_low)
-                    if  ok[-1] ==1.0 and full_code not in self.triggered_stocks:
+                    if  ok:
                         self.write_to_blk_files(market, stock_code)
-                        logging.warning(f"强势背驰股票： {stock_code}")
+                        logging.warning(f"底分型： {stock_code}")
                         winsound.Beep(1000, 500)  # 1000Hz频率，持续500毫秒
                         self.triggered_stocks.add(full_code)  # 记录已触发的股票
                  
@@ -357,8 +283,8 @@ def main():
     主函数
     """
     # 配置参数
-    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\BSMJB.blk"
-    UPDATE_INTERVAL = 2       # 更新间隔（秒）
+    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\DFXYJ.blk"
+    UPDATE_INTERVAL = 20       # 更新间隔（秒）
     
     # 检查blk文件是否存在
     if not os.path.exists(BLOB_FILE_PATH):

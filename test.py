@@ -1,55 +1,49 @@
-from pytdx.hq import TdxHq_API
 import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+import matplotlib.colors as mcolors
 
-# pytdx get_security_bars 函数 category 参数说明：
-TIME_PERIODS = {
-    0: "5分钟K线",
-    1: "15分钟K线", 
-    2: "30分钟K线",
-    3: "1小时K线",
-    4: "日K线",
-    5: "周K线",
-    6: "月K线",
-    7: "1分钟K线",
-    8: "1分钟K线",  # 与7相同
-    9: "日K线",     # 与4相同
-    10: "季K线",
-    11: "年K线"
-}
+# 1. 修正路径和编码（关键：用 r 前缀 + 中文编码 gbk）
+file_path = r'D:\feihu\gu_piao_to_redis\20251101历史成交查询.xlsx'
 
-# 创建API对象
-api = TdxHq_API()
+# 读取 .xls 文件（用 xlrd 引擎，需先安装：pip install xlrd==1.2.0）
+df = pd.read_excel(
+    file_path,
+    engine='xlrd',  # 适配 .xls 格式
+    encoding='gbk'  # 中文编码，解决解码错误
+)
 
-# 选择服务器并连接，这里使用了一个公开的服务器IP和端口
-# 如果这个服务器不稳定，可以尝试寻找其他可用的服务器IP
-server_ip = '152.136.167.10'
-server_port = 7709
+# 提取E列（证券名称）的唯一值（确保表头正确，若表头不是“证券名称”需修改）
+unique_names = df['证券名称'].drop_duplicates().tolist()
+if '证券名称' in unique_names:
+    unique_names.remove('证券名称')
 
-try:
-    if api.connect(server_ip, server_port):
-        print("成功连接到行情服务器")
-        
-        # 获取股票代码为600000的5分钟K线数据
-        # 参数说明: (市场代码, 股票代码, 起始索引, 需要获取的数量)
-        # 市场代码：0 - 深圳，1 - 上海
-        stock_code = '600000'
-        market = 1  # 上海市场
-        data = api.get_security_bars(0, market, stock_code, 0, 10)
-        
-        # 断开连接
-        api.disconnect()
-        
-        if data:
-            # 将数据转换为DataFrame
-            # 注意：pytdx返回的数据字段顺序可能与以下定义一致，请根据实际情况调整
-            df = pd.DataFrame(data, columns=['datetime', 'open', 'close', 'high', 'low', 'volume', 'amount', 'market', 'code'])
-            # 处理时间戳
-            df['datetime'] = pd.to_datetime(df['datetime'], format='%Y-%m-%d %H:%M')
-            print("成功获取5分钟K线数据：")
-            print(df.head())
-        else:
-            print("未获取到数据。")
-    else:
-        print("连接行情服务器失败。")
-except Exception as e:
-    print(f"操作过程中发生错误: {e}")
+# 2. 分配颜色
+color_list = list(mcolors.TABLEAU_COLORS.values())  # 区分度高的配色
+name_color_map = {}
+for i, name in enumerate(unique_names):
+    color_code = color_list[i % len(color_list)].replace('#', '')  # 转换为RGB格式
+    name_color_map[name] = color_code
+
+# 3. 用 openpyxl 处理格式（注意：.xls 格式需先另存为 .xlsx 才能用 openpyxl 编辑，这里直接处理读取的文件）
+# 若文件是 .xls 格式，建议先手动另存为 .xlsx（Excel 中“另存为”选择 .xlsx），再修改路径为 .xlsx
+# 以下代码假设文件已转为 .xlsx 格式（若仍是 .xls，需先转换）
+wb = load_workbook(file_path.replace('.xls', '.xlsx'))  # 读取 .xlsx 文件
+ws = wb.active
+
+# 遍历E列（从第2行开始，跳过表头）
+for row in range(2, ws.max_row + 1):
+    cell_value = ws[f'E{row}'].value
+    if cell_value in name_color_map:
+        fill = PatternFill(
+            start_color=name_color_map[cell_value],
+            end_color=name_color_map[cell_value],
+            fill_type='solid'
+        )
+        ws[f'E{row}'].fill = fill
+
+# 4. 保存结果
+output_path = r'D:\feihu\gu_piao_to_redis\20251101历史成交查询_带颜色标记.xlsx'
+wb.save(output_path)
+
+print(f"处理完成，新文件保存至：{output_path}")

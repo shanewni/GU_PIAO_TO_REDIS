@@ -201,7 +201,7 @@ class StockDataCollector:
                     logging.debug(f"成功连接到服务器 {server_ip}:{server_port}，获取 {full_code}")
                     
                     # 获取5分钟K线数据 (category=0)，获取200条
-                    data = api.get_security_bars(0, market, stock_code, 0, 200)
+                    data = api.get_security_bars(2, market, stock_code, 0, 200)
                     api.disconnect()
                     
                     if data:
@@ -247,9 +247,6 @@ class StockDataCollector:
         # 目标文件路径
         file_paths = [
             r"D:\zd_hbzq\T0002\blocknew\QBGRX.blk",
-            r"D:\new_tdx\T0002\blocknew\QBGRX.blk",
-            r"D:\zd_hbzq\T0002\blocknew\zxg.blk",
-            r"D:\new_tdx\T0002\blocknew\zxg.blk"
         ]
         
         for file_path in file_paths:
@@ -357,8 +354,8 @@ def main():
     主函数
     """
     # 配置参数
-    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\BSMJB.blk"
-    UPDATE_INTERVAL = 2       # 更新间隔（秒）
+    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\ZFG.blk"
+    UPDATE_INTERVAL = 20       # 更新间隔（秒）
     
     # 检查blk文件是否存在
     if not os.path.exists(BLOB_FILE_PATH):

@@ -69,48 +69,57 @@ def three_buy_variant(frac, high, low):
     
     # 3. 筛选向下线段（方向为1：从高点到低点）
     down_segments = []
+    up_segments = []
     for seg in segments:
         start_idx, end_idx, direction = seg
         if direction == 1:  # 高点到低点，属于向下线段
             down_segments.append((start_idx, end_idx))
-    
+        else:
+            up_segments.append((start_idx, end_idx))
+
     # 按线段结束位置从近到远排序（最近的在前面）
     down_segments.sort(key=lambda x: -x[1])  # 按end_idx降序排列
+    up_segments.sort(key=lambda x: -x[1])  # 按end_idx降序排列
     
     # 至少需要3个向下线段才可能形成信号
-    if len(down_segments) < 4:
+    if len(down_segments) < 3:
         return pf_out
     
     # 取最近的3个向下线段
     latest_seg = down_segments[0]    # 最近的向下线段
     prev_seg = down_segments[1]      # 前一个向下线段
-    prev2_seg = down_segments[2]     # 前两个向下线段
+
+    if segments[0][2] == 1:
+        up_prev_seg = up_segments[0]      # 最近的向上线段
+    else:
+        up_prev_seg = up_segments[1]      # 前一个向上线段  
+    
+    
     
     # 4. 条件1：低点依次降低（前2线段低点 > 前1线段低点 > 最近线段低点）
     latest_low = low[latest_seg[1]]    # 最近线段终点（低点）的价格
     prev_low = low[prev_seg[1]]        # 前一线段终点（低点）的价格
-    prev2_low = low[prev2_seg[1]]      # 前两线段终点（低点）的价格
+    up_prev_low = low[up_prev_seg[0]]     # 前一线段终点（低点）的价格
 
     latest_high = high[latest_seg[0]]    # 最近线段起点（高点）的价格
     prev_high = high[prev_seg[0]]        # 前一线段起点（高点）的价格
-    prev2_high = high[prev2_seg[0]]      # 前两线段起点（高点）的价格
+    up_prev_high = high[up_prev_seg[1]]      # 前一线段起点（高点）的价格
 
-    latest_seg = segments[0]    # 最近的向下线段
-    if latest_seg[2] != 1:
-        return pf_out  # 最近线段不是向下线段，不满足
-    
-
-    if  prev_high > prev2_high:
-        return pf_out  # 最近线段低点不低于前一线段，不满足
-    
-    if latest_high <= prev_high or latest_high <= prev2_high:
+    if  latest_high >= prev_high:
         return pf_out  # 最近线段高点不高于前一线段，不满足
     
-    if latest_low <= prev_low:
+    if latest_low >= prev_low:
         return pf_out  # 最近线段低点不低于前一线段，不满足
+    
     
     # 5. 条件2：最后一根K线价格突破最近两个向下线段的起点高点之一
     last_k_idx = data_len - 1  # 最后一根K线的索引
+    if high[last_k_idx] <= up_prev_high:
+        return pf_out  # 未突破任一高点，不满足
+    
+    sum = latest_seg[1] - prev_seg[0]
+    if data_len-1 - latest_seg[1] > sum/3:
+        return pf_out  # 线段间隔过近，不满足
     
     # 所有条件满足，标记信号
     pf_out[last_k_idx] = 1.0
@@ -201,7 +210,7 @@ class StockDataCollector:
                     logging.debug(f"成功连接到服务器 {server_ip}:{server_port}，获取 {full_code}")
                     
                     # 获取5分钟K线数据 (category=0)，获取200条
-                    data = api.get_security_bars(0, market, stock_code, 0, 200)
+                    data = api.get_security_bars(2, market, stock_code, 0, 200)
                     api.disconnect()
                     
                     if data:
@@ -246,10 +255,7 @@ class StockDataCollector:
         blk_code = f"{market}{stock_code}"
         # 目标文件路径
         file_paths = [
-            r"D:\zd_hbzq\T0002\blocknew\QBGRX.blk",
-            r"D:\new_tdx\T0002\blocknew\QBGRX.blk",
-            r"D:\zd_hbzq\T0002\blocknew\zxg.blk",
-            r"D:\new_tdx\T0002\blocknew\zxg.blk"
+            r"D:\zd_hbzq\T0002\blocknew\ZXG.blk",
         ]
         
         for file_path in file_paths:
@@ -357,8 +363,8 @@ def main():
     主函数
     """
     # 配置参数
-    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\BSMJB.blk"
-    UPDATE_INTERVAL = 2       # 更新间隔（秒）
+    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\FXDXT.blk"
+    UPDATE_INTERVAL = 20       # 更新间隔（秒）
     
     # 检查blk文件是否存在
     if not os.path.exists(BLOB_FILE_PATH):

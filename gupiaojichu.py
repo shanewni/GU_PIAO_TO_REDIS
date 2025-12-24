@@ -54,18 +54,138 @@ def sliding_min(arr, window_size):
     
     return result
 
+# def merge_contained_bars(high, low, data_len):
+#     """处理K线包含关系及连续同值K线合并"""
+#     if data_len == 0:
+#         return []
+    
+#     merged = []
+#     eps = 1e-6  # 浮点数精度阈值
+    
+#     for i in range(data_len):
+#         curr_high = high[i]
+#         curr_low = low[i]
+#         # 判断当前K线是否为"同值K线"（high≈low）
+#         is_current_same = abs(curr_high - curr_low) < eps
+        
+#         current_bar = MergedBar(
+#             high=curr_high,
+#             low=curr_low,
+#             orig_idx=i,
+#             is_same_value=is_current_same
+#         )
+        
+#         if not merged:
+#             merged.append(current_bar)
+#             continue
+        
+#         last_bar = merged[-1]
+        
+#         # 处理连续同值K线合并
+#         if is_current_same and last_bar.is_same_value:
+#             values_equal = abs(last_bar.high - curr_high) < eps
+#             if values_equal:
+#                 # 合并：保留最早的orig_idx
+#                 merged_same_bar = MergedBar(
+#                     high=last_bar.high,
+#                     low=last_bar.low,
+#                     orig_idx=last_bar.orig_idx,
+#                     is_same_value=True
+#                 )
+#                 merged.pop()
+#                 merged.append(merged_same_bar)
+#                 continue
+        
+#         # 同值K线与非同值K线不参与包含合并
+#         if last_bar.is_same_value or is_current_same:
+#             merged.append(current_bar)
+#             continue
+        
+#         # 检查包含关系
+#         is_contained = (curr_high <= last_bar.high + eps and curr_low >= last_bar.low - eps) or \
+#                        (last_bar.high <= curr_high + eps and last_bar.low >= curr_low - eps)
+        
+#         if not is_contained:
+#             merged.append(current_bar)
+#         else:
+#             # 存在包含关系，按趋势合并
+#             if len(merged) >= 2:
+#                 prev_last = merged[-2]
+#                 # 判断前序趋势
+#                 is_up = (last_bar.high > prev_last.high + eps) and (last_bar.low > prev_last.low + eps)
+#                 is_down = (last_bar.high < prev_last.high - eps) and (last_bar.low < prev_last.low - eps)
+                
+#                 if is_up:
+#                     max_high = max(last_bar.high, curr_high)
+#                     if abs(max_high - last_bar.high) < eps:
+#                         orig_idx = last_bar.orig_idx
+#                     else:
+#                         orig_idx = current_bar.orig_idx
+#                     new_bar = MergedBar(
+#                         high=max_high,
+#                         low=max(last_bar.low, curr_low),
+#                         orig_idx=orig_idx,
+#                         is_same_value=False
+#                     )
+#                 elif is_down:
+#                     min_low = min(last_bar.low, curr_low)
+#                     if abs(min_low - last_bar.low) < eps:
+#                         orig_idx = last_bar.orig_idx
+#                     else:
+#                         orig_idx = current_bar.orig_idx
+#                     new_bar = MergedBar(
+#                         high=min(last_bar.high, curr_high),
+#                         low=min_low,
+#                         orig_idx=orig_idx,
+#                         is_same_value=False
+#                     )
+#                 else:
+#                     # 非明确趋势：取范围
+#                     new_bar = MergedBar(
+#                         high=max(last_bar.high, curr_high),
+#                         low=min(last_bar.low, curr_low),
+#                         orig_idx=last_bar.orig_idx,
+#                         is_same_value=False
+#                     )
+#             else:
+#                 # 仅1根非同值K线，合并取范围
+#                 max_high = max(last_bar.high, curr_high)
+#                 if abs(max_high - last_bar.high) < eps:
+#                     orig_idx = last_bar.orig_idx
+#                 else:
+#                     orig_idx = current_bar.orig_idx
+#                 new_bar = MergedBar(
+#                     high=max_high,
+#                     low=min(last_bar.low, curr_low),
+#                     orig_idx=orig_idx,
+#                     is_same_value=False
+#                 )
+            
+#             merged.pop()
+#             merged.append(new_bar)
+    
+#     return merged
+class MergedBar:
+    """对应Rust中的MergedBar结构体"""
+    def __init__(self, high: float, low: float, orig_idx: int, is_same_value: bool):
+        self.high = high
+        self.low = low
+        self.orig_idx = orig_idx  # 原始K线索引
+        self.is_same_value = is_same_value  # 是否为同值K线（high≈low）
+
 def merge_contained_bars(high, low, data_len):
-    """处理K线包含关系及连续同值K线合并"""
+    """处理K线包含关系及连续同值K线合并（完全对齐Rust逻辑）"""
     if data_len == 0:
         return []
     
     merged = []
-    eps = 1e-6  # 浮点数精度阈值
+    eps = 1e-6  # 浮点数精度阈值（对齐Rust注释的"极小值判断"）
     
     for i in range(data_len):
         curr_high = high[i]
         curr_low = low[i]
-        # 判断当前K线是否为"同值K线"（high≈low）
+        
+        # 1. 判断当前K线是否为同值K线（Rust注释要求的精度判断）
         is_current_same = abs(curr_high - curr_low) < eps
         
         current_bar = MergedBar(
@@ -81,79 +201,76 @@ def merge_contained_bars(high, low, data_len):
         
         last_bar = merged[-1]
         
-        # 处理连续同值K线合并
+        # 2. 处理连续同值K线合并（Rust核心逻辑：同值+值相等→合并保留最早orig_idx）
         if is_current_same and last_bar.is_same_value:
             values_equal = abs(last_bar.high - curr_high) < eps
             if values_equal:
-                # 合并：保留最早的orig_idx
+                # 合并：继承last_bar的高低点，保留最早的orig_idx（Rust的..last_bar逻辑）
                 merged_same_bar = MergedBar(
                     high=last_bar.high,
                     low=last_bar.low,
-                    orig_idx=last_bar.orig_idx,
+                    orig_idx=last_bar.orig_idx,  # 关键：取最早的索引，而非当前
                     is_same_value=True
                 )
                 merged.pop()
                 merged.append(merged_same_bar)
                 continue
         
-        # 同值K线与非同值K线不参与包含合并
+        # 3. 同值K线与非同值K线不参与包含合并（Rust的核心规则）
         if last_bar.is_same_value or is_current_same:
             merged.append(current_bar)
             continue
         
-        # 检查包含关系
+        # 4. 检查包含关系（严格对齐Rust的包含逻辑，带精度容错）
+        # Rust: (curr_high <= last_bar.high && curr_low >= last_bar.low) || (last_bar.high <= curr_high && last_bar.low >= curr_low)
         is_contained = (curr_high <= last_bar.high + eps and curr_low >= last_bar.low - eps) or \
                        (last_bar.high <= curr_high + eps and last_bar.low >= curr_low - eps)
         
         if not is_contained:
             merged.append(current_bar)
         else:
-            # 存在包含关系，按趋势合并
+            # 5. 包含关系合并（按Rust的趋势规则）
             if len(merged) >= 2:
-                prev_last = merged[-2]
-                # 判断前序趋势
-                is_up = (last_bar.high > prev_last.high + eps) and (last_bar.low > prev_last.low + eps)
-                is_down = (last_bar.high < prev_last.high - eps) and (last_bar.low < prev_last.low - eps)
+                prev_last = merged[-2]  # Rust的merged[last_idx - 1]
+                
+                # 趋势判断（严格对齐Rust的is_up/is_down逻辑，带精度容错）
+                # Rust: is_up = last_bar.high > prev_last.high && last_bar.low > prev_last.low
+                is_up = (last_bar.high > prev_last.high - eps) and (last_bar.low > prev_last.low - eps)
+                # Rust: is_down = last_bar.high < prev_last.high && last_bar.low < prev_last.low
+                is_down = (last_bar.high < prev_last.high + eps) and (last_bar.low < prev_last.low + eps)
                 
                 if is_up:
+                    # 向上趋势：取高点最高，低点最高，orig_idx选高点更高的（相同则取前一个）
                     max_high = max(last_bar.high, curr_high)
-                    if abs(max_high - last_bar.high) < eps:
-                        orig_idx = last_bar.orig_idx
-                    else:
-                        orig_idx = current_bar.orig_idx
+                    orig_idx = last_bar.orig_idx if abs(max_high - last_bar.high) < eps else current_bar.orig_idx
                     new_bar = MergedBar(
                         high=max_high,
-                        low=max(last_bar.low, curr_low),
+                        low=max(last_bar.low, curr_low),  # Rust的last_bar.low.max(curr_low)
                         orig_idx=orig_idx,
                         is_same_value=False
                     )
                 elif is_down:
+                    # 向下趋势：取低点最低，高点最低，orig_idx选低点更低的（相同则取前一个）
                     min_low = min(last_bar.low, curr_low)
-                    if abs(min_low - last_bar.low) < eps:
-                        orig_idx = last_bar.orig_idx
-                    else:
-                        orig_idx = current_bar.orig_idx
+                    orig_idx = last_bar.orig_idx if abs(min_low - last_bar.low) < eps else current_bar.orig_idx
                     new_bar = MergedBar(
-                        high=min(last_bar.high, curr_high),
+                        high=min(last_bar.high, curr_high),  # Rust的last_bar.high.min(curr_high)
                         low=min_low,
                         orig_idx=orig_idx,
                         is_same_value=False
                     )
                 else:
-                    # 非明确趋势：取范围
+                    # 非明确趋势：取高低点范围，orig_idx取前一个
                     new_bar = MergedBar(
                         high=max(last_bar.high, curr_high),
                         low=min(last_bar.low, curr_low),
-                        orig_idx=last_bar.orig_idx,
+                        orig_idx=last_bar.orig_idx,  # Rust的orig_idx=last_bar.orig_idx
                         is_same_value=False
                     )
             else:
-                # 仅1根非同值K线，合并取范围
+                # 仅1根非同值K线：合并取高低点范围，orig_idx选高点更高的（相同则取前一个）
                 max_high = max(last_bar.high, curr_high)
-                if abs(max_high - last_bar.high) < eps:
-                    orig_idx = last_bar.orig_idx
-                else:
-                    orig_idx = current_bar.orig_idx
+                orig_idx = last_bar.orig_idx if abs(max_high - last_bar.high) < eps else current_bar.orig_idx
                 new_bar = MergedBar(
                     high=max_high,
                     low=min(last_bar.low, curr_low),
@@ -161,6 +278,7 @@ def merge_contained_bars(high, low, data_len):
                     is_same_value=False
                 )
             
+            # 替换最后一根K线（Rust的pop+push）
             merged.pop()
             merged.append(new_bar)
     
