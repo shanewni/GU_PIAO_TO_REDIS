@@ -92,9 +92,12 @@ def three_buy_variant(frac, high, low):
     last_k_idx = data_len - 1  # 最后一根K线的索引
     if high[last_k_idx] <= latest_high:
         return pf_out  # 未突破任一高点，不满足
-    
-    if (data_len-1 - latest_seg[1])*1.9 > latest_seg[1]- latest_seg[0]:
-        return pf_out  # 线段间隔过近，不满足
+    if latest_seg[1]- latest_seg[0] > 9 :
+        if (data_len-1 - latest_seg[1])*1.9 > latest_seg[1]- latest_seg[0]:
+            return pf_out  # 线段间隔过近，不满足
+    else:
+        if (data_len-1 - latest_seg[1]) > latest_seg[1]- latest_seg[0]:
+            return pf_out  # 线段间隔过近，不满足
     
     # 所有条件满足，标记信号
     pf_out[last_k_idx] = 1.0
