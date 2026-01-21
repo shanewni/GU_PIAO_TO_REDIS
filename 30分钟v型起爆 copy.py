@@ -9,6 +9,7 @@ import gupiaojichu
 import logging
 import json
 import winsound
+import re  # 确保已导入re模块（代码开头已有，无需重复）
 
 # 配置日志
 logging.basicConfig(
@@ -128,7 +129,7 @@ def three_buy_variant(frac, high, low):
 
 
 class StockDataCollector:
-    def __init__(self, blk_file_path):
+    def __init__(self, blk_file_path,blk_file_path_index):
         """
         初始化股票数据收集器
         
@@ -139,7 +140,8 @@ class StockDataCollector:
             redis_db: Redis数据库编号
         """
         self.blk_file_path = blk_file_path
-        self.stock_list = self.load_stock_list()
+        self.blk_file_path_index = blk_file_path_index
+        self.stock_list,self.stock_list_index = self.load_stock_list()
         self.triggered_stocks = set()  # 新增：用于记录已触发的股票代码
         # 服务器列表
         self.servers = [
@@ -147,6 +149,7 @@ class StockDataCollector:
             ('36.153.42.16', 7709)
         ]
         
+        logging.info(f"初始化完成，共加载 {len(self.blk_file_path_index)} 只指数")
         logging.info(f"初始化完成，共加载 {len(self.stock_list)} 只股票")
     
     def load_stock_list(self):
@@ -157,6 +160,7 @@ class StockDataCollector:
             list: 股票代码列表，格式为 [('市场代码', '股票代码', '完整代码'), ...]
         """
         stock_list = []
+        stock_list_index = []
         
         try:
             with open(self.blk_file_path, 'r', encoding='utf-8') as f:
@@ -183,13 +187,38 @@ class StockDataCollector:
                     stock_list.append((market, stock_code, full_code))
                     
                     logging.debug(f"加载股票: {full_code}")
+
+            with open(self.blk_file_path_index, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+                
+            # 跳过第一行空白，从第二行开始处理
+            for line in lines[1:]:
+                line = line.strip()
+                if line:
+                    # 第一位是市场代码，后六位是股票代码
+                    market_code = line[0]
+                    stock_code = line[1:7]
+                    
+                    # 将市场代码转换为pytdx需要的格式
+                    # 0: 深圳, 1: 上海
+                    if market_code == '0':
+                        market = 0  # 深圳
+                        market_prefix = 'sz'
+                    else:
+                        market = 1  # 上海
+                        market_prefix = 'sh'
+                    
+                    full_code = f"{market_prefix}{stock_code}"
+                    stock_list_index.append((market, stock_code, full_code))
+                    
+                    logging.debug(f"加载板块指数: {full_code}")
                     
         except Exception as e:
             logging.error(f"读取blk文件失败: {e}")
             
-        return stock_list
+        return stock_list,stock_list_index
     
-    def get_5min_data(self, market, stock_code, full_code):
+    def get_5min_data(self, market, stock_code, full_code,top30_index_map):
         """
         获取单只股票的5分钟K线数据（200条）
         
@@ -208,11 +237,7 @@ class StockDataCollector:
             try:
                 if api.connect(server_ip, server_port):
                     logging.debug(f"成功连接到服务器 {server_ip}:{server_port}，获取 {full_code}")
-                    
-                    # 获取5分钟K线数据 (category=0)，获取200条
-                    data = api.get_security_bars(2, market, stock_code, 0, 200)
-                    # zzzz = api.get_company_info_category(market, stock_code)
-                    # ppp = api.get_company_info_content(market, stock_code, zzzz[7]['filename'], zzzz[7]['start'], zzzz[7]['length'])
+                    data = api.get_security_bars(2, market, stock_code, 0, 100)
                     
                     if data:
                         # 处理所有200条数据
@@ -250,6 +275,61 @@ class StockDataCollector:
         logging.error(f"所有服务器都无法获取 {full_code} 的数据")
         return None,None,None
     
+    def get_index_data(self, market, stock_code, full_code):
+            """
+            获取单只指数的5分钟K线数据（1条）
+            
+            Args:
+                market: 市场代码 (0: 深圳, 1: 上海)
+                stock_code: 指数代码
+                full_code: 完整指数代码 (如 sh600000)
+                
+            Returns:
+                list or None: 1条K线数据，包含open, close, high, low, datetime
+            """
+            api = TdxHq_API()
+            
+            # 尝试所有服务器直到成功
+            for server_ip, server_port in self.servers:
+                try:
+                    if api.connect(server_ip, server_port):
+                        logging.debug(f"成功连接到服务器 {server_ip}:{server_port}，获取 {full_code}")
+                        
+                        data = api.get_index_bars(4, market, stock_code, 0, 2)
+                        
+                        if data:
+                            # 处理数据
+                            result_list = []
+                            result_list_high = []
+                            result_list_low = []
+                            for bar in data:
+                                # 提取需要的字段
+                                result = {
+                                    'open': float(bar['open']),
+                                    'high': float(bar['high']),
+                                    'low': float(bar['low']),
+                                    'close': float(bar['close']),
+                                    'datetime': bar['datetime']
+                                }
+                                result_list_high.append(float(bar['high']))
+                                result_list_low.append(float(bar['low']))
+                                result_list.append(result)
+                            
+                            logging.debug(f"成功获取 {full_code} 数据: {len(result_list)} 条")
+                            return result_list,result_list_high,result_list_low
+                        else:
+                            logging.warning(f"未获取到 {full_code} 的数据")
+                            return None,None,None
+                    else:
+                        logging.debug(f"连接服务器 {server_ip}:{server_port} 失败")
+                        
+                except Exception as e:
+                    logging.debug(f"服务器 {server_ip}:{server_port} 获取 {full_code} 出错: {e}")
+                    continue
+                    
+            logging.error(f"所有服务器都无法获取 {full_code} 的数据")
+            return None,None,None
+    
     def write_to_blk_files(self, market, stock_code):
         """将股票代码写入两个blk文件"""
         # 组合格式：market(1位) + stock_code(6位)
@@ -272,16 +352,57 @@ class StockDataCollector:
         """
         更新所有股票数据到Redis
         """
-        self.stock_list = self.load_stock_list()
+        self.stock_list,self.stock_list_index = self.load_stock_list()
         success_count = 0
         fail_count = 0
+        # 初始化存储指数涨幅的字典（key: 完整代码, value: 涨幅%）
+        index_gain_dict = {}
         
         logging.info("开始更新所有股票数据...")
+        # 第一步：处理指数列表，计算涨幅
+        for market, stock_code, full_code in self.stock_list_index:
+            try:
+                stock_data,stock_data_high,stock_data_low = self.get_index_data(market, stock_code, full_code)
+                if stock_data:
+                    # 计算涨幅：(当前收盘价 - 开盘价) / 开盘价 * 100%
+                    latest_bar = stock_data[0]  # 仅1条数据
+                    latest_bar_p = stock_data[1]  # 仅1条数据
+                    open_price = latest_bar['close']
+                    close_price = latest_bar_p['close']
+                    
+                    # 避免除以零错误
+                    if open_price == 0:
+                        gain = 0.0
+                    else:
+                        gain = (close_price - open_price) / open_price * 100
+                    
+                    # 保留两位小数，提升可读性
+                    gain = round(gain, 2)
+                    index_gain_dict[stock_code] = gain
+
+                else:
+                    logging.warning(f"获取 {full_code} 数据失败")
+                    
+            except Exception as e:
+                logging.error(f"处理 {full_code} 时发生错误: {e}")
+        
+        # 第二步：筛选涨幅排名前30的指数，存入map
+        # 按涨幅降序排序
+        sorted_index_gains = sorted(index_gain_dict.items(), key=lambda x: x[1], reverse=True)
+        # 取前30名，转为字典（map）
+        top30_index_map = dict(sorted_index_gains[:30])
+        
+        # 日志输出前30名指数信息
+        logging.info("="*50)
+        logging.info("涨幅排名前30的板块指数：")
+        for rank, (code, gain) in enumerate(top30_index_map.items(), 1):
+            logging.info(f"第{rank:2d}名 | {code} | 涨幅: {gain:6.2f}%")
+        logging.info("="*50)
         
         for market, stock_code, full_code in self.stock_list:
             try:
                 # 获取股票数据（200条）
-                stock_data,stock_data_high,stock_data_low = self.get_5min_data(market, stock_code, full_code)
+                stock_data,stock_data_high,stock_data_low = self.get_5min_data(market, stock_code, full_code,top30_index_map)
                 
                 if stock_data:
                     data_len = len(stock_data_high)
@@ -365,6 +486,7 @@ def main():
     """
     # 配置参数
     BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\FXDXT.blk"
+    BLOB_FILE_PATH_INDEX = r"D:\zd_hbzq\T0002\blocknew\YJSJBK.blk"
     UPDATE_INTERVAL = 20       # 更新间隔（秒）
     
     # 检查blk文件是否存在
@@ -375,6 +497,7 @@ def main():
     # 创建并运行数据收集器
     collector = StockDataCollector(
         blk_file_path=BLOB_FILE_PATH,
+        blk_file_path_index=BLOB_FILE_PATH_INDEX
     )
     
     # 运行收集器
@@ -383,3 +506,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
