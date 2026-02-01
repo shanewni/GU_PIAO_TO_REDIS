@@ -467,7 +467,24 @@ class StockDataCollector:
 
                 # 获取股票数据（200条）
                 stock_data,stock_data_high,stock_data_low = self.get_5min_data(market, stock_code, full_code,top30_index_map)
+                # ========== 新增：判断最后一根K线涨幅逻辑 ==========
+                last_kline = stock_data[-1]  # 获取最后一根K线
+                last_kline2 = stock_data[-2]  # 获取最后一根K线
+                open_price = last_kline2['close']
+                close_price = last_kline['close']
                 
+                # 计算涨幅（避免除以零）
+                if open_price == 0:
+                    kline_gain = 0.0
+                else:
+                    kline_gain = (close_price - open_price) / open_price * 100  # 涨幅百分比
+                kline_gain = round(kline_gain, 2)
+                
+                # 涨幅大于2.4%则跳过本次循环
+                if kline_gain > 2.4 or kline_gain <= 0:
+                    logging.debug(f"股票 {full_code} 最后一根K线涨幅 {kline_gain}% > 2.4%，跳过本次循环")
+                    continue  # 跳过后续的信号判断和写入逻辑
+                # ========== 新增逻辑结束 ==========
                 if stock_data:
                     data_len = len(stock_data_high)
                     stock_data_frac =gupiaojichu.identify_turns(data_len,stock_data_high,stock_data_low)
@@ -546,7 +563,7 @@ def main():
     # 配置参数
     BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\60RJXS.blk"
     BLOB_FILE_PATH_INDEX = r"D:\zd_hbzq\T0002\blocknew\YJSJBK.blk"
-    UPDATE_INTERVAL = 20       # 更新间隔（秒）
+    UPDATE_INTERVAL = 60       # 更新间隔（秒）
     TDX_INSTALL_PATH = r'D:/new_tdx_x/new_tdx'  # 通达信安装路径（请修改为实际路径）
     
     # 检查blk文件是否存在
