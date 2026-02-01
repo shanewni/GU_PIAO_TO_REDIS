@@ -438,13 +438,13 @@ class StockDataCollector:
         # 按涨幅降序排序
         sorted_index_gains = sorted(index_gain_dict.items(), key=lambda x: x[1], reverse=True)
         # 取前30名，转为字典（map）
-        top30_index_map = dict(sorted_index_gains[:30])
+        top30_index_map = dict(sorted_index_gains[:60])
         # ===================== 新增代码开始 =====================
         # 假设 stock_to_zs_map 是已定义的字典（key: 指数代码, value: 对应zs值）
         # 创建新map，存储前30个指数对应的stock_to_zs_map值
         top30_zs_map = {}
         # 遍历sorted_index_gains前30个元素，提取指数代码并匹配stock_to_zs_map
-        for code, _ in sorted_index_gains[:30]:
+        for code, _ in sorted_index_gains[:60]:
             if code in self.stock_to_zs:  # 避免KeyError，先检查键是否存在
                 top30_zs_map[self.stock_to_zs.get(code)] = code
             else:
@@ -544,7 +544,7 @@ def main():
     主函数
     """
     # 配置参数
-    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\FXDXT.blk"
+    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\60RJXS.blk"
     BLOB_FILE_PATH_INDEX = r"D:\zd_hbzq\T0002\blocknew\YJSJBK.blk"
     UPDATE_INTERVAL = 20       # 更新间隔（秒）
     TDX_INSTALL_PATH = r'D:/new_tdx_x/new_tdx'  # 通达信安装路径（请修改为实际路径）
