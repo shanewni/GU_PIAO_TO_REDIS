@@ -10,13 +10,15 @@ from typing import Callable, Dict, List
 warnings.filterwarnings('ignore')
 
 class TdxStockBacktest:
-    """基于pytdx的股票回测框架（支持多周期K线）"""
+    """基于pytdx的股票回测框架（支持多周期K线，新增止损策略）"""
     
     def __init__(self):
         self.api = TdxHq_API()
         self.stock_data = {}  # 改为字典存储多周期数据: {'day': 日线数据, '30min': 30分钟数据}
         self.backtest_result = None  # 存储回测结果
         self.trade_records = None  # 交易记录
+        self.stop_loss_price = 0.0  # 新增：止损价格（买入K线的最低点）
+        self.in_position = False    # 新增：是否持仓标记
     
     def connect_tdx(self, ip: str = "152.136.167.10", port: int = 7709) -> bool:
         """
@@ -106,7 +108,7 @@ class TdxStockBacktest:
     
     def run_backtest(self, strategy_func: Callable, period: str = 'day', init_cash: float = 100000.0, commission: float = 0.0003) -> pd.DataFrame:
         """
-        执行指定周期的策略回测
+        执行指定周期的策略回测（新增止损逻辑：买入K线最低点为止损价，触发则收盘价卖出）
         :param strategy_func: 策略函数（输入data，输出买卖信号）
         :param period: 回测周期 ('day'=日线, '30min'=30分钟)
         :param init_cash: 初始资金
@@ -127,8 +129,13 @@ class TdxStockBacktest:
         total_asset = init_cash  # 总资产（现金+持仓市值）
         trade_records = []  # 交易记录
         daily_results = []  # 每日/每30分钟结果
-        # 新增：记录每笔交易的盈亏（用于计算盈亏比）
-        trade_pnl = []
+        trade_pnl = []      # 记录每笔交易的盈亏（用于计算盈亏比）
+        
+        # 止损相关初始化
+        self.stop_loss_price = 0.0  # 止损价格（买入K线的最低价）
+        self.in_position = False    # 是否持仓
+        buy_kline_low = 0.0         # 买入K线的最低价
+        buy_datetime = None         # 买入时间
         
         # 1. 运行策略函数，获取买卖信号（多周期策略需要传入日线数据）
         if period == '30min' and 'day' in self.stock_data:
@@ -141,14 +148,52 @@ class TdxStockBacktest:
             print("策略函数必须返回包含'signal'列的DataFrame（signal: 1=买入, -1=卖出, 0=持有）")
             return pd.DataFrame()
         
-        # 2. 逐行执行回测
+        # 2. 逐行执行回测（新增止损逻辑）
         buy_price = 0  # 记录买入价格
         buy_fee = 0    # 记录买入手续费
+        
         for datetime, row in data.iterrows():
             close_price = row['收盘价']
+            low_price = row['最低价']
+            high_price = row['最高价']
             
-            # 执行买入信号
-            if row['signal'] == 1 and cash > close_price:
+            # ===== 止损逻辑：触发止损则强制卖出 =====
+            if self.in_position and low_price <= self.stop_loss_price:
+                # 触发止损，以收盘价卖出全部持仓
+                sell_num = position
+                fee = sell_num * close_price * commission
+                income = sell_num * close_price * (1 - commission)
+                
+                # 计算这笔止损交易的盈亏
+                total_buy_cost = sell_num * buy_price + buy_fee  # 买入总成本（含手续费）
+                total_sell_income = income - fee                # 卖出总收入（扣手续费）
+                pnl = total_sell_income - total_buy_cost        # 单笔盈亏
+                
+                cash += income
+                trade_records.append({
+                    '时间': datetime,
+                    '操作': '止损卖出',  # 标记为止损卖出
+                    '价格': close_price,
+                    '数量': sell_num,
+                    '费用': fee,
+                    '单笔盈亏': pnl,
+                    '触发止损价': self.stop_loss_price,
+                    '当前K线最低价': low_price
+                })
+                trade_pnl.append(pnl)
+                
+                # 重置持仓和止损参数
+                position = 0
+                buy_price = 0
+                buy_fee = 0
+                self.stop_loss_price = 0.0
+                self.in_position = False
+                buy_kline_low = 0.0
+                
+                print(f"【止损触发】{datetime} - 价格{low_price} <= 止损价{self.stop_loss_price}，以收盘价{close_price}卖出{sell_num}股")
+            
+            # ===== 正常买入信号执行 =====
+            if row['signal'] == 1 and cash > close_price and not self.in_position:
                 # 计算可买数量（整手，1手=100股）
                 buy_num = (cash // (close_price * 100)) * 100
                 if buy_num > 0:
@@ -160,15 +205,23 @@ class TdxStockBacktest:
                         cash -= cost
                         buy_price = close_price  # 记录买入价
                         buy_fee = fee            # 记录买入手续费
+                        buy_kline_low = row['最低价']  # 记录买入K线的最低价
+                        self.stop_loss_price = buy_kline_low  # 设置止损价为买入K线最低价
+                        self.in_position = True  # 标记为持仓状态
+                        buy_datetime = datetime
+                        
                         trade_records.append({
                             '时间': datetime,
                             '操作': '买入',
                             '价格': close_price,
                             '数量': buy_num,
-                            '费用': fee
+                            '费用': fee,
+                            '买入K线最低价': buy_kline_low,
+                            '设置止损价': self.stop_loss_price
                         })
+                        print(f"【买入开仓】{datetime} - 价格{close_price}，数量{buy_num}，止损价设置为{self.stop_loss_price}")
             
-            # 执行卖出信号
+            # ===== 正常卖出信号执行 =====
             elif row['signal'] == -1 and position > 0:
                 # 卖出全部持仓
                 sell_num = position
@@ -183,17 +236,24 @@ class TdxStockBacktest:
                 cash += income
                 trade_records.append({
                     '时间': datetime,
-                    '操作': '卖出',
+                    '操作': '策略卖出',
                     '价格': close_price,
                     '数量': sell_num,
                     '费用': fee,
-                    '单笔盈亏': pnl  # 新增：记录单笔盈亏
+                    '单笔盈亏': pnl
                 })
-                # 新增：存储单笔盈亏用于计算盈亏比
+                # 存储单笔盈亏用于计算盈亏比
                 trade_pnl.append(pnl)
+                
+                # 重置持仓和止损参数
                 position = 0
                 buy_price = 0
                 buy_fee = 0
+                self.stop_loss_price = 0.0
+                self.in_position = False
+                buy_kline_low = 0.0
+                
+                print(f"【策略卖出】{datetime} - 价格{close_price}，数量{sell_num}，盈亏{pnl:.2f}")
             
             # 计算当前总资产
             total_asset = cash + position * close_price
@@ -204,7 +264,8 @@ class TdxStockBacktest:
                 '可用现金': cash,
                 '总资产': total_asset,
                 '累计收益': total_asset - init_cash,
-                '累计收益率': (total_asset - init_cash) / init_cash * 100
+                '累计收益率': (total_asset - init_cash) / init_cash * 100,
+                '止损价格': self.stop_loss_price if self.in_position else 0.0
             })
         
         # 整理回测结果
@@ -213,7 +274,7 @@ class TdxStockBacktest:
         
         # 添加交易记录
         self.trade_records = pd.DataFrame(trade_records)
-        # 新增：存储单笔盈亏列表
+        # 存储单笔盈亏列表
         self.trade_pnl = trade_pnl
         
         # 计算核心指标（包含盈亏比）
@@ -251,17 +312,15 @@ class TdxStockBacktest:
         if len(self.trade_records) > 0:
             win_trades = 0
             buy_price = 0
-            total_trades = len(self.trade_records) // 2  # 每2笔（买+卖）算一次完整交易
-            for idx, trade in self.trade_records.iterrows():
-                if trade['操作'] == '买入':
-                    buy_price = trade['价格']
-                elif trade['操作'] == '卖出' and buy_price > 0:
-                    if trade['价格'] > buy_price:
-                        win_trades += 1
-                    buy_price = 0
+            # 区分正常交易和止损交易，都计入完整交易次数
+            total_trades = sum(1 for _, trade in self.trade_records.iterrows() if trade['操作'] in ['策略卖出', '止损卖出'])
+            # 统计盈利交易数
+            for _, trade in self.trade_records.iterrows():
+                if '单笔盈亏' in trade and trade['单笔盈亏'] > 0:
+                    win_trades += 1
             win_rate = win_trades / total_trades * 100 if total_trades >=1 else 0
         
-        # ========== 新增：盈亏比计算 ==========
+        # 盈亏比计算
         profit_loss_ratio = 0.0
         if hasattr(self, 'trade_pnl') and len(self.trade_pnl) > 0:
             # 分离盈利和亏损交易
@@ -276,9 +335,15 @@ class TdxStockBacktest:
             elif len(profitable_trades) > 0 and len(losing_trades) == 0:
                 # 只有盈利交易，盈亏比设为无穷大
                 profit_loss_ratio = float('inf')
-            # 只有亏损交易时，盈亏比为0
         
-        # 存储指标（新增盈亏比）
+        # 新增：止损相关统计
+        stop_loss_count = 0
+        strategy_sell_count = 0
+        if len(self.trade_records) > 0:
+            stop_loss_count = sum(1 for _, trade in self.trade_records.iterrows() if trade['操作'] == '止损卖出')
+            strategy_sell_count = sum(1 for _, trade in self.trade_records.iterrows() if trade['操作'] == '策略卖出')
+        
+        # 存储指标（新增盈亏比和止损统计）
         self.metrics = {
             '初始资金': init_cash,
             '最终总资产': self.backtest_result['总资产'].iloc[-1],
@@ -286,10 +351,12 @@ class TdxStockBacktest:
             '累计收益率(%)': round(total_return, 2),
             '年化收益率(%)': round(annual_return, 2),
             '最大回撤(%)': round(max_drawdown, 2),
-            '交易次数': len(self.trade_records),
+            '总交易记录数': len(self.trade_records),
             '完整交易次数': total_trades,
+            '策略卖出次数': strategy_sell_count,
+            '止损卖出次数': stop_loss_count,
             '胜率(%)': round(win_rate, 2),
-            '盈亏比': profit_loss_ratio  # 新增盈亏比指标
+            '盈亏比': profit_loss_ratio
         }
         
         # 打印指标
@@ -313,20 +380,27 @@ class TdxStockBacktest:
         return max_dd
     
     def plot_result(self, period: str = 'day'):
-        """可视化指定周期的回测结果"""
+        """可视化指定周期的回测结果（新增止损价格标注）"""
         if self.backtest_result is None:
             print("无回测结果可展示")
             return
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
         
-        # 子图1：价格和总资产
+        # 子图1：价格、总资产和止损价
         ax1.plot(self.backtest_result.index, self.backtest_result['收盘价'], label=f'{period}价格', color='blue', alpha=0.7)
+        # 绘制止损价格线（仅在持仓期间显示）
+        stop_loss_series = self.backtest_result['止损价格']
+        stop_loss_series = stop_loss_series[stop_loss_series > 0]
+        if not stop_loss_series.empty:
+            ax1.plot(stop_loss_series.index, stop_loss_series.values, 
+                    label='止损价格', color='red', linestyle='--', alpha=0.8)
+        
         ax1_twin = ax1.twinx()
         ax1_twin.plot(self.backtest_result.index, self.backtest_result['总资产'], label='总资产', color='red')
         ax1.set_ylabel('价格 (元)')
         ax1_twin.set_ylabel('总资产 (元)')
-        ax1.set_title(f'{self._ktype2name({"day":9, "30min":2}[period])}价格与总资产走势')
+        ax1.set_title(f'{self._ktype2name({"day":9, "30min":2}[period])}价格、止损价与总资产走势')
         ax1.legend(loc='upper left')
         ax1_twin.legend(loc='upper right')
         ax1.grid(True, alpha=0.3)
@@ -356,6 +430,7 @@ def multi_period_strategy(min30_data: pd.DataFrame, day_data: pd.DataFrame) -> p
     3. 30分钟K线收盘价在30分钟60均线上
     卖出条件：
     1. 30分钟K线收盘价在30分钟60均线以下，且连续两根K线都满足此条件
+    （注：止损卖出逻辑在run_backtest中独立实现，优先级高于策略卖出）
     :param min30_data: 30分钟K线数据
     :param day_data: 日线数据
     :return: 带买卖信号的30分钟数据DataFrame
@@ -444,19 +519,19 @@ if __name__ == "__main__":
     
     # 2. 连接通达信服务器
     if backtest.connect_tdx():
-        # 3. 一键获取日线+30分钟线数据（以贵州茅台 600519 为例）
-        code = "000042"
+        # 3. 一键获取日线+30分钟线数据（以深长城 000042 为例）
+        code = "603536"
         multi_data = backtest.get_multi_period_data(code=code, count=800)  # 增加数据量保证60均线有效
         
-        # 4. 运行30分钟周期的多策略回测
+        # 4. 运行30分钟周期的多策略回测（包含止损逻辑）
         if not multi_data['30min'].empty and not multi_data['day'].empty:
-            print("\n===== 运行30分钟线多周期策略回测 =====")
+            print("\n===== 运行30分钟线多周期策略回测（含止损） =====")
             # 先通过策略函数处理数据
             min30_with_signal = multi_period_strategy(multi_data['30min'], multi_data['day'])
             # 将带信号的30分钟数据更新到stock_data中
             backtest.stock_data['30min'] = min30_with_signal
             
-            # 修复：dummy_strategy支持2个参数（兼容run_backtest的传参逻辑）
+            # dummy策略兼容回测框架
             def dummy_strategy(data, day_data=None):
                 return data
             
@@ -469,7 +544,7 @@ if __name__ == "__main__":
             )
             
             # 打印交易记录和可视化
-            print("\n===== 30分钟线交易记录 =====")
+            print("\n===== 30分钟线交易记录（含止损） =====")
             print(backtest.trade_records)
             backtest.plot_result(period='30min')
         
