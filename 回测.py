@@ -10,15 +10,17 @@ from typing import Callable, Dict, List
 warnings.filterwarnings('ignore')
 
 class TdxStockBacktest:
-    """基于pytdx的股票回测框架（支持多周期K线，新增止损策略）"""
+    """基于pytdx的股票回测框架（支持多周期K线+止损策略+以损定量）"""
     
     def __init__(self):
         self.api = TdxHq_API()
         self.stock_data = {}  # 改为字典存储多周期数据: {'day': 日线数据, '30min': 30分钟数据}
         self.backtest_result = None  # 存储回测结果
         self.trade_records = None  # 交易记录
-        self.stop_loss_price = 0.0  # 新增：止损价格（买入K线的最低点）
-        self.in_position = False    # 新增：是否持仓标记
+        self.stop_loss_price = 0.0  # 止损价格（买入K线的最低点）
+        self.in_position = False    # 是否持仓标记
+        self.stop_loss_ratio = 0.02 # 新增：总资金止损百分比（默认2%）
+        self.risk_per_trade = 0.0   # 新增：单笔交易可承受的最大亏损金额
     
     def connect_tdx(self, ip: str = "152.136.167.10", port: int = 7709) -> bool:
         """
@@ -106,19 +108,52 @@ class TdxStockBacktest:
             '30min': min30_data
         }
     
-    def run_backtest(self, strategy_func: Callable, period: str = 'day', init_cash: float = 100000.0, commission: float = 0.0003) -> pd.DataFrame:
+    def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
         """
-        执行指定周期的策略回测（新增止损逻辑：买入K线最低点为止损价，触发则收盘价卖出）
+        以损定量核心计算：根据止损百分比计算可买数量
+        :param current_cash: 当前可用总资金
+        :param entry_price: 买入价格
+        :param stop_loss_price: 止损价格
+        :return: 可买数量（100的整数倍，整手）
+        """
+        if entry_price <= stop_loss_price:
+            return 0  # 止损价不能大于等于买入价
+        
+        # 单笔可承受的最大亏损金额 = 当前总资金 * 止损百分比
+        self.risk_per_trade = current_cash * self.stop_loss_ratio
+        
+        # 每股亏损 = 买入价 - 止损价
+        loss_per_share = entry_price - stop_loss_price
+        
+        # 可买数量 = 可承受亏损金额 / 每股亏损（取整手）
+        max_shares = self.risk_per_trade / loss_per_share
+        position_size = int(max_shares // 100 * 100)  # 转换为100的整数倍
+        
+        # 安全校验：确保买入金额不超过可用资金（含手续费）
+        max_affordable = current_cash / (entry_price * 1.001)  # 预留手续费空间
+        position_size = min(position_size, int(max_affordable // 100 * 100))
+        
+        return max(position_size, 0)  # 确保数量非负
+    
+    def run_backtest(self, strategy_func: Callable, period: str = 'day', init_cash: float = 100000.0, 
+                     commission: float = 0.0003, stop_loss_ratio: float = 0.02) -> pd.DataFrame:
+        """
+        执行指定周期的策略回测（新增以损定量：按总资金止损百分比计算仓位）
         :param strategy_func: 策略函数（输入data，输出买卖信号）
         :param period: 回测周期 ('day'=日线, '30min'=30分钟)
         :param init_cash: 初始资金
         :param commission: 交易佣金（默认0.03%）
+        :param stop_loss_ratio: 总资金止损百分比（默认2%）
         :return: 回测结果DataFrame
         """
         # 检查指定周期数据是否存在
         if period not in self.stock_data or self.stock_data[period].empty:
             print(f"请先获取{self._ktype2name({'day':9, '30min':2}[period])}数据")
             return pd.DataFrame()
+        
+        # 初始化止损百分比
+        self.stop_loss_ratio = stop_loss_ratio
+        print(f"以损定量配置：单笔交易最大亏损 = 总资金 × {stop_loss_ratio*100}%")
         
         # 复制数据避免修改原数据
         data = self.stock_data[period].copy()
@@ -148,7 +183,7 @@ class TdxStockBacktest:
             print("策略函数必须返回包含'signal'列的DataFrame（signal: 1=买入, -1=卖出, 0=持有）")
             return pd.DataFrame()
         
-        # 2. 逐行执行回测（新增止损逻辑）
+        # 2. 逐行执行回测（新增以损定量+止损逻辑）
         buy_price = 0  # 记录买入价格
         buy_fee = 0    # 记录买入手续费
         
@@ -156,6 +191,7 @@ class TdxStockBacktest:
             close_price = row['收盘价']
             low_price = row['最低价']
             high_price = row['最高价']
+            current_total_asset = cash + position * close_price  # 当前总资产
             
             # ===== 止损逻辑：触发止损则强制卖出 =====
             if self.in_position and low_price <= self.stop_loss_price:
@@ -172,13 +208,15 @@ class TdxStockBacktest:
                 cash += income
                 trade_records.append({
                     '时间': datetime,
-                    '操作': '止损卖出',  # 标记为止损卖出
+                    '操作': '止损卖出',
                     '价格': close_price,
                     '数量': sell_num,
                     '费用': fee,
                     '单笔盈亏': pnl,
                     '触发止损价': self.stop_loss_price,
-                    '当前K线最低价': low_price
+                    '当前K线最低价': low_price,
+                    '单笔风险金额': self.risk_per_trade,  # 新增：记录单笔风险金额
+                    '实际亏损比例': abs(pnl)/current_total_asset*100  # 新增：实际亏损占总资金比例
                 })
                 trade_pnl.append(pnl)
                 
@@ -189,13 +227,24 @@ class TdxStockBacktest:
                 self.stop_loss_price = 0.0
                 self.in_position = False
                 buy_kline_low = 0.0
+                self.risk_per_trade = 0.0
                 
                 print(f"【止损触发】{datetime} - 价格{low_price} <= 止损价{self.stop_loss_price}，以收盘价{close_price}卖出{sell_num}股")
+                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际亏损:{pnl:.2f} | 实际亏损比例:{abs(pnl)/current_total_asset*100:.2f}%")
             
-            # ===== 正常买入信号执行 =====
+            # ===== 正常买入信号执行（以损定量） =====
             if row['signal'] == 1 and cash > close_price and not self.in_position:
-                # 计算可买数量（整手，1手=100股）
-                buy_num = (cash // (close_price * 100)) * 100
+                # 确定止损价（买入K线最低价）
+                buy_kline_low = row['最低价']
+                self.stop_loss_price = buy_kline_low
+                
+                # 以损定量：计算可买数量
+                buy_num = self.calculate_position_size(
+                    current_cash=current_total_asset,  # 基于当前总资产计算
+                    entry_price=close_price,
+                    stop_loss_price=self.stop_loss_price
+                )
+                
                 if buy_num > 0:
                     # 计算交易成本
                     cost = buy_num * close_price * (1 + commission)
@@ -205,8 +254,6 @@ class TdxStockBacktest:
                         cash -= cost
                         buy_price = close_price  # 记录买入价
                         buy_fee = fee            # 记录买入手续费
-                        buy_kline_low = row['最低价']  # 记录买入K线的最低价
-                        self.stop_loss_price = buy_kline_low  # 设置止损价为买入K线最低价
                         self.in_position = True  # 标记为持仓状态
                         buy_datetime = datetime
                         
@@ -217,9 +264,14 @@ class TdxStockBacktest:
                             '数量': buy_num,
                             '费用': fee,
                             '买入K线最低价': buy_kline_low,
-                            '设置止损价': self.stop_loss_price
+                            '设置止损价': self.stop_loss_price,
+                            '单笔风险金额': self.risk_per_trade,  # 新增：记录单笔风险金额
+                            '风险比例': self.stop_loss_ratio*100,  # 新增：记录风险比例
                         })
-                        print(f"【买入开仓】{datetime} - 价格{close_price}，数量{buy_num}，止损价设置为{self.stop_loss_price}")
+                        print(f"【买入开仓（以损定量）】{datetime} - 价格{close_price}，数量{buy_num}")
+                        print(f"          - 止损价:{self.stop_loss_price} | 单笔风险金额:{self.risk_per_trade:.2f} | 风险比例:{self.stop_loss_ratio*100}%")
+                else:
+                    print(f"【买入失败】{datetime} - 以损定量计算可买数量为0（止损价{self.stop_loss_price} >= 买入价{close_price}）")
             
             # ===== 正常卖出信号执行 =====
             elif row['signal'] == -1 and position > 0:
@@ -240,7 +292,9 @@ class TdxStockBacktest:
                     '价格': close_price,
                     '数量': sell_num,
                     '费用': fee,
-                    '单笔盈亏': pnl
+                    '单笔盈亏': pnl,
+                    '单笔风险金额': self.risk_per_trade,  # 新增：记录单笔风险金额
+                    '实际盈亏比例': pnl/current_total_asset*100  # 新增：实际盈亏占总资金比例
                 })
                 # 存储单笔盈亏用于计算盈亏比
                 trade_pnl.append(pnl)
@@ -252,8 +306,10 @@ class TdxStockBacktest:
                 self.stop_loss_price = 0.0
                 self.in_position = False
                 buy_kline_low = 0.0
+                self.risk_per_trade = 0.0
                 
                 print(f"【策略卖出】{datetime} - 价格{close_price}，数量{sell_num}，盈亏{pnl:.2f}")
+                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际盈亏比例:{pnl/current_total_asset*100:.2f}%")
             
             # 计算当前总资产
             total_asset = cash + position * close_price
@@ -265,7 +321,8 @@ class TdxStockBacktest:
                 '总资产': total_asset,
                 '累计收益': total_asset - init_cash,
                 '累计收益率': (total_asset - init_cash) / init_cash * 100,
-                '止损价格': self.stop_loss_price if self.in_position else 0.0
+                '止损价格': self.stop_loss_price if self.in_position else 0.0,
+                '单笔风险金额': self.risk_per_trade if self.in_position else 0.0  # 新增：每日风险金额
             })
         
         # 整理回测结果
@@ -284,7 +341,7 @@ class TdxStockBacktest:
         return self.backtest_result
     
     def calc_backtest_metrics(self, init_cash: float) -> Dict:
-        """计算回测核心指标（新增盈亏比计算）"""
+        """计算回测核心指标（新增以损定量相关统计）"""
         if self.backtest_result is None:
             return {}
         
@@ -339,11 +396,18 @@ class TdxStockBacktest:
         # 新增：止损相关统计
         stop_loss_count = 0
         strategy_sell_count = 0
+        total_risk_amount = 0.0  # 累计风险金额
+        actual_loss_amount = 0.0 # 实际止损亏损总额
         if len(self.trade_records) > 0:
             stop_loss_count = sum(1 for _, trade in self.trade_records.iterrows() if trade['操作'] == '止损卖出')
             strategy_sell_count = sum(1 for _, trade in self.trade_records.iterrows() if trade['操作'] == '策略卖出')
+            # 统计累计风险金额和实际亏损
+            total_risk_amount = self.trade_records['单笔风险金额'].sum()
+            stop_loss_trades = self.trade_records[self.trade_records['操作'] == '止损卖出']
+            if not stop_loss_trades.empty:
+                actual_loss_amount = stop_loss_trades['单笔盈亏'].sum()  # 亏损为负数
         
-        # 存储指标（新增盈亏比和止损统计）
+        # 存储指标（新增以损定量相关）
         self.metrics = {
             '初始资金': init_cash,
             '最终总资产': self.backtest_result['总资产'].iloc[-1],
@@ -356,7 +420,11 @@ class TdxStockBacktest:
             '策略卖出次数': strategy_sell_count,
             '止损卖出次数': stop_loss_count,
             '胜率(%)': round(win_rate, 2),
-            '盈亏比': profit_loss_ratio
+            '盈亏比': profit_loss_ratio,
+            '止损百分比设置(%)': round(self.stop_loss_ratio*100, 2),  # 新增
+            '累计风险金额': round(total_risk_amount, 2),            # 新增
+            '实际止损亏损总额': round(actual_loss_amount, 2),       # 新增
+            '平均单笔风险金额': round(total_risk_amount/max(total_trades,1), 2)  # 新增
         }
         
         # 打印指标
@@ -380,12 +448,12 @@ class TdxStockBacktest:
         return max_dd
     
     def plot_result(self, period: str = 'day'):
-        """可视化指定周期的回测结果（新增止损价格标注）"""
+        """可视化指定周期的回测结果（新增以损定量相关标注）"""
         if self.backtest_result is None:
             print("无回测结果可展示")
             return
         
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+        fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
         
         # 子图1：价格、总资产和止损价
         ax1.plot(self.backtest_result.index, self.backtest_result['收盘价'], label=f'{period}价格', color='blue', alpha=0.7)
@@ -408,9 +476,19 @@ class TdxStockBacktest:
         # 子图2：累计收益率
         ax2.bar(self.backtest_result.index, self.backtest_result['累计收益率'], color='green', alpha=0.6)
         ax2.set_ylabel('累计收益率 (%)')
-        ax2.set_xlabel('时间')
         ax2.set_title('累计收益率走势')
         ax2.grid(True, alpha=0.3)
+        
+        # 子图3：单笔风险金额（新增）
+        risk_series = self.backtest_result['单笔风险金额']
+        risk_series = risk_series[risk_series > 0]
+        if not risk_series.empty:
+            ax3.plot(risk_series.index, risk_series.values, label='单笔风险金额', color='orange', marker='o', alpha=0.8)
+        ax3.set_ylabel('单笔风险金额 (元)')
+        ax3.set_xlabel('时间')
+        ax3.set_title(f'单笔风险金额走势（止损比例：{self.stop_loss_ratio*100}%）')
+        ax3.legend(loc='upper right')
+        ax3.grid(True, alpha=0.3)
         
         plt.tight_layout()
         plt.show()
@@ -512,20 +590,20 @@ def multi_period_strategy(min30_data: pd.DataFrame, day_data: pd.DataFrame) -> p
     return min30_df
 
 
-# ====================== 使用示例 ======================
+# ====================== 使用示例（新增以损定量配置） ======================
 if __name__ == "__main__":
     # 1. 初始化回测框架
     backtest = TdxStockBacktest()
     
     # 2. 连接通达信服务器
     if backtest.connect_tdx():
-        # 3. 一键获取日线+30分钟线数据（以深长城 000042 为例）
-        code = "603536"
-        multi_data = backtest.get_multi_period_data(code=code, count=800)  # 增加数据量保证60均线有效
+        # 3. 一键获取日线+30分钟线数据（以振江股份 603536 为例）
+        code = "600362"
+        multi_data = backtest.get_multi_period_data(code=code, count=800)  # 增加数据量保证60均线有
         
-        # 4. 运行30分钟周期的多策略回测（包含止损逻辑）
+        # 4. 运行30分钟周期的多策略回测（含以损定量+止损）
         if not multi_data['30min'].empty and not multi_data['day'].empty:
-            print("\n===== 运行30分钟线多周期策略回测（含止损） =====")
+            print("\n===== 运行30分钟线多周期策略回测（含以损定量+止损） =====")
             # 先通过策略函数处理数据
             min30_with_signal = multi_period_strategy(multi_data['30min'], multi_data['day'])
             # 将带信号的30分钟数据更新到stock_data中
@@ -535,16 +613,17 @@ if __name__ == "__main__":
             def dummy_strategy(data, day_data=None):
                 return data
             
-            # 执行回测
+            # 执行回测（新增stop_loss_ratio参数，设置总资金止损百分比）
             min30_result = backtest.run_backtest(
                 strategy_func=dummy_strategy, 
                 period='30min', 
                 init_cash=100000,
-                commission=0.0003
+                commission=0.0003,
+                stop_loss_ratio=0.02  # 每次止损总资金的2%，可自行调整（如0.01=1%，0.03=3%）
             )
             
             # 打印交易记录和可视化
-            print("\n===== 30分钟线交易记录（含止损） =====")
+            print("\n===== 30分钟线交易记录（含以损定量+止损） =====")
             print(backtest.trade_records)
             backtest.plot_result(period='30min')
         
