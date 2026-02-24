@@ -637,11 +637,19 @@ def multi_period_strategy(min30_data: pd.DataFrame, min30_high_list: list, min30
             if max(high_range) <= prev_top_high:
                 min30_df.iloc[idx, min30_df.columns.get_loc('sell_cond_pattern1')] = True
     
+    # ===================== 1. 定义四个独立开关（True=开启，False=关闭） =====================
+    switch_sell_original = True   # 原卖出条件开关//    连续两根K线收盘价在60均线以下
+    switch_sell_pattern1 = False   # 卖出模式1（sell_cond_pattern1）开关//距离+最高价限制
+    switch_sell_pattern2 = False   # 卖出模式2（sell_cond_pattern2）开关//跌破底分型最低价
+
     # 合并所有卖出条件（原条件 + 两个新条件）
     min30_df['new_sell_cond'] = (
-        min30_df['min30_sell_cond_original'] | 
-        min30_df['sell_cond_pattern1'] | 
-        min30_df['sell_cond_pattern2']
+            # 原卖出条件：仅开关开启时生效
+            (min30_df['min30_sell_cond_original'] & switch_sell_original) | 
+            # 卖出模式1：仅开关开启时生效
+            (min30_df['sell_cond_pattern1'] & switch_sell_pattern1) | 
+            # 卖出模式2：仅开关开启时生效
+            (min30_df['sell_cond_pattern2'] & switch_sell_pattern2) 
     )
     
     # 6. 将日线条件映射到30分钟数据
