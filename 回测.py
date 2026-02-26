@@ -639,8 +639,8 @@ def multi_period_strategy(min30_data: pd.DataFrame, min30_high_list: list, min30
     
     # ===================== 1. 定义四个独立开关（True=开启，False=关闭） =====================
     switch_sell_original = True   # 原卖出条件开关//    连续两根K线收盘价在60均线以下
-    switch_sell_pattern1 = False   # 卖出模式1（sell_cond_pattern1）开关//距离+最高价限制
-    switch_sell_pattern2 = False   # 卖出模式2（sell_cond_pattern2）开关//跌破底分型最低价
+    switch_sell_pattern1 = True   # 卖出模式1（sell_cond_pattern1）开关//距离+最高价限制
+    switch_sell_pattern2 = True   # 卖出模式2（sell_cond_pattern2）开关//跌破底分型最低价
 
     # 合并所有卖出条件（原条件 + 两个新条件）
     min30_df['new_sell_cond'] = (

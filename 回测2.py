@@ -96,7 +96,7 @@ class TdxStockBacktest:
         }
         return ktype_map.get(ktype, f'未知周期({ktype})')
     
-    def get_multi_period_data(self, code: str, count: int = 700) -> Dict[str, pd.DataFrame]:
+    def get_multi_period_data(self, code: str, count: int = 800) -> Dict[str, pd.DataFrame]:
         """
         一键获取日线+30分钟线数据
         :param code: 股票代码
@@ -143,38 +143,38 @@ class TdxStockBacktest:
         return max(position_size, 0)  # 确保数量非负
     
     @staticmethod
-    def detect_turning_points(high: List[float], low: List[float], window: int = 5) -> List[float]:
-        """
-        检测高低转折点，生成frac数组（1.0=高点，-1.0=低点，0.0=无转折）
-        :param high: 最高价列表
-        :param low: 最低价列表
-        :param window: 窗口期（判断高低点的前后K线数）
-        :return: frac转折点标记列表
-        """
-        data_len = len(high)
-        frac = [0.0] * data_len
+    # def detect_turning_points(high: List[float], low: List[float], window: int = 5) -> List[float]:
+    #     """
+    #     检测高低转折点，生成frac数组（1.0=高点，-1.0=低点，0.0=无转折）
+    #     :param high: 最高价列表
+    #     :param low: 最低价列表
+    #     :param window: 窗口期（判断高低点的前后K线数）
+    #     :return: frac转折点标记列表
+    #     """
+    #     data_len = len(high)
+    #     frac = [0.0] * data_len
         
-        for i in range(window, data_len - window):
-            # 判断是否为高点：当前最高价大于前后window根K线的最高价
-            is_high = True
-            for j in range(1, window + 1):
-                if high[i] <= high[i - j] or high[i] <= high[i + j]:
-                    is_high = False
-                    break
-            if is_high:
-                frac[i] = 1.0
-                continue
+    #     for i in range(window, data_len - window):
+    #         # 判断是否为高点：当前最高价大于前后window根K线的最高价
+    #         is_high = True
+    #         for j in range(1, window + 1):
+    #             if high[i] <= high[i - j] or high[i] <= high[i + j]:
+    #                 is_high = False
+    #                 break
+    #         if is_high:
+    #             frac[i] = 1.0
+    #             continue
             
-            # 判断是否为低点：当前最低价小于前后window根K线的最低价
-            is_low = True
-            for j in range(1, window + 1):
-                if low[i] >= low[i - j] or low[i] >= low[i + j]:
-                    is_low = False
-                    break
-            if is_low:
-                frac[i] = -1.0
+    #         # 判断是否为低点：当前最低价小于前后window根K线的最低价
+    #         is_low = True
+    #         for j in range(1, window + 1):
+    #             if low[i] >= low[i - j] or low[i] >= low[i + j]:
+    #                 is_low = False
+    #                 break
+    #         if is_low:
+    #             frac[i] = -1.0
         
-        return frac
+    #     return frac
     
     @staticmethod
     def three_buy_variant(frac, high, low):
@@ -275,7 +275,7 @@ class TdxStockBacktest:
         return pf_out
     
     @staticmethod
-    def calculate_three_buy_signals(frac_full, high_full, low_full):
+    def calculate_three_buy_signals( high_full, low_full):
         """
         遍历完整数据序列，逐段计算三买变体买点信号
         :param frac_full: 完整的转折点标记列表（全量数据）
@@ -284,19 +284,19 @@ class TdxStockBacktest:
         :return: 全量数据的买点信号列表，1.0表示对应位置是买点，0.0表示无
         """
         # 校验全量数据长度一致
-        if len(frac_full) != len(high_full) or len(high_full) != len(low_full):
+        if  len(high_full) != len(low_full):
             raise ValueError("frac_full、high_full、low_full必须长度一致")
         
-        total_length = len(frac_full)
+        total_length = len(high_full)
         # 初始化全量信号数组（默认全为0）
         full_signals = [0.0] * total_length
         
         # 遍历每个数据点，逐步扩展窗口计算信号
         for window_end in range(1, total_length + 1):
             # 截取当前窗口的子数据（从0到window_end-1）
-            frac_window = frac_full[:window_end]
             high_window = high_full[:window_end]
             low_window = low_full[:window_end]
+            frac_window = gupiaojichu.identify_turns(window_end, high_window, low_window)
             
             # 调用三买变体函数，计算当前窗口的信号
             try:
@@ -397,11 +397,13 @@ class TdxStockBacktest:
         :param min30_low: 30分钟最低价列表
         :return: 带signal列的DataFrame（1=买入，-1=卖出，0=持有）
         """
+
+                # 3. 获取顶底分型数据
         # 1. 生成转折点frac数组
-        frac = self.detect_turning_points(min30_high, min30_low, window=5)
+        # frac = self.detect_turning_points(min30_high, min30_low, window=5)
         
         # 2. 遍历计算三买买点信号
-        buy_signals = self.calculate_three_buy_signals(frac, min30_high, min30_low)
+        buy_signals = self.calculate_three_buy_signals( min30_high, min30_low)
         
         # 3. 生成买卖信号（买入=1，卖出=-1，持有=0）
         # 策略逻辑：买点买入，持仓后收盘价跌破止损价卖出（或固定止盈）
@@ -444,7 +446,7 @@ class TdxStockBacktest:
         return data
     
     def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
-                     commission: float = 0.0003, stop_loss_ratio: float = 0.02) -> pd.DataFrame:
+                     commission: float = 0.0003, stop_loss_ratio: float = 0.01) -> pd.DataFrame:
         """
         执行三买变体策略回测（30分钟周期）
         :param code: 股票代码
@@ -651,21 +653,11 @@ if __name__ == "__main__":
     # 连接通达信服务器
     backtest.connect_tdx()
     
-    # 执行回测（示例：贵州茅台 600519）
+    # 执行回测
     result = backtest.run_backtest(
-        code="600519",
+        code="600362",
         period="30min",
         init_cash=100000.0,
         commission=0.0003,
-        stop_loss_ratio=0.02
+        stop_loss_ratio=0.01
     )
-    
-    # 可选：绘制总资产曲线
-    plt.figure(figsize=(12, 6))
-    plt.plot(result['总资产'], label='总资产')
-    plt.title('30分钟三买变体策略回测 - 总资产曲线')
-    plt.xlabel('时间')
-    plt.ylabel('总资产（元）')
-    plt.legend()
-    plt.grid(True)
-    plt.show()
