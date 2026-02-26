@@ -311,12 +311,16 @@ class TdxStockBacktest:
         
         return full_signals
     @staticmethod
-    def calculate_dynamic_sell_signals(high_full: List[float], low_full: List[float], close_full: List[float], ma60_full: pd.Series) -> List[bool]:
+    def calculate_dynamic_sell_signals(high_full: List[float], low_full: List[float], close_full: List[float], ma60_full: pd.Series) -> tuple[List[bool], List[str]]:
         """
         逐K线模拟动态出现，计算动态卖出条件，彻底杜绝未来函数。
+        返回：
+            sell_signals: 卖出信号列表
+            sell_reasons: 对应位置的卖出原因（空字符串表示无）
         """
         total_length = len(high_full)
         sell_signals = [False] * total_length
+        sell_reasons = [""] * total_length  # 新增：记录每个K线的卖出原因
         
         # 将Series转换为列表，大幅提升循环取值效率
         ma60_list = ma60_full.tolist()
@@ -369,13 +373,23 @@ class TdxStockBacktest:
                         high_range = high_window[last_bottom_idx:] 
                         if max(high_range) <= high_window[prev_top_idx]:
                             cond_pattern1 = True
-                            
-            # 综合判断：满足任一条件则触发卖出
-            # 这里默认三个开关全部开启，你可以根据需要调整
+            
+            # 综合判断：满足任一条件则触发卖出，并记录原因
+            reason = ""
+            if cond_ma60:
+                reason += "连续2根K线收盘价低于MA60；"
+            if cond_pattern1:
+                reason += "底分型后未突破前高且距离达标；"
+            if cond_pattern2:
+                reason += "跌破最后底分型最低价；"
+            
             if cond_ma60 or cond_pattern1 or cond_pattern2:
                 sell_signals[current_idx] = True
+                sell_reasons[current_idx] = reason.rstrip("；")  # 去除末尾分号
+            else:
+                sell_reasons[current_idx] = ""
                 
-        return sell_signals
+        return sell_signals, sell_reasons
     
     @staticmethod
     def calc_max_drawdown(asset_values: np.ndarray) -> float:
@@ -468,10 +482,11 @@ class TdxStockBacktest:
         # 2. 计算60均线
         data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
         
-        # 3. 动态计算卖出信号 (调用新增的去未来函数方法)
+        # 3. 动态计算卖出信号 & 卖出原因 (调用修改后的方法)
         close_list = data['收盘价'].tolist()
-        sell_signals = self.calculate_dynamic_sell_signals(min30_high, min30_low, close_list, data['ma60'])
+        sell_signals, sell_reasons = self.calculate_dynamic_sell_signals(min30_high, min30_low, close_list, data['ma60'])
         data['new_sell_cond'] = sell_signals
+        data['sell_reason'] = sell_reasons  # 新增：保存卖出原因
         
         # 4. 状态机生成最终交易信号
         data['signal'] = 0
@@ -501,7 +516,7 @@ class TdxStockBacktest:
                     data.loc[idx, 'signal'] = -1
                     in_pos = False
         
-        # 清理辅助列
+        # 清理辅助列（保留sell_reason用于回测打印）
         cols_to_drop = ['ma60', 'new_sell_cond', 'buy_signal']
         data = data.drop(columns=[c for c in cols_to_drop if c in data.columns])
         
@@ -644,7 +659,13 @@ class TdxStockBacktest:
                     print(f"【买入失败】{datetime} - 以损定量计算可买数量为0（止损价{self.stop_loss_price} >= 买入价{close_price}）")
             
             # ===== 正常卖出信号执行 =====
+            # ===== 正常卖出信号执行 =====
             elif row['signal'] == -1 and position > 0:
+                # 获取当前K线索引（第几根K线）
+                current_kline_idx = data.index.get_loc(datetime) + 1  # 从1开始计数
+                # 获取卖出原因
+                sell_reason = row['sell_reason'] if 'sell_reason' in row else "未知原因"
+                
                 # 卖出全部持仓
                 sell_num = position
                 fee = sell_num * close_price * commission
@@ -663,7 +684,9 @@ class TdxStockBacktest:
                     '费用': fee,
                     '单笔盈亏': pnl,
                     '单笔风险金额': self.risk_per_trade,
-                    '实际盈亏比例': pnl/current_total_asset*100
+                    '实际盈亏比例': pnl/current_total_asset*100,
+                    '卖出原因': sell_reason,  # 新增：交易记录中保存卖出原因
+                    '当前K线索引': current_kline_idx  # 新增：交易记录中保存K线索引
                 })
                 self.trade_pnl.append(pnl)
                 
@@ -676,7 +699,9 @@ class TdxStockBacktest:
                 buy_kline_low = 0.0
                 self.risk_per_trade = 0.0
                 
-                print(f"【策略卖出】{datetime} - 价格{close_price}，数量{sell_num}，盈亏{pnl:.2f}")
+                # 新增：打印卖出原因和K线索引
+                print(f"【策略卖出】{datetime} - 第{current_kline_idx}根K线 | 价格{close_price}，数量{sell_num}，盈亏{pnl:.2f}")
+                print(f"          - 卖出原因：{sell_reason}")
                 print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际盈亏比例:{pnl/current_total_asset*100:.2f}%")
             
             # 计算当前总资产
