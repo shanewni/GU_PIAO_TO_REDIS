@@ -310,6 +310,72 @@ class TdxStockBacktest:
             full_signals[window_end - 1] = current_signal
         
         return full_signals
+    @staticmethod
+    def calculate_dynamic_sell_signals(high_full: List[float], low_full: List[float], close_full: List[float], ma60_full: pd.Series) -> List[bool]:
+        """
+        逐K线模拟动态出现，计算动态卖出条件，彻底杜绝未来函数。
+        """
+        total_length = len(high_full)
+        sell_signals = [False] * total_length
+        
+        # 将Series转换为列表，大幅提升循环取值效率
+        ma60_list = ma60_full.tolist()
+        
+        # 逐根K线向右推进（模拟实盘K线一根根走出来）
+        for window_end in range(1, total_length + 1):
+            if window_end < 60:
+                continue
+                
+            current_idx = window_end - 1
+            
+            # === 条件1：均线条件（无未来函数风险，只看当前和前一根） ===
+            cond_ma60 = False
+            if current_idx >= 1:
+                # 连续两根收盘价小于MA60
+                if close_full[current_idx] < ma60_list[current_idx] and close_full[current_idx-1] < ma60_list[current_idx-1]:
+                    cond_ma60 = True
+                    
+            # === 条件2 & 3：分型条件（需动态截取数据避免未来函数） ===
+            # 【核心逻辑】：只切片取到当前K线的数据
+            high_window = high_full[:window_end]
+            low_window = low_full[:window_end]
+            
+            # 在当前可见的历史窗口内，识别顶底分型
+            frac_window = gupiaojichu.identify_turns(window_end, high_window, low_window)
+            
+            top_indices = [i for i, val in enumerate(frac_window) if val == 1.0]
+            bottom_indices = [i for i, val in enumerate(frac_window) if val == -1.0]
+            
+            cond_pattern1 = False
+            cond_pattern2 = False
+            
+            # 只有当历史上已经确认出现过底分型时才判断
+            if bottom_indices:
+                last_bottom_idx = bottom_indices[-1]
+                
+                # 卖出条件3：当前最低价跌破已确认的最后底分型最低价
+                if low_full[current_idx] < low_full[last_bottom_idx]:
+                    cond_pattern2 = True
+                    
+                # 卖出条件2：距离和最高价限制
+                valid_tops = [i for i in top_indices if i < last_bottom_idx]
+                if valid_tops:
+                    prev_top_idx = valid_tops[-1]
+                    distance_btw = last_bottom_idx - prev_top_idx
+                    current_distance = current_idx - last_bottom_idx
+                    
+                    if current_distance >= distance_btw:
+                        # 检查从最后底分型到当前K线的最高价
+                        high_range = high_window[last_bottom_idx:] 
+                        if max(high_range) <= high_window[prev_top_idx]:
+                            cond_pattern1 = True
+                            
+            # 综合判断：满足任一条件则触发卖出
+            # 这里默认三个开关全部开启，你可以根据需要调整
+            if cond_ma60 or cond_pattern1 or cond_pattern2:
+                sell_signals[current_idx] = True
+                
+        return sell_signals
     
     @staticmethod
     def calc_max_drawdown(asset_values: np.ndarray) -> float:
@@ -391,57 +457,53 @@ class TdxStockBacktest:
     
     def three_buy_strategy(self, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
         """
-        三买变体策略函数：生成30分钟级别的买卖信号
-        :param min30_data: 30分钟K线DataFrame
-        :param min30_high: 30分钟最高价列表
-        :param min30_low: 30分钟最低价列表
-        :return: 带signal列的DataFrame（1=买入，-1=卖出，0=持有）
+        三买变体策略函数：生成30分钟级别的买卖信号（已消除未来函数）
         """
-
-                # 3. 获取顶底分型数据
-        # 1. 生成转折点frac数组
-        # frac = self.detect_turning_points(min30_high, min30_low, window=5)
-        
-        # 2. 遍历计算三买买点信号
-        buy_signals = self.calculate_three_buy_signals( min30_high, min30_low)
-        
-        # 3. 生成买卖信号（买入=1，卖出=-1，持有=0）
-        # 策略逻辑：买点买入，持仓后收盘价跌破止损价卖出（或固定止盈）
         data = min30_data.copy()
-        data['signal'] = 0
+        
+        # 1. 动态计算三买买点信号 (原函数已经是滚动窗口，安全的)
+        buy_signals = self.calculate_three_buy_signals(min30_high, min30_low)
         data['buy_signal'] = buy_signals
         
-        # 持仓状态标记
+        # 2. 计算60均线
+        data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
+        
+        # 3. 动态计算卖出信号 (调用新增的去未来函数方法)
+        close_list = data['收盘价'].tolist()
+        sell_signals = self.calculate_dynamic_sell_signals(min30_high, min30_low, close_list, data['ma60'])
+        data['new_sell_cond'] = sell_signals
+        
+        # 4. 状态机生成最终交易信号
+        data['signal'] = 0
         in_pos = False
         stop_loss = 0.0
-        take_profit_ratio = 0.05  # 止盈比例5%
         
         for idx in data.index:
-            # 获取当前行的位置索引
             pos_idx = data.index.get_loc(idx)
             
             # 买入信号：有三买信号且未持仓
             if data['buy_signal'].iloc[pos_idx] == 1.0 and not in_pos:
                 data.loc[idx, 'signal'] = 1
                 in_pos = True
-                # 设置止损价（买入K线最低价）
+                # 设置初始止损价（买入K线最低价），防止建仓后极端插针行情
                 stop_loss = data['最低价'].iloc[pos_idx]
-                # 设置止盈价（买入价+5%）
-                take_profit = data['收盘价'].iloc[pos_idx] * (1 + take_profit_ratio)
             
-            # 卖出信号：持仓状态下，跌破止损价或达到止盈价
+            # 卖出信号：持仓状态下触发卖出条件
             elif in_pos:
-                current_close = data['收盘价'].iloc[pos_idx]
                 current_low = data['最低价'].iloc[pos_idx]
                 
-                # 止损卖出
+                # 初始止损：跌破买入K线最低价依然强制防守
                 if current_low <= stop_loss:
                     data.loc[idx, 'signal'] = -1
                     in_pos = False
-                # 止盈卖出
-                elif current_close >= take_profit:
+                # 动态策略卖出：触发了多维卖出条件之一
+                elif data['new_sell_cond'].iloc[pos_idx]:
                     data.loc[idx, 'signal'] = -1
                     in_pos = False
+        
+        # 清理辅助列
+        cols_to_drop = ['ma60', 'new_sell_cond', 'buy_signal']
+        data = data.drop(columns=[c for c in cols_to_drop if c in data.columns])
         
         return data
     
