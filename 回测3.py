@@ -243,7 +243,7 @@ class TdxStockBacktest:
         seg_length = latest_seg[1] - latest_seg[0]
         after_seg_length = last_k_idx - latest_seg[1]
         if seg_length >= 9:
-            if after_seg_length * 1.9 > seg_length:
+            if after_seg_length * 1.8 > seg_length:
                 return pf_out  # 线段间隔过近，不满足
         else:
             if after_seg_length > seg_length:
@@ -452,31 +452,46 @@ class TdxStockBacktest:
     
     def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
         """
-        三买变体策略函数：生成30分钟级别的买卖信号（已消除未来函数）
+        三买变体策略函数：包含日线过滤条件
         """
         data = min30_data.copy()
 
-                # 1. 计算日线60均线及条件
-        day_df['ma60'] = day_df['收盘价'].rolling(window=60).mean().bfill()  # 60日均线（向后填充空值）
-        day_df['day_cond1'] = (day_df['收盘价'] > day_df['ma60']).fillna(False)  # 收盘价在60均线上
-        day_df['ma60_shift3'] = day_df['ma60'].shift(3).bfill()  # 3天前的60均线
-        day_df['day_cond2'] = (day_df['ma60'] > day_df['ma60_shift3']).fillna(False)  # 60均线向上
-        day_df['day_cond'] = day_df['day_cond1'] & day_df['day_cond2']  # 日线总条件
+        # --- 1. 计算日线级别条件 ---
+        day_df = day_df.copy()
+        day_df['ma60'] = day_df['收盘价'].rolling(window=60).mean()
+        day_df['ma60_shift3'] = day_df['ma60'].shift(3)
         
-        # 1. 动态计算三买买点信号 (原函数已经是滚动窗口，安全的)
+        # 日线过滤条件：收盘价在MA60上，且MA60相比3天前是增长的
+        day_df['day_cond'] = (day_df['收盘价'] > day_df['ma60']) & (day_df['ma60'] > day_df['ma60_shift3'])
+        
+        # 重要：将日线信号平移一天。因为在30分钟交易时，我们只能看到“昨天”已经收盘的日线结果
+        day_df['day_signal_valid'] = day_df['day_cond'].shift(1).fillna(False)
+
+        # --- 2. 将日线条件对齐到30分钟数据 ---
+        # 提取日期列用于关联
+        data['date_only'] = data.index.date
+        day_df['date_only'] = day_df.index.date
+        
+        # 合并日线信号到30分钟数据中
+        data = data.reset_index().merge(
+            day_df[['date_only', 'day_signal_valid']], 
+            on='date_only', 
+            how='left'
+        ).set_index('datetime')
+        
+        data['day_signal_valid'] = data['day_signal_valid'].ffill().fillna(False)
+
+        # --- 3. 计算30分钟买卖信号 ---
         buy_signals = self.calculate_three_buy_signals(min30_high, min30_low)
         data['buy_signal'] = buy_signals
         
-        # 2. 计算60均线
         data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
-        
-        # 3. 动态计算卖出信号 & 卖出原因 (调用修改后的方法)
         close_list = data['收盘价'].tolist()
         sell_signals, sell_reasons = self.calculate_dynamic_sell_signals(min30_high, min30_low, close_list, data['ma60'])
         data['new_sell_cond'] = sell_signals
-        data['sell_reason'] = sell_reasons  # 新增：保存卖出原因
+        data['sell_reason'] = sell_reasons
         
-        # 4. 状态机生成最终交易信号
+        # --- 4. 状态机逻辑 ---
         data['signal'] = 0
         in_pos = False
         stop_loss = 0.0
@@ -484,29 +499,24 @@ class TdxStockBacktest:
         for idx in data.index:
             pos_idx = data.index.get_loc(idx)
             
-            # 买入信号：有三买信号且未持仓
-            if data['buy_signal'].iloc[pos_idx] == 1.0 and not in_pos:
+            # 修改后的买入逻辑：增加 day_signal_valid 判断
+            has_3buy_signal = data['buy_signal'].iloc[pos_idx] == 1.0
+            is_day_trend_ok = data['day_signal_valid'].iloc[pos_idx] == True
+            
+            if has_3buy_signal and is_day_trend_ok and not in_pos:
                 data.loc[idx, 'signal'] = 1
                 in_pos = True
-                # 设置初始止损价（买入K线最低价），防止建仓后极端插针行情
                 stop_loss = data['最低价'].iloc[pos_idx]
             
-            # 卖出信号：持仓状态下触发卖出条件
             elif in_pos:
+                # (维持原有的卖出逻辑不变...)
                 current_low = data['最低价'].iloc[pos_idx]
-                
-                # 初始止损：跌破买入K线最低价依然强制防守
                 if current_low <= stop_loss:
                     data.loc[idx, 'signal'] = -1
                     in_pos = False
-                # 动态策略卖出：触发了多维卖出条件之一
                 elif data['new_sell_cond'].iloc[pos_idx]:
                     data.loc[idx, 'signal'] = -1
                     in_pos = False
-        
-        # 清理辅助列（保留sell_reason用于回测打印）
-        cols_to_drop = ['ma60', 'new_sell_cond', 'buy_signal']
-        data = data.drop(columns=[c for c in cols_to_drop if c in data.columns])
         
         return data
     
@@ -750,7 +760,7 @@ if __name__ == "__main__":
     
     # 执行回测
     result = backtest.run_backtest(
-        code="000042",
+        code="603536",
         period="30min",
         init_cash=100000.0,
         commission=0.0003,
