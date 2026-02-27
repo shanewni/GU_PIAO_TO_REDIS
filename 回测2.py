@@ -612,9 +612,19 @@ class TdxStockBacktest:
             
             # ===== 正常买入信号执行（以损定量） =====
             if row['signal'] == 1 and cash > close_price and not self.in_position:
-                # 确定止损价（买入K线最低价）
-                buy_kline_low = row['最低价']
-                self.stop_loss_price = buy_kline_low
+                # --- 优化逻辑开始 ---
+                current_idx = data.index.get_loc(datetime)
+                current_low = row['最低价']
+                
+                if current_idx > 0:
+                    # 获取前一根K线的收盘价
+                    prev_close = data['收盘价'].iloc[current_idx - 1]
+                    # 核心逻辑：取前K收盘与本K最低的较小值
+                    self.stop_loss_price = min(current_low, prev_close)
+                else:
+                    # 如果是第一根K线（无前值），则使用当前最低价
+                    self.stop_loss_price = current_low
+                # --- 优化逻辑结束 ---
                 
                 # 以损定量：计算可买数量
                 buy_num = self.calculate_position_size(
