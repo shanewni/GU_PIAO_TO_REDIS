@@ -624,7 +624,7 @@ class TdxStockBacktest:
                 self.risk_per_trade = 0.0
                 
                 print(f"【止损触发】{datetime} - 价格{low_price} <= 止损价{self.stop_loss_price}，以收盘价{close_price}卖出{sell_num}股")
-                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际亏损:{pnl:.2f} | 实际亏损比例:{abs(pnl)/current_total_asset*100:.2f}%")
+                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际亏损:{pnl:.2f} | 实际盈亏比例:{abs(pnl)/current_total_asset*100:.2f}%")
             
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
             if row['signal'] == 1 and cash > close_price and not self.in_position:
@@ -909,8 +909,8 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 all_metrics.append(metrics)
             if trades_detail:  # 收集交易明细
                 all_trades_detail.extend(trades_detail)
-            # 避免请求过快，休眠0.5秒
-            time.sleep(0.5)
+            # 避免请求过快，休眠0.1秒
+            time.sleep(0.1)
         except Exception as e:
             print(f"股票 {code} 回测异常: {e}")
             continue
@@ -964,12 +964,59 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
     
     return stock_summary_df, trades_detail_df, total_trades_metrics
 
+def calculate_pure_compounding(all_trades_detail: List[Dict], init_cash: float = 100000.0) -> Dict:
+    """
+    纯理论复利计算：忽略资金重叠，将所有有效交易按时间排序，进行单队列资产滚动。
+    :param all_trades_detail: batch_backtest 返回的交易明细列表
+    :param init_cash: 模拟的账户初始总资金（默认100万）
+    """
+    if not all_trades_detail:
+        return {}
 
+    # 1. 过滤出平仓交易（只有卖出和止损才有实际的单笔盈亏结算）
+    closed_trades = [t for t in all_trades_detail if t.get('单笔盈亏', 0) != 0.0]
+    
+    if not closed_trades:
+        return {}
+
+    # 2. 严格按照交易时间（平仓时间）升序排列
+    closed_trades.sort(key=lambda x: pd.to_datetime(x['交易时间']))
+
+    # 3. 开始模拟资金滚动
+    current_capital = init_cash
+    capital_curve = [current_capital]  # 记录资金曲线用于算回撤
+    
+    for trade in closed_trades:
+        # 你原本代码里的 '实际盈亏比例' 是相对于单股10万资产的波动百分比
+        # 这里我们直接将这个净值波动率作用于全局总资金
+        # 注意：原代码 '实际盈亏比例' 是放大了100倍的百分比（如 1.5 表示 1.5%），所以这里要除以 100
+        trade_return_ratio = trade['实际盈亏比例'] / 100.0
+        
+        # 核心复利公式：新资金 = 老资金 * (1 + 单笔涨跌幅)
+        current_capital = current_capital * (1 + trade_return_ratio)
+        capital_curve.append(current_capital)
+
+    # 4. 计算复利曲线的最大回撤
+    capital_array = np.array(capital_curve)
+    running_max = np.maximum.accumulate(capital_array)
+    drawdowns = (capital_array - running_max) / running_max
+    max_dd = np.min(drawdowns) * 100
+
+    # 5. 汇总数据
+    total_return_pct = (current_capital - init_cash) / init_cash * 100
+
+    return {
+        "初始总资金": init_cash,
+        "最终总资金": current_capital,
+        "参与复利交易笔数": len(closed_trades),
+        "理论复利总收益率(%)": total_return_pct,
+        "复利资金曲线最大回撤(%)": max_dd
+    }
 # ------------------- 主执行入口 -------------------
 if __name__ == "__main__":
     # 1. 解析通达信板块文件
     stock_list = parse_tdx_blk_file(BLOB_FILE_PATH)
-    
+    stock_list =stock_list[:10]  # 取前100只股票进行回测，避免数据过大导致内存问题
     if not stock_list:
         print("未提取到股票代码，退出程序")
     else:
@@ -980,7 +1027,23 @@ if __name__ == "__main__":
             commission=0.0003,     # 佣金0.03%
             stop_loss_ratio=0.01   # 单笔止损1%
         )
+        # ================== 新增：执行理论复利计算 ==================
+        # 将 DataFrame 转换回字典列表形式供复利函数使用
+        trades_list = trades_detail_result.to_dict('records') if not trades_detail_result.empty else []
+        compounding_metrics = calculate_pure_compounding(trades_list, init_cash=100000.0)
         
+        print("\n" + "="*80)
+        print("                    板块回测（无视重叠的极限复利）汇总")
+        print("="*80)
+        for k, v in compounding_metrics.items():
+            if "(%)" in k:
+                print(f"{k}: {v:.2f}%")
+            elif "资金" in k:
+                print(f"{k}: {v:,.2f} 元")
+            else:
+                print(f"{k}: {v}")
+        print("="*80)
+        # ============================================================
         # 3. 保存结果到Excel（多sheet）
         if not stock_summary_result.empty:
             with pd.ExcelWriter("板块回测汇总结果_含总笔数.xlsx", engine="openpyxl") as writer:
