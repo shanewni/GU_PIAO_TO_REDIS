@@ -636,13 +636,15 @@ class TdxStockBacktest:
                     continue
                 if close_price <= last_top_fractal_price:
                     continue
-                
+
                 # 3. 原有的止损价计算逻辑
                 if current_idx > 0:
-                    # 获取前一根K线的收盘价
                     prev_close = data['最高价'].iloc[current_idx - 1]
-                    # 核心逻辑：取前K收盘与本K最低的较小值
-                    self.stop_loss_price = min(row['最低价'], prev_close)
+                    loss_price = min(row['最低价'], prev_close)
+
+                    if (close_price-loss_price)/loss_price*100 > 2.4:
+                        continue
+                    self.stop_loss_price = loss_price
                 else:
                     # 如果是第一根K线（无前值），则使用当前最低价
                     self.stop_loss_price = row['最低价']
@@ -1016,7 +1018,6 @@ def calculate_pure_compounding(all_trades_detail: List[Dict], init_cash: float =
 if __name__ == "__main__":
     # 1. 解析通达信板块文件
     stock_list = parse_tdx_blk_file(BLOB_FILE_PATH)
-    stock_list =stock_list[:10]  # 取前100只股票进行回测，避免数据过大导致内存问题
     if not stock_list:
         print("未提取到股票代码，退出程序")
     else:
@@ -1058,9 +1059,9 @@ if __name__ == "__main__":
             print(f"\n汇总结果已保存到: 板块回测汇总结果_含总笔数.xlsx")
             
             # 可选：展示前10行结果
-            print("\n单股票维度汇总前10行：")
-            print(stock_summary_result.head(10))
+            # print("\n单股票维度汇总前10行：")
+            # print(stock_summary_result.head(10))
             
-            print("\n总交易笔数维度汇总：")
-            for k, v in total_trades_metrics.items():
-                print(f"{k}: {v:.2f}")
+            # print("\n总交易笔数维度汇总：")
+            # for k, v in total_trades_metrics.items():
+            #     print(f"{k}: {v:.2f}")
