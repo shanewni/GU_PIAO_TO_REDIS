@@ -4,11 +4,15 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from pytdx.hq import TdxHq_API
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Tuple
 import gupiaojichu
+import struct
 
 # 忽略无关警告
 warnings.filterwarnings('ignore')
+
+# 通达信板块文件路径
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\60RJXS.blk"
 
 class TdxStockBacktest:
     """基于pytdx的股票回测框架（支持多周期K线+止损策略+以损定量+三买变体买点）"""
@@ -22,6 +26,9 @@ class TdxStockBacktest:
         self.in_position = False    # 是否持仓标记
         self.stop_loss_ratio = 0.02 # 新增：总资金止损百分比（默认2%）
         self.risk_per_trade = 0.0   # 新增：单笔交易可承受的最大亏损金额
+        # 新增：存储30分钟周期的frac（转折点）数据，用于顶分型判断
+        self.min30_frac = []
+        self.all_trades_detail = [] # 新增：存储单股票所有交易明细（用于总笔数汇总）
     
     def connect_tdx(self, ip: str = "152.136.167.10", port: int = 7709) -> bool:
         """
@@ -108,12 +115,32 @@ class TdxStockBacktest:
         # 获取30分钟线数据
         min30_data, min30_high_list, min30_low_list = self.get_stock_k_data(code, count=count, ktype=2)
         
+        # 预计算30分钟周期的frac（转折点）数据，用于顶分型判断
+        self.min30_frac = gupiaojichu.identify_turns(len(min30_high_list), min30_high_list, min30_low_list)
+        
         return {
             'day': day_data,
             '30min_high_list': min30_high_list,
             '30min_low_list': min30_low_list,
             '30min': min30_data
         }
+    
+    def get_last_top_fractal_price(self, current_idx: int, high_list: List[float]) -> float:
+        """
+        获取当前索引之前最近的顶分型最高价
+        :param current_idx: 当前K线索引
+        :param high_list: 最高价列表
+        :return: 最近顶分型最高价（无则返回0）
+        """
+        if current_idx <= 0 or len(self.min30_frac) <= current_idx:
+            return 0.0
+        
+        # 从当前索引往前找第一个顶分型（frac=1.0）
+        for i in range(current_idx - 1, -1, -1):
+            if self.min30_frac[i] == 1.0:  # 1.0表示顶分型（高点转折点）
+                return high_list[i]
+        
+        return 0.0  # 无顶分型时返回0
     
     def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
         """
@@ -141,40 +168,6 @@ class TdxStockBacktest:
         position_size = min(position_size, int(max_affordable // 100 * 100))
         
         return max(position_size, 0)  # 确保数量非负
-    
-    @staticmethod
-    # def detect_turning_points(high: List[float], low: List[float], window: int = 5) -> List[float]:
-    #     """
-    #     检测高低转折点，生成frac数组（1.0=高点，-1.0=低点，0.0=无转折）
-    #     :param high: 最高价列表
-    #     :param low: 最低价列表
-    #     :param window: 窗口期（判断高低点的前后K线数）
-    #     :return: frac转折点标记列表
-    #     """
-    #     data_len = len(high)
-    #     frac = [0.0] * data_len
-        
-    #     for i in range(window, data_len - window):
-    #         # 判断是否为高点：当前最高价大于前后window根K线的最高价
-    #         is_high = True
-    #         for j in range(1, window + 1):
-    #             if high[i] <= high[i - j] or high[i] <= high[i + j]:
-    #                 is_high = False
-    #                 break
-    #         if is_high:
-    #             frac[i] = 1.0
-    #             continue
-            
-    #         # 判断是否为低点：当前最低价小于前后window根K线的最低价
-    #         is_low = True
-    #         for j in range(1, window + 1):
-    #             if low[i] >= low[i - j] or low[i] >= low[i + j]:
-    #                 is_low = False
-    #                 break
-    #         if is_low:
-    #             frac[i] = -1.0
-        
-    #     return frac
     
     @staticmethod
     def three_buy_variant(frac, high, low):
@@ -255,7 +248,7 @@ class TdxStockBacktest:
         seg_length = latest_seg[1] - latest_seg[0]
         after_seg_length = last_k_idx - latest_seg[1]
         if seg_length >= 9:
-            if after_seg_length * 1.9 > seg_length:
+            if after_seg_length * 1.8 > seg_length:
                 return pf_out  # 线段间隔过近，不满足
         else:
             if after_seg_length > seg_length:
@@ -278,14 +271,13 @@ class TdxStockBacktest:
     def calculate_three_buy_signals( high_full, low_full):
         """
         遍历完整数据序列，逐段计算三买变体买点信号
-        :param frac_full: 完整的转折点标记列表（全量数据）
         :param high_full: 完整的最高价序列（全量数据）
         :param low_full: 完整的最低价序列（全量数据）
         :return: 全量数据的买点信号列表，1.0表示对应位置是买点，0.0表示无
         """
         # 校验全量数据长度一致
         if  len(high_full) != len(low_full):
-            raise ValueError("frac_full、high_full、low_full必须长度一致")
+            raise ValueError("high_full、low_full必须长度一致")
         
         total_length = len(high_full)
         # 初始化全量信号数组（默认全为0）
@@ -310,6 +302,7 @@ class TdxStockBacktest:
             full_signals[window_end - 1] = current_signal
         
         return full_signals
+    
     @staticmethod
     def calculate_dynamic_sell_signals(high_full: List[float], low_full: List[float], 
                                      close_full: List[float], ma60_full: pd.Series,
@@ -357,7 +350,7 @@ class TdxStockBacktest:
             top_indices = [i for i, val in enumerate(frac_window) if val == 1.0]
             bottom_indices = [i for i, val in enumerate(frac_window) if val == -1.0]
             
-            cond_pattern1 = False # 顶分型后未突破
+            cond_pattern1 = False # 顶分型后未突破前高且距离达标
             cond_pattern2 = False # 跌破底分型
             
             if bottom_indices:
@@ -404,7 +397,7 @@ class TdxStockBacktest:
     
     def calc_backtest_metrics(self, init_cash: float) -> Dict:
         """计算回测核心指标（包含盈亏比）"""
-        if self.backtest_result is None or len(self.trade_pnl) == 0:
+        if self.backtest_result is None or len(getattr(self, 'trade_pnl', [])) == 0:
             return {}
         
         # 累计收益
@@ -455,93 +448,131 @@ class TdxStockBacktest:
             '夏普比率': sharpe_ratio
         }
         
-        # 打印核心指标
-        print("\n===== 回测核心指标 =====")
-        for k, v in metrics.items():
-            print(f"{k}: {v:.2f}")
-        
         return metrics
     
-    def three_buy_strategy(self, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
+    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
         """
-        三买变体策略函数：生成30分钟级别的买卖信号（已消除未来函数）
+        三买变体策略函数：包含日线过滤条件
         """
         data = min30_data.copy()
+
+        # --- 1. 计算日线级别条件 ---
+        day_df = day_df.copy()
+        day_df['ma60'] = day_df['收盘价'].rolling(window=60).mean()
+        day_df['ma60_shift3'] = day_df['ma60'].shift(3)
         
-        # 1. 动态计算三买买点信号 (原函数已经是滚动窗口，安全的)
+        # 日线过滤条件：收盘价在MA60上，且MA60相比3天前是增长的
+        day_df['day_cond'] = (day_df['收盘价'] > day_df['ma60']) & (day_df['ma60'] > day_df['ma60_shift3'])
+        
+        # 重要：将日线信号平移一天。因为在30分钟交易时，我们只能看到“昨天”已经收盘的日线结果
+        day_df['day_signal_valid'] = day_df['day_cond'].shift(1).fillna(False)
+
+        # --- 2. 将日线条件对齐到30分钟数据 ---
+        # 提取日期列用于关联
+        data['date_only'] = data.index.date
+        day_df['date_only'] = day_df.index.date
+        
+        # 合并日线信号到30分钟数据中
+        data = data.reset_index().merge(
+            day_df[['date_only', 'day_signal_valid']], 
+            on='date_only', 
+            how='left'
+        ).set_index('datetime')
+        
+        data['day_signal_valid'] = data['day_signal_valid'].ffill().fillna(False)
+
+        # --- 3. 计算30分钟买卖信号 ---
         buy_signals = self.calculate_three_buy_signals(min30_high, min30_low)
         data['buy_signal'] = buy_signals
         
-        # 2. 计算60均线
         data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
-        
-        # 3. 动态计算卖出信号 & 卖出原因 (调用修改后的方法)
         close_list = data['收盘价'].tolist()
         sell_signals, sell_reasons = self.calculate_dynamic_sell_signals(min30_high, min30_low, close_list, data['ma60'])
         data['new_sell_cond'] = sell_signals
-        data['sell_reason'] = sell_reasons  # 新增：保存卖出原因
+        data['sell_reason'] = sell_reasons
         
-        # 4. 状态机生成最终交易信号
+        # --- 4. 状态机逻辑 ---
         data['signal'] = 0
         in_pos = False
         stop_loss = 0.0
+        buy_price = 0.0  # 新增：记录买入价用于第3K线判断
+        hold_count = 0   # 新增：持仓K线计数器
         
         for idx in data.index:
             pos_idx = data.index.get_loc(idx)
+            current_close = data['收盘价'].iloc[pos_idx]
+            current_low = data['最低价'].iloc[pos_idx]
             
-            # 买入信号：有三买信号且未持仓
-            if data['buy_signal'].iloc[pos_idx] == 1.0 and not in_pos:
+            # --- 买入逻辑 ---
+            has_3buy_signal = data['buy_signal'].iloc[pos_idx] == 1.0
+            is_day_trend_ok = data['day_signal_valid'].iloc[pos_idx] == True
+            
+            if has_3buy_signal and is_day_trend_ok and not in_pos:
                 data.loc[idx, 'signal'] = 1
                 in_pos = True
-                # 设置初始止损价（买入K线最低价），防止建仓后极端插针行情
                 stop_loss = data['最低价'].iloc[pos_idx]
+                buy_price = current_close  # 记录买入时的收盘价
+                hold_count = 0             # 重置计数器（买入当根为0）
             
-            # 卖出信号：持仓状态下触发卖出条件
+            # --- 卖出逻辑 ---
             elif in_pos:
-                current_low = data['最低价'].iloc[pos_idx]
+                hold_count += 1  # 持仓天数增加
                 
-                # 初始止损：跌破买入K线最低价依然强制防守
+                # 1. 原始止损逻辑（破买入K线最低点）
                 if current_low <= stop_loss:
                     data.loc[idx, 'signal'] = -1
+                    data.loc[idx, 'sell_reason'] = "触发初始止损价"
                     in_pos = False
-                # 动态策略卖出：触发了多维卖出条件之一
+                    
+                # 2. 原有的动态卖出条件（MA60、顶分型等）
                 elif data['new_sell_cond'].iloc[pos_idx]:
                     data.loc[idx, 'signal'] = -1
+                    # sell_reason 已经在 new_sell_cond 计算时生成了
                     in_pos = False
-        
-        # 清理辅助列（保留sell_reason用于回测打印）
-        cols_to_drop = ['ma60', 'new_sell_cond', 'buy_signal']
-        data = data.drop(columns=[c for c in cols_to_drop if c in data.columns])
+
+                # 3. 新增逻辑：第3根K线收盘价低于买入价卖出
+                # 注意：买入后的第1根是 hold_count=1，第3根是 hold_count=3
+                elif hold_count == 3:
+                    if current_close < buy_price:
+                        data.loc[idx, 'signal'] = -1
+                        data.loc[idx, 'sell_reason'] = "买入后第3根K线弱势（收盘价 < 买入价）"
+                        in_pos = False
         
         return data
     
     def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
-                     commission: float = 0.0003, stop_loss_ratio: float = 0.01) -> pd.DataFrame:
+                     commission: float = 0.0003, stop_loss_ratio: float = 0.01) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
         """
         执行三买变体策略回测（30分钟周期）
+        升级：返回单股票交易明细列表，用于总笔数汇总
         :param code: 股票代码
         :param period: 回测周期（仅支持30min）
         :param init_cash: 初始资金
         :param commission: 交易佣金（默认0.03%）
         :param stop_loss_ratio: 总资金止损百分比（默认2%）
-        :return: 回测结果DataFrame
+        :return: 回测结果DataFrame, 回测指标字典, 单股票交易明细列表
         """
+        print(f"\n========== 开始回测股票 {code} ==========")
+        # 重置单股票交易明细
+        self.all_trades_detail = []
+        
         if period != '30min':
             print("当前版本仅支持30分钟周期回测")
-            return pd.DataFrame()
+            return pd.DataFrame(), {}, []
         
         # 获取多周期数据
         multi_data = self.get_multi_period_data(code)
+        day_data = multi_data['day']
         min30_data = multi_data['30min']
         min30_high = multi_data['30min_high_list']
         min30_low = multi_data['30min_low_list']
         
         if min30_data.empty:
-            print("30分钟数据为空，无法回测")
-            return pd.DataFrame()
+            print(f"股票 {code} 30分钟数据为空，无法回测")
+            return pd.DataFrame(), {}, []
         
         # 生成策略信号
-        data = self.three_buy_strategy(min30_data, min30_high, min30_low)
+        data = self.three_buy_strategy(day_data,min30_data, min30_high, min30_low)
         
         # 初始化止损百分比
         self.stop_loss_ratio = stop_loss_ratio
@@ -570,6 +601,7 @@ class TdxStockBacktest:
             low_price = row['最低价']
             high_price = row['最高价']
             current_total_asset = cash + position * close_price
+            current_idx = data.index.get_loc(datetime)  # 当前K线索引
             
             # ===== 止损逻辑：触发止损则强制卖出 =====
             if self.in_position and low_price <= self.stop_loss_price:
@@ -584,19 +616,23 @@ class TdxStockBacktest:
                 pnl = total_sell_income - total_buy_cost
                 
                 cash += income
-                trade_records.append({
-                    '时间': datetime,
-                    '操作': '止损卖出',
+                trade_detail = {
+                    '股票代码': code,
+                    '交易时间': datetime,
+                    '交易类型': '止损卖出',
                     '价格': close_price,
                     '数量': sell_num,
                     '费用': fee,
                     '单笔盈亏': pnl,
+                    '是否盈利': pnl > 0,
                     '触发止损价': self.stop_loss_price,
                     '当前K线最低价': low_price,
                     '单笔风险金额': self.risk_per_trade,
-                    '实际亏损比例': abs(pnl)/current_total_asset*100
-                })
+                    '实际盈亏比例': pnl/current_total_asset*100
+                }
+                trade_records.append(trade_detail)
                 self.trade_pnl.append(pnl)
+                self.all_trades_detail.append(trade_detail)  # 存入交易明细
                 
                 # 重置持仓和止损参数
                 position = 0
@@ -608,25 +644,32 @@ class TdxStockBacktest:
                 self.risk_per_trade = 0.0
                 
                 print(f"【止损触发】{datetime} - 价格{low_price} <= 止损价{self.stop_loss_price}，以收盘价{close_price}卖出{sell_num}股")
-                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际亏损:{pnl:.2f} | 实际亏损比例:{abs(pnl)/current_total_asset*100:.2f}%")
+                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际亏损:{pnl:.2f} | 实际盈亏比例:{abs(pnl)/current_total_asset*100:.2f}%")
             
-            # ===== 正常买入信号执行（以损定量） =====
+            # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
             if row['signal'] == 1 and cash > close_price and not self.in_position:
-                # --- 优化逻辑开始 ---
-                current_idx = data.index.get_loc(datetime)
-                current_low = row['最低价']
+                # 1. 获取最近顶分型的最高价
+                last_top_fractal_price = self.get_last_top_fractal_price(current_idx, min30_high)
                 
+                # 2. 校验收盘价是否高于前顶分型最高价（无顶分型时不买入）
+                if last_top_fractal_price == 0.0:
+                    continue
+                if close_price <= last_top_fractal_price:
+                    continue
+
+                # 3. 原有的止损价计算逻辑
                 if current_idx > 0:
-                    # 获取前一根K线的收盘价
-                    prev_close = data['收盘价'].iloc[current_idx - 1]
-                    # 核心逻辑：取前K收盘与本K最低的较小值
-                    self.stop_loss_price = min(current_low, prev_close)
+                    prev_close = data['最高价'].iloc[current_idx - 1]
+                    loss_price = min(row['最低价'], prev_close)
+
+                    if (close_price-loss_price)/loss_price*100 > 2.4:
+                        continue
+                    self.stop_loss_price = loss_price
                 else:
                     # 如果是第一根K线（无前值），则使用当前最低价
-                    self.stop_loss_price = current_low
-                # --- 优化逻辑结束 ---
+                    self.stop_loss_price = row['最低价']
                 
-                # 以损定量：计算可买数量
+                # 4. 以损定量：计算可买数量
                 buy_num = self.calculate_position_size(
                     current_cash=current_total_asset,
                     entry_price=close_price,
@@ -645,23 +688,29 @@ class TdxStockBacktest:
                         self.in_position = True
                         buy_datetime = datetime
                         
-                        trade_records.append({
-                            '时间': datetime,
-                            '操作': '买入',
+                        trade_detail = {
+                            '股票代码': code,
+                            '交易时间': datetime,
+                            '交易类型': '买入',
                             '价格': close_price,
                             '数量': buy_num,
                             '费用': fee,
-                            '买入K线最低价': buy_kline_low,
+                            '单笔盈亏': 0.0,  # 买入时盈亏为0，卖出时更新
+                            '是否盈利': None,
                             '设置止损价': self.stop_loss_price,
                             '单笔风险金额': self.risk_per_trade,
                             '风险比例': self.stop_loss_ratio*100,
-                        })
+                            '前顶分型最高价': last_top_fractal_price,
+                            '收盘价突破幅度': (close_price - last_top_fractal_price)/last_top_fractal_price*100
+                        }
+                        trade_records.append(trade_detail)
+                        self.all_trades_detail.append(trade_detail)  # 存入交易明细
+                        
                         print(f"【买入开仓（以损定量）】{datetime} - 价格{close_price}，数量{buy_num}")
                         print(f"          - 止损价:{self.stop_loss_price} | 单笔风险金额:{self.risk_per_trade:.2f} | 风险比例:{self.stop_loss_ratio*100}%")
                 else:
                     print(f"【买入失败】{datetime} - 以损定量计算可买数量为0（止损价{self.stop_loss_price} >= 买入价{close_price}）")
             
-            # ===== 正常卖出信号执行 =====
             # ===== 正常卖出信号执行 =====
             elif row['signal'] == -1 and position > 0:
                 # 获取当前K线索引（第几根K线）
@@ -679,19 +728,23 @@ class TdxStockBacktest:
                 pnl = total_sell_income - total_buy_cost
                 
                 cash += income
-                trade_records.append({
-                    '时间': datetime,
-                    '操作': '策略卖出',
+                trade_detail = {
+                    '股票代码': code,
+                    '交易时间': datetime,
+                    '交易类型': '策略卖出',
                     '价格': close_price,
                     '数量': sell_num,
                     '费用': fee,
                     '单笔盈亏': pnl,
+                    '是否盈利': pnl > 0,
+                    '卖出原因': sell_reason,
+                    '当前K线索引': current_kline_idx,
                     '单笔风险金额': self.risk_per_trade,
-                    '实际盈亏比例': pnl/current_total_asset*100,
-                    '卖出原因': sell_reason,  # 新增：交易记录中保存卖出原因
-                    '当前K线索引': current_kline_idx  # 新增：交易记录中保存K线索引
-                })
+                    '实际盈亏比例': pnl/current_total_asset*100
+                }
+                trade_records.append(trade_detail)
                 self.trade_pnl.append(pnl)
+                self.all_trades_detail.append(trade_detail)  # 存入交易明细
                 
                 # 重置持仓和止损参数
                 position = 0
@@ -729,25 +782,306 @@ class TdxStockBacktest:
         self.trade_records = pd.DataFrame(trade_records)
         
         # 计算核心指标
-        self.calc_backtest_metrics(init_cash)
+        metrics = self.calc_backtest_metrics(init_cash)
         
-        print(f"\n{period}周期三买变体策略回测完成！")
-        return self.backtest_result
+        # 打印单股票回测指标
+        print(f"\n===== 股票 {code} 回测核心指标 =====")
+        for k, v in metrics.items():
+            print(f"{k}: {v:.2f}")
+        
+        print(f"\n========== 股票 {code} 回测完成 ==========\n")
+        return self.backtest_result, metrics, self.all_trades_detail
 
 
-# ------------------- 测试入口 -------------------
-if __name__ == "__main__":
-    # 初始化回测框架
+def parse_tdx_blk_file(file_path: str) -> List[str]:
+    stock_list = []
+    
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            
+        # 跳过第一行空白，从第二行开始处理
+        for line in lines[1:]:
+            line = line.strip()
+            if line:
+                # 第一位是市场代码，后六位是股票代码
+                market_code = line[0]
+                stock_code = line[1:7]
+                
+                # 将市场代码转换为pytdx需要的格式
+                # 0: 深圳, 1: 上海
+                if market_code == '0':
+                    market = 0  # 深圳
+                    market_prefix = 'sz'
+                else:
+                    market = 1  # 上海
+                    market_prefix = 'sh'
+                
+                full_code = f"{market_prefix}{stock_code}"
+                # stock_list.append((market, stock_code, full_code))            
+                stock_list.append((stock_code))            
+    except Exception as e:
+        print(f"读取blk文件失败: {e}")
+        
+    return stock_list
+
+def calculate_total_trades_metrics(all_trades_detail: List[Dict]) -> Dict:
+    """
+    新增：按总交易笔数计算核心指标
+    :param all_trades_detail: 所有股票的交易明细列表
+    :return: 总笔数维度的汇总指标
+    """
+    if not all_trades_detail:
+        return {}
+    
+    # 过滤出有盈亏的交易（买入交易无盈亏，仅统计卖出/止损交易）
+    pnl_trades = [trade for trade in all_trades_detail if trade['单笔盈亏'] != 0.0]
+    if not pnl_trades:
+        return {
+            '总交易笔数（含买入）': len(all_trades_detail),
+            '有效交易笔数（有盈亏）': 0,
+            '盈利笔数': 0,
+            '亏损笔数': 0,
+            '总胜率(%)': 0.0,
+            '总盈利金额': 0.0,
+            '总亏损金额': 0.0,
+            '总净收益': 0.0,
+            '平均每笔盈利': 0.0,
+            '平均每笔亏损': 0.0,
+            '总盈亏比': 0.0,
+            '最大单笔盈利': 0.0,
+            '最大单笔亏损': 0.0
+        }
+    
+    # 核心计算
+    total_trades_all = len(all_trades_detail)          # 所有交易笔数（含买入）
+    total_pnl_trades = len(pnl_trades)                 # 有效交易笔数（卖出/止损）
+    win_trades = [t for t in pnl_trades if t['是否盈利']] # 盈利笔数
+    loss_trades = [t for t in pnl_trades if not t['是否盈利']] # 亏损笔数
+    total_win_count = len(win_trades)
+    total_loss_count = len(loss_trades)
+    
+    # 金额类指标
+    total_profit = sum(t['单笔盈亏'] for t in win_trades)
+    total_loss = abs(sum(t['单笔盈亏'] for t in loss_trades))
+    total_net_profit = total_profit - total_loss
+    avg_win_per_trade = total_profit / total_win_count if total_win_count > 0 else 0.0
+    avg_loss_per_trade = total_loss / total_loss_count if total_loss_count > 0 else 0.0
+    total_profit_loss_ratio = avg_win_per_trade / avg_loss_per_trade if avg_loss_per_trade > 0 else 0.0
+    
+    # 极值指标
+    max_single_win = max([t['单笔盈亏'] for t in win_trades], default=0.0)
+    max_single_loss = min([t['单笔盈亏'] for t in loss_trades], default=0.0)
+    
+    # 胜率
+    total_win_rate = (total_win_count / total_pnl_trades) * 100 if total_pnl_trades > 0 else 0.0
+    
+    # 汇总结果
+    total_metrics = {
+        '总交易笔数（含买入）': total_trades_all,
+        '有效交易笔数（卖出/止损）': total_pnl_trades,
+        '盈利笔数': total_win_count,
+        '亏损笔数': total_loss_count,
+        '总胜率(%)': total_win_rate,
+        '总盈利金额': total_profit,
+        '总亏损金额': total_loss,
+        '总净收益': total_net_profit,
+        '平均每笔盈利': avg_win_per_trade,
+        '平均每笔亏损': avg_loss_per_trade,
+        '总盈亏比': total_profit_loss_ratio,
+        '最大单笔盈利': max_single_win,
+        '最大单笔亏损': max_single_loss
+    }
+    
+    return total_metrics
+
+def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0, 
+                   commission: float = 0.0003, stop_loss_ratio: float = 0.01) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
+    """
+    批量回测股票列表（升级：新增总笔数汇总）
+    :param stock_codes: 股票代码列表
+    :param init_cash: 单股票初始资金
+    :param commission: 佣金比例
+    :param stop_loss_ratio: 止损比例
+    :return: 单股票汇总结果DF, 所有交易明细DF, 总笔数汇总指标
+    """
+    # 初始化回测框架并连接通达信
     backtest = TdxStockBacktest()
+    connect_success = backtest.connect_tdx()
+    if not connect_success:
+        print("通达信服务器连接失败，无法执行批量回测")
+        return pd.DataFrame(), pd.DataFrame(), {}
     
-    # 连接通达信服务器
-    backtest.connect_tdx()
+    # 存储所有股票的回测指标 + 所有交易明细
+    all_metrics = []
+    all_trades_detail = []  # 存储所有股票的交易明细
     
-    # 执行回测
-    result = backtest.run_backtest(
-        code="600362",
-        period="30min",
-        init_cash=100000.0,
-        commission=0.0003,
-        stop_loss_ratio=0.01
-    )
+    # 逐只股票回测
+    for idx, code in enumerate(stock_codes):
+        print(f"\n------------------- 进度 {idx+1}/{len(stock_codes)} -------------------")
+        try:
+            _, metrics, trades_detail = backtest.run_backtest(
+                code=code,
+                init_cash=init_cash,
+                commission=commission,
+                stop_loss_ratio=stop_loss_ratio
+            )
+            if metrics:  # 仅保留有有效指标的股票
+                metrics['股票代码'] = code
+                all_metrics.append(metrics)
+            if trades_detail:  # 收集交易明细
+                all_trades_detail.extend(trades_detail)
+            # 避免请求过快，休眠0.1秒
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"股票 {code} 回测异常: {e}")
+            continue
+    
+    # ========== 原有：单股票维度汇总 ==========
+    if not all_metrics:
+        print("无有效回测结果")
+        return pd.DataFrame(), pd.DataFrame(), {}
+    
+    # 单股票汇总DF
+    stock_summary_df = pd.DataFrame(all_metrics)
+    # 调整列顺序，把股票代码放第一列
+    cols = ['股票代码'] + [col for col in stock_summary_df.columns if col != '股票代码']
+    stock_summary_df = stock_summary_df[cols]
+    
+    # 单股票维度汇总指标
+    print("\n" + "="*80)
+    print("                          板块回测（单股票维度）汇总")
+    print("="*80)
+    total_stocks = len(stock_summary_df)
+    profitable_stocks = len(stock_summary_df[stock_summary_df['累计收益'] > 0])
+    avg_return = stock_summary_df['累计收益率(%)'].mean()
+    avg_max_dd = stock_summary_df['最大回撤(%)'].mean()
+    avg_win_rate = stock_summary_df['胜率(%)'].mean()
+    avg_profit_loss_ratio = stock_summary_df['盈亏比'].mean()
+    total_profit_all = stock_summary_df['累计收益'].sum()
+    total_return_all = (total_profit_all / (init_cash * total_stocks)) * 100
+    
+    # 打印单股票维度汇总
+    print(f"1. 参与回测股票总数：{total_stocks} 只")
+    print(f"2. 盈利股票数量：{profitable_stocks} 只 | 盈利股票占比：{profitable_stocks/total_stocks*100:.2f}%")
+    print(f"3. 单股票平均累计收益率：{avg_return:.2f}%")
+    print(f"4. 单股票平均最大回撤：{avg_max_dd:.2f}%")
+    print(f"5. 单股票平均胜率：{avg_win_rate:.2f}%")
+    print(f"6. 单股票平均盈亏比：{avg_profit_loss_ratio:.2f}")
+    print(f"7. 板块总累计收益：{total_profit_all:.2f} 元 (等额资金分配下)")
+    print(f"8. 板块总累计收益率：{total_return_all:.2f}% (等额资金分配下)")
+    print("="*80)
+    
+    # ========== 新增：总交易笔数维度汇总 ==========
+    total_trades_metrics = calculate_total_trades_metrics(all_trades_detail)
+    print("\n" + "="*80)
+    print("                          板块回测（总交易笔数维度）汇总")
+    print("="*80)
+    for k, v in total_trades_metrics.items():
+        print(f"{k}: {v:.2f}")
+    print("="*80)
+    
+    # 交易明细DF（便于保存和分析）
+    trades_detail_df = pd.DataFrame(all_trades_detail)
+    
+    return stock_summary_df, trades_detail_df, total_trades_metrics
+
+def calculate_pure_compounding(all_trades_detail: List[Dict], init_cash: float = 100000.0) -> Dict:
+    """
+    纯理论复利计算：忽略资金重叠，将所有有效交易按时间排序，进行单队列资产滚动。
+    :param all_trades_detail: batch_backtest 返回的交易明细列表
+    :param init_cash: 模拟的账户初始总资金（默认100万）
+    """
+    if not all_trades_detail:
+        return {}
+
+    # 1. 过滤出平仓交易（只有卖出和止损才有实际的单笔盈亏结算）
+    closed_trades = [t for t in all_trades_detail if t.get('单笔盈亏', 0) != 0.0]
+    
+    if not closed_trades:
+        return {}
+
+    # 2. 严格按照交易时间（平仓时间）升序排列
+    closed_trades.sort(key=lambda x: pd.to_datetime(x['交易时间']))
+
+    # 3. 开始模拟资金滚动
+    current_capital = init_cash
+    capital_curve = [current_capital]  # 记录资金曲线用于算回撤
+    
+    for trade in closed_trades:
+        # 你原本代码里的 '实际盈亏比例' 是相对于单股10万资产的波动百分比
+        # 这里我们直接将这个净值波动率作用于全局总资金
+        # 注意：原代码 '实际盈亏比例' 是放大了100倍的百分比（如 1.5 表示 1.5%），所以这里要除以 100
+        trade_return_ratio = trade['实际盈亏比例'] / 100.0
+        
+        # 核心复利公式：新资金 = 老资金 * (1 + 单笔涨跌幅)
+        current_capital = current_capital * (1 + trade_return_ratio)
+        capital_curve.append(current_capital)
+
+    # 4. 计算复利曲线的最大回撤
+    capital_array = np.array(capital_curve)
+    running_max = np.maximum.accumulate(capital_array)
+    drawdowns = (capital_array - running_max) / running_max
+    max_dd = np.min(drawdowns) * 100
+
+    # 5. 汇总数据
+    total_return_pct = (current_capital - init_cash) / init_cash * 100
+
+    return {
+        "初始总资金": init_cash,
+        "最终总资金": current_capital,
+        "参与复利交易笔数": len(closed_trades),
+        "理论复利总收益率(%)": total_return_pct,
+        "复利资金曲线最大回撤(%)": max_dd
+    }
+# ------------------- 主执行入口 -------------------
+if __name__ == "__main__":
+    # 1. 解析通达信板块文件
+    stock_list = parse_tdx_blk_file(BLOB_FILE_PATH)
+    if not stock_list:
+        print("未提取到股票代码，退出程序")
+    else:
+        # 2. 执行批量回测
+        stock_summary_result, trades_detail_result, total_trades_metrics = batch_backtest(
+            stock_codes=stock_list,
+            init_cash=100000.0,    # 单股票初始资金10万
+            commission=0.0003,     # 佣金0.03%
+            stop_loss_ratio=0.01   # 单笔止损1%
+        )
+        # ================== 新增：执行理论复利计算 ==================
+        # 将 DataFrame 转换回字典列表形式供复利函数使用
+        trades_list = trades_detail_result.to_dict('records') if not trades_detail_result.empty else []
+        compounding_metrics = calculate_pure_compounding(trades_list, init_cash=100000.0)
+        
+        print("\n" + "="*80)
+        print("                    板块回测（无视重叠的极限复利）汇总")
+        print("="*80)
+        for k, v in compounding_metrics.items():
+            if "(%)" in k:
+                print(f"{k}: {v:.2f}%")
+            elif "资金" in k:
+                print(f"{k}: {v:,.2f} 元")
+            else:
+                print(f"{k}: {v}")
+        print("="*80)
+        # ============================================================
+        # 3. 保存结果到Excel（多sheet）
+        if not stock_summary_result.empty:
+            with pd.ExcelWriter("板块回测汇总结果_含总笔数.xlsx", engine="openpyxl") as writer:
+                # Sheet1：单股票汇总
+                stock_summary_result.to_excel(writer, sheet_name="单股票维度汇总", index=False)
+                # Sheet2：所有交易明细
+                trades_detail_result.to_excel(writer, sheet_name="所有交易明细", index=False)
+                # Sheet3：总笔数维度汇总
+                total_trades_df = pd.DataFrame([total_trades_metrics])
+                total_trades_df.to_excel(writer, sheet_name="总交易笔数维度汇总", index=False)
+            
+            print(f"\n汇总结果已保存到: 板块回测汇总结果_含总笔数.xlsx")
+            
+            # 可选：展示前10行结果
+            # print("\n单股票维度汇总前10行：")
+            # print(stock_summary_result.head(10))
+            
+            # print("\n总交易笔数维度汇总：")
+            # for k, v in total_trades_metrics.items():
+            #     print(f"{k}: {v:.2f}")
