@@ -12,7 +12,7 @@ import struct
 warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\60RJXS.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
 
 class TdxStockBacktest:
     """基于pytdx的股票回测框架（支持多周期K线+止损策略+以损定量+三买变体买点）"""
@@ -355,8 +355,8 @@ class TdxStockBacktest:
             
             if bottom_indices:
                 last_bottom_idx = bottom_indices[-1]
-                if low_full[current_idx] < low_full[last_bottom_idx]:
-                    cond_pattern2 = True
+                # if low_full[current_idx] < low_full[last_bottom_idx]:
+                #     cond_pattern2 = True
                     
                 valid_tops = [i for i in top_indices if i < last_bottom_idx]
                 if valid_tops:
@@ -532,11 +532,11 @@ class TdxStockBacktest:
 
                 # 3. 新增逻辑：第3根K线收盘价低于买入价卖出
                 # 注意：买入后的第1根是 hold_count=1，第3根是 hold_count=3
-                elif hold_count == 3:
-                    if current_close < buy_price:
-                        data.loc[idx, 'signal'] = -1
-                        data.loc[idx, 'sell_reason'] = "买入后第3根K线弱势（收盘价 < 买入价）"
-                        in_pos = False
+                # elif hold_count == 3:
+                #     if current_close < buy_price:
+                #         data.loc[idx, 'signal'] = -1
+                #         data.loc[idx, 'sell_reason'] = "买入后第3根K线弱势（收盘价 < 买入价）"
+                #         in_pos = False
         
         return data
     
@@ -664,6 +664,8 @@ class TdxStockBacktest:
 
                     if (close_price-loss_price)/loss_price*100 > 2.4:
                         continue
+                    if (close_price-loss_price)/loss_price*100 < 0.5:
+                        continue
                     self.stop_loss_price = loss_price
                 else:
                     # 如果是第一根K线（无前值），则使用当前最低价
@@ -701,7 +703,8 @@ class TdxStockBacktest:
                             '单笔风险金额': self.risk_per_trade,
                             '风险比例': self.stop_loss_ratio*100,
                             '前顶分型最高价': last_top_fractal_price,
-                            '收盘价突破幅度': (close_price - last_top_fractal_price)/last_top_fractal_price*100
+                            '收盘价突破幅度': (close_price - last_top_fractal_price)/last_top_fractal_price*100,
+                            '单k涨幅': (close_price - self.stop_loss_price)/self.stop_loss_price*100
                         }
                         trade_records.append(trade_detail)
                         self.all_trades_detail.append(trade_detail)  # 存入交易明细
@@ -1034,10 +1037,65 @@ def calculate_pure_compounding(all_trades_detail: List[Dict], init_cash: float =
         "理论复利总收益率(%)": total_return_pct,
         "复利资金曲线最大回撤(%)": max_dd
     }
+
+def analyze_loss_periods(trades_df: pd.DataFrame) -> pd.DataFrame:
+    if trades_df.empty:
+        return pd.DataFrame()
+    
+    df = trades_df.copy()
+    # 转换时间格式
+    df['交易时间'] = pd.to_datetime(df['交易时间'])
+    df['月份'] = df['交易时间'].dt.to_period('M')
+    df['周几'] = df['交易时间'].dt.day_name()
+    df['日期'] = df['交易时间'].dt.date
+    
+    # 修正字段名：原代码中记录盈亏的列名是 '单笔盈亏'
+    loss_df = df[df['单笔盈亏'] < 0]
+    
+    if loss_df.empty:
+        print("\n太棒了，没有亏损单！")
+        return pd.DataFrame()
+    
+    # --- 维度1：按月份统计亏损额 ---
+    monthly_loss = loss_df.groupby('月份')['单笔盈亏'].sum().sort_values()
+    
+    # --- 维度2：按日期统计（找出最惨烈的几天） ---
+    # 这里用全量df去算，因为要知道那一天的胜率
+    daily_stats = df.groupby('日期').agg(
+        当日净损益=('单笔盈亏', 'sum'),
+        交易笔数=('单笔盈亏', 'count'),
+        亏损占比=('单笔盈亏', lambda x: (x < 0).mean() * 100)
+    ).sort_values(by='当日净损益')
+
+    print("\n" + "!"*20 + " 亏损时间分布报告 " + "!"*20)
+    print("\n[1] 亏损最严重的月份:")
+    print(monthly_loss.head())
+    
+    print("\n[2] 亏损最严重的 5 个交易日:")
+    print(daily_stats.head(5))
+    
+    # --- 维度3：连续亏损预警 ---
+    # 如果某天亏损笔数 > 5 且 胜率 < 10%，定义为“系统性收割日”
+    trap_days = daily_stats[(daily_stats['交易笔数'] > 5) & (daily_stats['亏损占比'] > 80)]
+    if not trap_days.empty:
+        print("\n[3] 识别到“系统性收割日”（大面积止损）:")
+        print(trap_days.index.tolist())
+    
+    # === 核心提取：将所有亏损日期提取出来，用于返回并存入Excel ===
+    # 统计每一天发生的具体亏损情况
+    loss_dates_summary = loss_df.groupby('日期').agg(
+        亏损单数量=('股票代码', 'count'),
+        当日总亏损额=('单笔盈亏', 'sum')
+    ).reset_index().sort_values(by='当日总亏损额', ascending=True)
+
+    return loss_dates_summary
+
 # ------------------- 主执行入口 -------------------
 if __name__ == "__main__":
     # 1. 解析通达信板块文件
     stock_list = parse_tdx_blk_file(BLOB_FILE_PATH)
+    # stock_list = stock_list[:10]  # 测试时可限制股票数量
+    
     if not stock_list:
         print("未提取到股票代码，退出程序")
     else:
@@ -1048,8 +1106,7 @@ if __name__ == "__main__":
             commission=0.0003,     # 佣金0.03%
             stop_loss_ratio=0.01   # 单笔止损1%
         )
-        # ================== 新增：执行理论复利计算 ==================
-        # 将 DataFrame 转换回字典列表形式供复利函数使用
+        # ================== 执行理论复利计算 ==================
         trades_list = trades_detail_result.to_dict('records') if not trades_detail_result.empty else []
         compounding_metrics = calculate_pure_compounding(trades_list, init_cash=100000.0)
         
@@ -1064,10 +1121,13 @@ if __name__ == "__main__":
             else:
                 print(f"{k}: {v}")
         print("="*80)
-        # ============================================================
+        
+        # ================== 执行亏损日期分析 ==================
+        loss_dates_df = analyze_loss_periods(trades_detail_result)
+        t = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(time.time()))
         # 3. 保存结果到Excel（多sheet）
         if not stock_summary_result.empty:
-            with pd.ExcelWriter("板块回测汇总结果_含总笔数.xlsx", engine="openpyxl") as writer:
+            with pd.ExcelWriter(f"板块回测汇总结果_含总笔数{t}.xlsx", engine="openpyxl") as writer:
                 # Sheet1：单股票汇总
                 stock_summary_result.to_excel(writer, sheet_name="单股票维度汇总", index=False)
                 # Sheet2：所有交易明细
@@ -1075,13 +1135,8 @@ if __name__ == "__main__":
                 # Sheet3：总笔数维度汇总
                 total_trades_df = pd.DataFrame([total_trades_metrics])
                 total_trades_df.to_excel(writer, sheet_name="总交易笔数维度汇总", index=False)
+                # Sheet4：提取的亏损明细表
+                if loss_dates_df is not None and not loss_dates_df.empty:
+                    loss_dates_df.to_excel(writer, sheet_name="亏损日期提取", index=False)
             
-            print(f"\n汇总结果已保存到: 板块回测汇总结果_含总笔数.xlsx")
-            
-            # 可选：展示前10行结果
-            # print("\n单股票维度汇总前10行：")
-            # print(stock_summary_result.head(10))
-            
-            # print("\n总交易笔数维度汇总：")
-            # for k, v in total_trades_metrics.items():
-            #     print(f"{k}: {v:.2f}")
+            print(f"\n汇总结果已保存到: 板块回测汇总结果_含总笔数.xlsx，请查看 '亏损日期提取' Sheet。")
