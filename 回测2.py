@@ -268,7 +268,7 @@ class TdxStockBacktest:
         return pf_out
     
     @staticmethod
-    def calculate_three_buy_signals( high_full, low_full):
+    def calculate_three_buy_signals( high_full, low_full, close_full) -> List[float]:
         """
         遍历完整数据序列，逐段计算三买变体买点信号
         :param high_full: 完整的最高价序列（全量数据）
@@ -276,8 +276,8 @@ class TdxStockBacktest:
         :return: 全量数据的买点信号列表，1.0表示对应位置是买点，0.0表示无
         """
         # 校验全量数据长度一致
-        if  len(high_full) != len(low_full):
-            raise ValueError("high_full、low_full必须长度一致")
+        if  len(high_full) != len(low_full) or len(high_full) != len(close_full):
+            raise ValueError("high_full、low_full、close_full必须长度一致")
         
         total_length = len(high_full)
         # 初始化全量信号数组（默认全为0）
@@ -296,7 +296,20 @@ class TdxStockBacktest:
             except Exception as e:
                 # 若窗口数据不足，跳过并保持0
                 continue
-            
+                        # 如果当前窗口有信号，需要检查收盘价是否高于最近顶分型最高价
+            if window_signal[-1] == 1.0:
+                current_close = close_full[window_end - 1]
+                # 在frac_window中找最后一个顶分型（值为1.0）的索引
+                last_top_idx = -1
+                for i in range(window_end - 1, -1, -1):
+                    if frac_window[i] == 1.0:
+                        last_top_idx = i
+                        break
+                if last_top_idx != -1:
+                    last_top_high = high_window[last_top_idx]
+                    if current_close <= last_top_high:
+                        window_signal[-1] = 0.0  # 不满足收盘价高于前顶分型，撤销信号
+
             # 提取当前窗口最后一个位置的信号
             current_signal = window_signal[-1]
             full_signals[window_end - 1] = current_signal
@@ -332,7 +345,9 @@ class TdxStockBacktest:
                 if current_close < ma60_list[current_idx] and close_full[current_idx-1] < ma60_list[current_idx-1]:
                     # 检查是否处于持仓状态且满足门槛
                     if buy_price is not None and buy_idx is not None:
+                        # 计算当前涨幅和持仓K线数
                         profit_ratio = (current_close - buy_price) / buy_price
+                        # 持仓K线数 = 当前索引 - 买入索引
                         hold_count = current_idx - buy_idx
                         
                         # 执行门槛检查
@@ -355,8 +370,8 @@ class TdxStockBacktest:
             
             if bottom_indices:
                 last_bottom_idx = bottom_indices[-1]
-                # if low_full[current_idx] < low_full[last_bottom_idx]:
-                #     cond_pattern2 = True
+                if low_full[current_idx] < low_full[last_bottom_idx]:
+                    cond_pattern2 = True
                     
                 valid_tops = [i for i in top_indices if i < last_bottom_idx]
                 if valid_tops:
@@ -482,7 +497,7 @@ class TdxStockBacktest:
         data['day_signal_valid'] = data['day_signal_valid'].ffill().fillna(False)
 
         # --- 3. 计算30分钟买卖信号 ---
-        buy_signals = self.calculate_three_buy_signals(min30_high, min30_low)
+        buy_signals = self.calculate_three_buy_signals(min30_high, min30_low,data['收盘价'].tolist())
         data['buy_signal'] = buy_signals
         
         data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
@@ -608,6 +623,7 @@ class TdxStockBacktest:
                 # 触发止损，以收盘价卖出全部持仓
                 sell_num = position
                 fee = sell_num * close_price * commission
+                # 卖出收入 = 卖出数量 × 卖出价格 × (1 - 佣金率)
                 income = sell_num * close_price * (1 - commission)
                 
                 # 计算这笔止损交易的盈亏
@@ -615,6 +631,7 @@ class TdxStockBacktest:
                 total_sell_income = income - fee
                 pnl = total_sell_income - total_buy_cost
                 
+                # 更新资金和记录交易
                 cash += income
                 trade_detail = {
                     '股票代码': code,
@@ -648,15 +665,6 @@ class TdxStockBacktest:
             
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
             if row['signal'] == 1 and cash > close_price and not self.in_position:
-                # 1. 获取最近顶分型的最高价
-                last_top_fractal_price = self.get_last_top_fractal_price(current_idx, min30_high)
-                
-                # 2. 校验收盘价是否高于前顶分型最高价（无顶分型时不买入）
-                if last_top_fractal_price == 0.0:
-                    continue
-                if close_price <= last_top_fractal_price:
-                    continue
-
                 # 3. 原有的止损价计算逻辑
                 if current_idx > 0:
                     prev_close = data['最高价'].iloc[current_idx - 1]
@@ -702,8 +710,6 @@ class TdxStockBacktest:
                             '设置止损价': self.stop_loss_price,
                             '单笔风险金额': self.risk_per_trade,
                             '风险比例': self.stop_loss_ratio*100,
-                            '前顶分型最高价': last_top_fractal_price,
-                            '收盘价突破幅度': (close_price - last_top_fractal_price)/last_top_fractal_price*100,
                             '单k涨幅': (close_price - self.stop_loss_price)/self.stop_loss_price*100
                         }
                         trade_records.append(trade_detail)
