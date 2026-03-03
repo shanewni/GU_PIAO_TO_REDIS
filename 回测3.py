@@ -27,7 +27,6 @@ class TdxStockBacktest:
         self.stop_loss_ratio = 0.02 # 新增：总资金止损百分比（默认2%）
         self.risk_per_trade = 0.0   # 新增：单笔交易可承受的最大亏损金额
         # 新增：存储30分钟周期的frac（转折点）数据，用于顶分型判断
-        self.min30_frac = []
         self.all_trades_detail = [] # 新增：存储单股票所有交易明细（用于总笔数汇总）
     
     def connect_tdx(self, ip: str = "152.136.167.10", port: int = 7709) -> bool:
@@ -115,32 +114,12 @@ class TdxStockBacktest:
         # 获取30分钟线数据
         min30_data, min30_high_list, min30_low_list = self.get_stock_k_data(code, count=count, ktype=2)
         
-        # 预计算30分钟周期的frac（转折点）数据，用于顶分型判断
-        self.min30_frac = gupiaojichu.identify_turns(len(min30_high_list), min30_high_list, min30_low_list)
-        
         return {
             'day': day_data,
             '30min_high_list': min30_high_list,
             '30min_low_list': min30_low_list,
             '30min': min30_data
         }
-    
-    def get_last_top_fractal_price(self, current_idx: int, high_list: List[float]) -> float:
-        """
-        获取当前索引之前最近的顶分型最高价
-        :param current_idx: 当前K线索引
-        :param high_list: 最高价列表
-        :return: 最近顶分型最高价（无则返回0）
-        """
-        if current_idx <= 0 or len(self.min30_frac) <= current_idx:
-            return 0.0
-        
-        # 从当前索引往前找第一个顶分型（frac=1.0）
-        for i in range(current_idx - 1, -1, -1):
-            if self.min30_frac[i] == 1.0:  # 1.0表示顶分型（高点转折点）
-                return high_list[i]
-        
-        return 0.0  # 无顶分型时返回0
     
     def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
         """
@@ -582,7 +561,6 @@ class TdxStockBacktest:
                     ma60_full=ma60_list,
                     buy_price=buy_price,  # 现在这里有值了！
                     buy_idx=buy_idx,      # 现在这里有值了！
-                    min30_frac=self.min30_frac
                 )
                 
                 if is_sell:
