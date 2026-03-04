@@ -234,13 +234,14 @@ class TdxStockBacktest:
                 return pf_out  # 线段间隔过近，不满足
         
         # 检查向上线段中是否有价格突破最近高点
-        if len(up_segments) > 0:
-            up_seg_start, up_seg_end = up_segments[0]
-            i = up_seg_start
-            while i < up_seg_end:
-                if high[i] >= latest_high:
-                    return pf_out  # 向上线段中有价格高于最近高点，不满足
-                i += 1
+        if len(down_segments) > 0:
+            up_seg_start, up_seg_end = down_segments[0]
+            i = up_seg_end
+            if i < last_k_idx:
+                while i < last_k_idx:
+                    if high[i] >= latest_high:
+                        return pf_out  # 向上线段中有价格高于最近高点，不满足
+                    i += 1
 
         # 所有条件满足，标记信号
         pf_out[last_k_idx] = 1.0
@@ -478,7 +479,7 @@ class TdxStockBacktest:
         if bottom_indices:
             last_bottom_idx = bottom_indices[-1]
             # 跌破最近底分型最低价
-            if low_full[current_idx] < low_full[last_bottom_idx]:
+            if low_full[current_idx] < low_full[last_bottom_idx] and current_idx > last_bottom_idx+1:
                 cond_pattern = True
                 pattern_reason = "跌破最后底分型最低价"
                 
@@ -551,7 +552,7 @@ class TdxStockBacktest:
                     data.loc[current_idx_time, 'sell_reason'] = "触发初始止损价"
                     in_pos = False
                     continue
-                
+                min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
                 # B. 动态卖出检查 (传入实时持仓数据)
                 is_sell, reason = self.check_dynamic_sell_condition(
                     current_idx=i,
@@ -561,6 +562,7 @@ class TdxStockBacktest:
                     ma60_full=ma60_list,
                     buy_price=buy_price,  # 现在这里有值了！
                     buy_idx=buy_idx,      # 现在这里有值了！
+                    min30_frac =min30_frac
                 )
                 
                 if is_sell:

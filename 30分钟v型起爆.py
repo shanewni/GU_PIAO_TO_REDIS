@@ -99,11 +99,15 @@ def three_buy_variant(frac, high, low):
         if (data_len-1 - latest_seg[1]) > latest_seg[1]- latest_seg[0]:
             return pf_out  # 线段间隔过近，不满足
         
-    i=up_segments[0][0]
-    while i < up_segments[0][1]:
-        if high[i] >= latest_high:
-            return pf_out  # 向上线段中有低点低于终点，不满足
-        i+=1
+    # 检查向上线段中是否有价格突破最近高点
+    if len(down_segments) > 0:
+        up_seg_start, up_seg_end = down_segments[0]
+        i = up_seg_end
+        if i < last_k_idx:
+            while i < last_k_idx:
+                if high[i] >= latest_high:
+                    return pf_out  # 向上线段中有价格高于最近高点，不满足
+                i += 1
 
     # 所有条件满足，标记信号
     pf_out[last_k_idx] = 1.0
