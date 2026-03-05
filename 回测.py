@@ -94,7 +94,7 @@ class TdxStockBacktest:
 
         # 5. 最后修正一遍精度
         df_30m[price_cols] = df_30m[price_cols].round(2)
-        
+        df_30m.index.name = 'datetime'
         print(f"成功从本地读取 {symbol} 30分钟数据，共 {len(df_30m)} 条")
         return df_30m
     
@@ -607,7 +607,9 @@ class TdxStockBacktest:
     
     def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
         data = min30_data.copy()
-
+        # --- 新增：统一索引名称，确保 reset_index 后的列名一致 ---
+        data.index.name = 'datetime'
+        day_df.index.name = 'datetime'
         # --- 1. 日线过滤条件 (保持原逻辑) ---
         day_df = day_df.copy()
         day_df['ma60'] = day_df['收盘价'].rolling(window=60).mean()
@@ -617,8 +619,12 @@ class TdxStockBacktest:
 
         data['date_only'] = data.index.date
         day_df['date_only'] = day_df.index.date
-        data = data.reset_index().merge(day_df[['date_only', 'day_signal_valid']], on='date_only', how='left').set_index('datetime')
-        data['day_signal_valid'] = data['day_signal_valid'].ffill().fillna(False)
+        # --- 这里的合并逻辑现在就不会报错了 ---
+        data = data.reset_index().merge(
+            day_df[['date_only', 'day_signal_valid']], 
+            on='date_only', 
+            how='left'
+        ).set_index('datetime')
 
         # --- 2. 预计算基础指标 ---
         # 计算买入信号 (全量计算基础信号)
@@ -1072,7 +1078,7 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 init_cash=init_cash,
                 commission=commission,
                 stop_loss_ratio=stop_loss_ratio,
-                use_local=False  ,# 统一使用联网模式获取数据
+                use_local=True  ,# 统一使用联网模式获取数据
                 tdx_path=DEFAULT_TDX_PATH
             )
             if metrics:  # 仅保留有有效指标的股票

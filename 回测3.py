@@ -508,6 +508,7 @@ class TdxStockBacktest:
 
         data['date_only'] = data.index.date
         day_df['date_only'] = day_df.index.date
+        # 将日线的有效信号合并到30分钟数据中，前向填充以覆盖整个交易日
         data = data.reset_index().merge(day_df[['date_only', 'day_signal_valid']], on='date_only', how='left').set_index('datetime')
         data['day_signal_valid'] = data['day_signal_valid'].ffill().fillna(False)
 
