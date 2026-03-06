@@ -602,7 +602,7 @@ class TdxStockBacktest:
             valid_tops = [i for i in top_indices if i < last_bottom_idx]
             if valid_tops:
                 prev_top_idx = valid_tops[-1]
-                if (current_idx - last_bottom_idx) >= (last_bottom_idx - prev_top_idx):
+                if (current_idx - last_bottom_idx) >= (last_bottom_idx - prev_top_idx) and (last_bottom_idx - prev_top_idx) >= 3:
                     if max(high_full[last_bottom_idx:current_idx+1]) <= high_full[prev_top_idx]:
                         cond_pattern = True
                         pattern_reason = "底分型后未突破前高且距离达标"
