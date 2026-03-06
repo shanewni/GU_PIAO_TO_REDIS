@@ -80,29 +80,38 @@ def three_buy_variant(frac, high, low):
     down_segments.sort(key=lambda x: -x[1])  # 按end_idx降序排列
     up_segments.sort(key=lambda x: -x[1])  # 按end_idx降序排列
     
-    # 至少需要3个向下线段才可能形成信号
+    # 至少需要1个向下线段才可能形成信号
     if len(down_segments) < 1:
         return pf_out
     
-    # 取最近的3个向下线段
+    # 取最近的向下线段
     latest_seg = down_segments[0]    # 最近的向下线段
     latest_high = high[latest_seg[0]]    # 最近线段起点（高点）的价格
 
-    # 5. 条件2：最后一根K线价格突破最近两个向下线段的起点高点之一
+    # 条件：最后一根K线价格突破最近向下线段的起点高点
     last_k_idx = data_len - 1  # 最后一根K线的索引
     if high[last_k_idx] <= latest_high:
-        return pf_out  # 未突破任一高点，不满足
-    if latest_seg[1]- latest_seg[0] >= 9 :
-        if (data_len-1 - latest_seg[1])*1.9 > latest_seg[1]- latest_seg[0]:
+        return pf_out  # 未突破高点，不满足
+    
+    # 线段间隔条件判断
+    seg_length = latest_seg[1] - latest_seg[0]
+    after_seg_length = last_k_idx - latest_seg[1]
+    if seg_length >= 9:
+        if after_seg_length * 1.2 > seg_length:
             return pf_out  # 线段间隔过近，不满足
     else:
-        if (data_len-1 - latest_seg[1]) > latest_seg[1]- latest_seg[0]:
+        if after_seg_length > seg_length:
             return pf_out  # 线段间隔过近，不满足
-        
+    
     # 检查向上线段中是否有价格突破最近高点
     if len(down_segments) > 0:
-        up_seg_start, up_seg_end = down_segments[0]
-        i = up_seg_end
+        down_seg_start, down_seg_end = down_segments[0]
+        up_seg_start, up_seg_end = up_segments[0]
+        if up_seg_end <= down_seg_end:
+            return pf_out  # 最近的向下线段结束位置过近，不满足
+        if down_seg_start+6 > up_seg_end:
+            return pf_out  # 最近的向上线段过短，不满足
+        i = down_seg_end
         if i < last_k_idx:
             while i < last_k_idx:
                 if high[i] >= latest_high:
