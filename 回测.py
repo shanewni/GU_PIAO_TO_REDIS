@@ -385,7 +385,7 @@ class TdxStockBacktest:
             except Exception as e:
                 # 若窗口数据不足，跳过并保持0
                 continue
-                        # 如果当前窗口有信号，需要检查收盘价是否高于最近顶分型最高价
+                # 如果当前窗口有信号，需要检查收盘价是否高于最近顶分型最高价
             if window_signal[-1] == 1.0:
                 current_close = close_full[window_end - 1]
                 # 在frac_window中找最后一个顶分型（值为1.0）的索引
@@ -393,7 +393,8 @@ class TdxStockBacktest:
                 for i in range(window_end - 1, -1, -1):
                     if frac_window[i] == 1.0:
                         last_top_idx = i
-                        break
+                        if last_top_idx != window_end - 1:  
+                            break
                 if last_top_idx != -1:
                     last_top_high = high_window[last_top_idx]
                     if current_close <= last_top_high:
