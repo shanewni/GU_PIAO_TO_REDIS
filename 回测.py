@@ -663,7 +663,11 @@ class TdxStockBacktest:
                     buy_price = close_list[i]
                     buy_idx = i
                     # 设置初始止损价：买入K线最低点
-                    initial_stop_loss = low_list[i]
+                    if i > 0:
+                        prev_high = high_list[i-1]          # 前一根K线的最高价
+                        initial_stop_loss = min(low_list[i], prev_high)
+                    else:
+                        initial_stop_loss = low_list[i]      # 第一根K线无前值，回退为当前最低价
             else:
                 # 持仓中：判定卖出
                 
