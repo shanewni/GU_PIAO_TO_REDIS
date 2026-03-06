@@ -344,8 +344,13 @@ class TdxStockBacktest:
         
         # 检查向上线段中是否有价格突破最近高点
         if len(down_segments) > 0:
-            up_seg_start, up_seg_end = down_segments[0]
-            i = up_seg_end
+            down_seg_start, down_seg_end = down_segments[0]
+            up_seg_start, up_seg_end = up_segments[0]
+            if up_seg_end <= down_seg_end:
+                return pf_out  # 最近的向下线段结束位置过近，不满足
+            if down_seg_start+6 > up_seg_end:
+                return pf_out  # 最近的向上线段过短，不满足
+            i = down_seg_end
             if i < last_k_idx:
                 while i < last_k_idx:
                     if high[i] >= latest_high:
