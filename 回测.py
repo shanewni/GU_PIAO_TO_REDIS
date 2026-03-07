@@ -612,90 +612,104 @@ class TdxStockBacktest:
         return False, ""   
     
     def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
-        data = min30_data.copy()
-        # --- 新增：统一索引名称，确保 reset_index 后的列名一致 ---
-        data.index.name = 'datetime'
-        day_df.index.name = 'datetime'
-        # --- 1. 日线过滤条件 (保持原逻辑) ---
-        day_df = day_df.copy()
-        day_df['ma60'] = day_df['收盘价'].rolling(window=60).mean()
-        day_df['ma60_shift3'] = day_df['ma60'].shift(3)
-        day_df['day_cond'] = (day_df['收盘价'] > day_df['ma60']) & (day_df['ma60'] > day_df['ma60_shift3'])
-        day_df['day_signal_valid'] = day_df['day_cond'].shift(1).fillna(False)
-
-        data['date_only'] = data.index.date
-        day_df['date_only'] = day_df.index.date
-        # --- 这里的合并逻辑现在就不会报错了 ---
-        data = data.reset_index().merge(
-            day_df[['date_only', 'day_signal_valid']], 
-            on='date_only', 
-            how='left'
-        ).set_index('datetime')
-
-        # --- 2. 预计算基础指标 ---
-        # 计算买入信号 (全量计算基础信号)
-        buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
-        data['buy_signal'] = buy_signals
-        data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
-        
-        # 转换列表以提高循环效率
-        close_list = data['收盘价'].tolist()
-        ma60_list = data['ma60'].tolist()
-        high_list = min30_high
-        low_list = min30_low
-        
-        # --- 3. 核心状态机循环 ---
-        data['signal'] = 0
-        data['sell_reason'] = ""
-        in_pos = False
-        buy_price = 0.0
-        buy_idx = 0
-        initial_stop_loss = 0.0
-        
-        for i in range(len(data)):
-            current_idx_time = data.index[i]
+            data = min30_data.copy()
+            data.index.name = 'datetime'
+            day_df.index.name = 'datetime'
             
-            if not in_pos:
-                # 尝试买入
-                if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
-                    data.loc[current_idx_time, 'signal'] = 1
-                    in_pos = True
-                    buy_price = close_list[i]
-                    buy_idx = i
-                    # 设置初始止损价：买入K线最低点
-                    if i > 0:
-                        prev_high = high_list[i-1]          # 前一根K线的最高价
-                        initial_stop_loss = min(low_list[i], prev_high)
-                    else:
-                        initial_stop_loss = low_list[i]      # 第一根K线无前值，回退为当前最低价
-            else:
-                # 持仓中：判定卖出
-                
-                # A. 初始止损检查 (优先级最高)
-                if low_list[i] <= initial_stop_loss:
-                    data.loc[current_idx_time, 'signal'] = -1
-                    data.loc[current_idx_time, 'sell_reason'] = "触发初始止损价"
-                    in_pos = False
-                    continue
-                min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
-                # B. 动态卖出检查 (传入实时持仓数据)
-                is_sell, reason = self.check_dynamic_sell_condition(
-                    current_idx=i,
-                    high_full=high_list,
-                    low_full=low_list,
-                    close_full=close_list,
-                    ma60_full=ma60_list,
-                    buy_price=buy_price,  # 现在这里有值了！
-                    buy_idx=buy_idx,      # 现在这里有值了！
-                    min30_frac =min30_frac
-                )
-                
-                if is_sell:
-                    data.loc[current_idx_time, 'signal'] = -1
-                    data.loc[current_idx_time, 'sell_reason'] = reason
-                    in_pos = False
+            # --- 1. 日线过滤条件 (保持原逻辑) ---
+            day_df = day_df.copy()
+            day_df['ma60'] = day_df['收盘价'].rolling(window=60).mean()
+            day_df['ma60_shift3'] = day_df['ma60'].shift(3)
+            day_df['day_cond'] = (day_df['收盘价'] > day_df['ma60']) & (day_df['ma60'] > day_df['ma60_shift3'])
+            day_df['day_signal_valid'] = day_df['day_cond'].shift(1).fillna(False)
 
-        return data
+            data['date_only'] = data.index.date
+            day_df['date_only'] = day_df.index.date
+            data = data.reset_index().merge(
+                day_df[['date_only', 'day_signal_valid']], 
+                on='date_only', 
+                how='left'
+            ).set_index('datetime')
+
+            # --- 2. 预计算基础指标 ---
+            buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
+            data['buy_signal'] = buy_signals
+            data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
+            
+            close_list = data['收盘价'].tolist()
+            ma60_list = data['ma60'].tolist()
+            high_list = min30_high
+            low_list = min30_low
+            
+            # --- 3. 核心状态机循环 ---
+            data['signal'] = 0
+            data['sell_reason'] = ""
+            in_pos = False
+            buy_price = 0.0
+            buy_idx = 0
+            initial_stop_loss = 0.0
+            current_stop_loss = 0.0 # 新增：当前实时执行的止损价
+            
+            for i in range(len(data)):
+                current_idx_time = data.index[i]
+                
+                if not in_pos:
+                    # 尝试买入
+                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
+                        data.loc[current_idx_time, 'signal'] = 1
+                        in_pos = True
+                        buy_price = close_list[i]
+                        buy_idx = i
+                        # 设置初始止损价
+                        if i > 0:
+                            prev_high = high_list[i-1]
+                            initial_stop_loss = min(low_list[i], prev_high)
+                        else:
+                            initial_stop_loss = low_list[i]
+                        current_stop_loss = initial_stop_loss # 初始化实时止损
+                else:
+                    # 持仓中：判定卖出
+                    hold_count = i - buy_idx # 计算介入后的K线根数 (0为买入当天)
+
+                    # --- 新增：介入后第三根K线逻辑 (hold_count == 3) ---
+                    if hold_count == 3:
+                        if close_list[i] < buy_price:
+                            # data.loc[current_idx_time, 'signal'] = -1
+                            # data.loc[current_idx_time, 'sell_reason'] = "第三根K线低于买入价强制卖出"
+                            # in_pos = False
+                            # continue
+                            pass
+                        else:
+                            # 高于或等于买入价，移动止损到成本价
+                            current_stop_loss = max(current_stop_loss, buy_price)
+                    
+                    # A. 止损检查 (优先级最高，使用 current_stop_loss)
+                    if low_list[i] <= current_stop_loss:
+                        data.loc[current_idx_time, 'signal'] = -1
+                        data.loc[current_idx_time, 'sell_reason'] = f"触发止损(当前止损价:{current_stop_loss})"
+                        in_pos = False
+                        continue
+
+                    min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
+                    data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss # 记录当前止损价，便于调试和分析
+                    # B. 动态卖出检查
+                    is_sell, reason = self.check_dynamic_sell_condition(
+                        current_idx=i,
+                        high_full=high_list,
+                        low_full=low_list,
+                        close_full=close_list,
+                        ma60_full=ma60_list,
+                        buy_price=buy_price,
+                        buy_idx=buy_idx,
+                        min30_frac=min30_frac
+                    )
+                    
+                    if is_sell:
+                        data.loc[current_idx_time, 'signal'] = -1
+                        data.loc[current_idx_time, 'sell_reason'] = reason
+                        in_pos = False
+
+            return data
     
     def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
                      commission: float = 0.0003, stop_loss_ratio: float = 0.01,
@@ -769,6 +783,11 @@ class TdxStockBacktest:
             high_price = row['最高价']
             current_total_asset = cash + position * close_price
             current_idx = data.index.get_loc(datetime)  # 当前K线索引
+
+            # 核心修改：实时更新回测器手中的止损价
+            if self.in_position:
+                # 这里的 active_stop_loss 包含了你新加的“第三根K线移位”后的价格
+                self.stop_loss_price = row['active_stop_loss']
             
             # ===== 止损逻辑：触发止损则强制卖出 =====
             if self.in_position and low_price <= self.stop_loss_price:
