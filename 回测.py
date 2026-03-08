@@ -13,7 +13,7 @@ from mootdx.reader import Reader
 warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -229,6 +229,33 @@ class TdxStockBacktest:
         self.stock_data['30min'] = result['30min']
         
         return result
+    
+    @staticmethod
+    def calculate_rps_matrix(all_stocks_data: Dict[str, pd.DataFrame], n: int = 250) -> pd.DataFrame:
+        """
+        计算整个池子的 RPS 矩阵
+        :param all_stocks_data: {code: df} 字典，df 需包含收盘价
+        :param n: 回测周期 (250, 120, 60)
+        :return: 一个以时间为索引，股票代码为列的 RPS 评分表
+        """
+        extrs_dict = {}
+        for code, df in all_stocks_data.items():
+            # 确保 DataFrame 不为空且包含必要列
+            if df is None or df.empty or '收盘价' not in df.columns:
+                continue
+            # 计算 EXTRS: (C - REF(C, N)) / REF(C, N)
+            extrs_dict[code] = df['收盘价'].pct_change(n)
+
+        if not extrs_dict:
+            return pd.DataFrame()
+        
+        extrs_df = pd.DataFrame(extrs_dict)
+        # 3. 关键：前 N 天的数据都是 NaN，不能参与排名
+        # axis=1 表示每一行（同一天）进行排名
+        # pct=True 得到 0-1 的分位数，再乘以 100
+        # min_periods=1 确保只要当天有数据的股票都参与排名
+        rps_df = extrs_df.rank(axis=1, pct=True, ascending=True) * 100
+        return rps_df   
     
     def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
         """
@@ -611,7 +638,8 @@ class TdxStockBacktest:
         if cond_pattern: return True, pattern_reason
         return False, ""   
     
-    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
+    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float], 
+                           rps_series: pd.Series = None) -> pd.DataFrame:
             data = min30_data.copy()
             data.index.name = 'datetime'
             day_df.index.name = 'datetime'
@@ -630,6 +658,20 @@ class TdxStockBacktest:
                 on='date_only', 
                 how='left'
             ).set_index('datetime')
+
+             # 将日线级别的综合 RPS 过滤结果同步到 30 分钟数据上
+            if rps_series is not None:
+                data['date_only'] = data.index.date
+                # 此时 rps_series 里的值是 1 (符合RPS条件) 或 0 (不符合)
+                rps_df = rps_series.to_frame(name='rps_ok_flag')
+                rps_df['date_only'] = rps_df.index.date
+                data = data.reset_index().merge(
+                    rps_df[['date_only', 'rps_ok_flag']], 
+                    on='date_only', 
+                    how='left'
+                ).set_index('datetime')
+            else:
+                data['rps_ok_flag'] = 1 # 默认不限制
 
             # --- 2. 预计算基础指标 ---
             buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
@@ -655,7 +697,9 @@ class TdxStockBacktest:
                 
                 if not in_pos:
                     # 尝试买入
-                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
+                     # 核心买入判定：原 rps_cond 修改为直接读取我们合并后的标识
+                    rps_is_strong = data['rps_ok_flag'].iloc[i] == 1
+                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i] and rps_is_strong:
                         data.loc[current_idx_time, 'signal'] = 1
                         in_pos = True
                         buy_price = close_list[i]
@@ -713,7 +757,7 @@ class TdxStockBacktest:
     
     def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
                      commission: float = 0.0003, stop_loss_ratio: float = 0.01,
-                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH,current_rps: pd.Series = None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
         """
         执行三买变体策略回测（30分钟周期）
         升级：返回单股票交易明细列表，用于总笔数汇总
@@ -753,7 +797,7 @@ class TdxStockBacktest:
             return pd.DataFrame(), {}, []
         
         # 生成策略信号
-        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low)
+        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low,current_rps)
         
         # 初始化止损百分比
         self.stop_loss_ratio = stop_loss_ratio
@@ -816,7 +860,7 @@ class TdxStockBacktest:
                     '触发止损价': self.stop_loss_price,
                     '当前K线最低价': low_price,
                     '单笔风险金额': self.risk_per_trade,
-                    '实际盈亏比例': pnl/current_total_asset*100
+                    '实际盈亏比例': pnl/self.buy_in_total_asset*100
                 }
                 trade_records.append(trade_detail)
                 self.trade_pnl.append(pnl)
@@ -860,6 +904,8 @@ class TdxStockBacktest:
                 if buy_num > 0:
                     # 计算交易成本
                     cost = buy_num * close_price * (1 + commission)
+                    # 【核心修正】：记录买入这一刻的账户总资产，作为后续计算盈亏比的分母
+                    self.buy_in_total_asset = cash + position * close_price + (buy_num * close_price)
                     fee = buy_num * close_price * commission
                     if cash >= cost:
                         position += buy_num
@@ -922,7 +968,7 @@ class TdxStockBacktest:
                     '卖出原因': sell_reason,
                     '当前K线索引': current_kline_idx,
                     '单笔风险金额': self.risk_per_trade,
-                    '实际盈亏比例': pnl/current_total_asset*100
+                    '实际盈亏比例': pnl/self.buy_in_total_asset*100
                 }
                 trade_records.append(trade_detail)
                 self.trade_pnl.append(pnl)
@@ -1097,18 +1143,38 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
     # 存储所有股票的回测指标 + 所有交易明细
     all_metrics = []
     all_trades_detail = []  # 存储所有股票的交易明细
-    
+
+    all_day_data = {}
+    # 步骤 A: 预抓取所有日线数据用于计算全局 RPS
+    print("正在预取日线数据以计算 RPS 强度...")
+    for code in stock_codes:
+        df = backtest.get_local_day_data(code)
+        if not df.empty:
+            all_day_data[code] = df
+    # 步骤 B: 计算多周期 RPS 强度
+    print("正在计算 RPS60 和 RPS120 强度矩阵...")
+    rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=60)
+    rps120_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=120)
     # 逐只股票回测
     for idx, code in enumerate(stock_codes):
         print(f"\n------------------- 进度 {idx+1}/{len(stock_codes)} -------------------")
         try:
+            # --- 核心逻辑修改：提取该股的两个 RPS 序列并计算“或”逻辑 ---
+            s60 = rps60_matrix[code] if code in rps60_matrix else pd.Series(0, index=rps60_matrix.index)
+            s120 = rps120_matrix[code] if code in rps120_matrix else pd.Series(0, index=rps120_matrix.index)
+            
+            # 只要其中一个大于 80，该序列即为 True (1)，否则为 False (0)
+            # 这样传给策略函数时，策略只需要判断这个综合信号即可
+
+            combined_rps_filter = ((s60 >= 80) | (s120 >= 80)).astype(int)
             _, metrics, trades_detail = backtest.run_backtest(
                 code=code,
                 init_cash=init_cash,
                 commission=commission,
                 stop_loss_ratio=stop_loss_ratio,
                 use_local=True  ,# 统一使用联网模式获取数据
-                tdx_path=DEFAULT_TDX_PATH
+                tdx_path=DEFAULT_TDX_PATH,
+                current_rps=combined_rps_filter
             )
             if metrics:  # 仅保留有有效指标的股票
                 metrics['股票代码'] = code

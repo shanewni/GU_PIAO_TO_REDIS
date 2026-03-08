@@ -7,7 +7,7 @@ from openpyxl.styles import Font, Alignment
 import os
 
 # =================配置区域=================
-file_path = '板块回测汇总结果_含总笔数2026-03-06-13-14-21_无3k卖出逻辑.xlsx'
+file_path = '板块回测汇总结果_含总笔数2026-03-08-16-46-20.xlsx'
 sheet_name = '所有交易明细'           
 column_name = '实际盈亏比例'                
 initial_capital = 100000              
