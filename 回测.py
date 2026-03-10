@@ -903,7 +903,7 @@ class TdxStockBacktest:
                 
                 if buy_num > 0:
                     # 【核心修正】：记录买入这一刻的账户总资产，作为后续计算盈亏比的分母
-                    self.buy_in_total_asset = cash + position * close_price + (buy_num * close_price)
+                    self.buy_in_total_asset = cash + position * close_price
                     # 计算交易成本
                     cost = buy_num * close_price * (1 + commission)
                     fee = buy_num * close_price * commission
