@@ -876,7 +876,7 @@ class TdxStockBacktest:
                 self.risk_per_trade = 0.0
                 
                 print(f"【止损触发】{datetime} - 价格{low_price} <= 止损价{self.stop_loss_price}，以收盘价{close_price}卖出{sell_num}股")
-                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际亏损:{pnl:.2f} | 实际盈亏比例:{abs(pnl)/current_total_asset*100:.2f}%")
+                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际亏损:{pnl:.2f} | 实际盈亏比例:{abs(pnl)/self.buy_in_total_asset*100:.2f}%")
             
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
             if row['signal'] == 1 and cash > close_price and not self.in_position:
@@ -902,10 +902,10 @@ class TdxStockBacktest:
                 )
                 
                 if buy_num > 0:
-                    # 计算交易成本
-                    cost = buy_num * close_price * (1 + commission)
                     # 【核心修正】：记录买入这一刻的账户总资产，作为后续计算盈亏比的分母
                     self.buy_in_total_asset = cash + position * close_price + (buy_num * close_price)
+                    # 计算交易成本
+                    cost = buy_num * close_price * (1 + commission)
                     fee = buy_num * close_price * commission
                     if cash >= cost:
                         position += buy_num
@@ -986,7 +986,7 @@ class TdxStockBacktest:
                 # 新增：打印卖出原因和K线索引
                 print(f"【策略卖出】{datetime} - 第{current_kline_idx}根K线 | 价格{close_price}，数量{sell_num}，盈亏{pnl:.2f}")
                 print(f"          - 卖出原因：{sell_reason}")
-                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际盈亏比例:{pnl/current_total_asset*100:.2f}%")
+                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际盈亏比例:{pnl/self.buy_in_total_asset*100:.2f}%")
             
             # 计算当前总资产
             total_asset = cash + position * close_price
@@ -1154,19 +1154,20 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
     # 步骤 B: 计算多周期 RPS 强度
     print("正在计算 RPS60 和 RPS120 强度矩阵...")
     rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=60)
-    rps120_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=120)
+    # rps120_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=120)
     # 逐只股票回测
     for idx, code in enumerate(stock_codes):
         print(f"\n------------------- 进度 {idx+1}/{len(stock_codes)} -------------------")
         try:
             # --- 核心逻辑修改：提取该股的两个 RPS 序列并计算“或”逻辑 ---
             s60 = rps60_matrix[code] if code in rps60_matrix else pd.Series(0, index=rps60_matrix.index)
-            s120 = rps120_matrix[code] if code in rps120_matrix else pd.Series(0, index=rps120_matrix.index)
+            # s120 = rps120_matrix[code] if code in rps120_matrix else pd.Series(0, index=rps120_matrix.index)
             
             # 只要其中一个大于 80，该序列即为 True (1)，否则为 False (0)
             # 这样传给策略函数时，策略只需要判断这个综合信号即可
 
-            combined_rps_filter = ((s60 >= 80) | (s120 >= 80)).astype(int)
+            # combined_rps_filter = ((s60 >= 80) & (s120 >= 80)).astype(int)
+            combined_rps_filter = ((s60 >= 80)).astype(int)
             _, metrics, trades_detail = backtest.run_backtest(
                 code=code,
                 init_cash=init_cash,
