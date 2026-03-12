@@ -13,7 +13,7 @@ from mootdx.reader import Reader
 warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -233,29 +233,23 @@ class TdxStockBacktest:
     @staticmethod
     def calculate_rps_matrix(all_stocks_data: Dict[str, pd.DataFrame], n: int = 250) -> pd.DataFrame:
         """
-        计算整个池子的 RPS 矩阵
-        :param all_stocks_data: {code: df} 字典，df 需包含收盘价
-        :param n: 回测周期 (250, 120, 60)
-        :return: 一个以时间为索引，股票代码为列的 RPS 评分表
+        计算 30 分钟级别的 RPS 矩阵
+        :param n: 回测周期（如果是30分钟线，n=250 约等于 31 个交易日）
         """
         extrs_dict = {}
         for code, df in all_stocks_data.items():
-            # 确保 DataFrame 不为空且包含必要列
             if df is None or df.empty or '收盘价' not in df.columns:
                 continue
-            # 计算 EXTRS: (C - REF(C, N)) / REF(C, N)
+            # 计算 30 分钟 K 线跨度的涨幅
             extrs_dict[code] = df['收盘价'].pct_change(n)
 
         if not extrs_dict:
             return pd.DataFrame()
         
         extrs_df = pd.DataFrame(extrs_dict)
-        # 3. 关键：前 N 天的数据都是 NaN，不能参与排名
-        # axis=1 表示每一行（同一天）进行排名
-        # pct=True 得到 0-1 的分位数，再乘以 100
-        # min_periods=1 确保只要当天有数据的股票都参与排名
+        # 每一行（每一个30分钟时间点）进行全成员排名
         rps_df = extrs_df.rank(axis=1, pct=True, ascending=True) * 100
-        return rps_df   
+        return rps_df
     
     def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
         """
@@ -659,19 +653,20 @@ class TdxStockBacktest:
                 how='left'
             ).set_index('datetime')
 
-             # 将日线级别的综合 RPS 过滤结果同步到 30 分钟数据上
+            # --- 修正后的同步逻辑 ---
             if rps_series is not None:
-                data['date_only'] = data.index.date
-                # 此时 rps_series 里的值是 1 (符合RPS条件) 或 0 (不符合)
+                # rps_series 现在的 index 是 datetime (30min)
                 rps_df = rps_series.to_frame(name='rps_ok_flag')
-                rps_df['date_only'] = rps_df.index.date
-                data = data.reset_index().merge(
-                    rps_df[['date_only', 'rps_ok_flag']], 
-                    on='date_only', 
+                # 直接通过索引合并，不再通过 date_only
+                data = data.merge(
+                    rps_df[['rps_ok_flag']], 
+                    left_index=True, 
+                    right_index=True, 
                     how='left'
-                ).set_index('datetime')
+                )
+                data['rps_ok_flag'] = data['rps_ok_flag'].fillna(0)
             else:
-                data['rps_ok_flag'] = 1 # 默认不限制
+                data['rps_ok_flag'] = 1
 
             # --- 2. 预计算基础指标 ---
             buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
@@ -711,10 +706,16 @@ class TdxStockBacktest:
                         else:
                             initial_stop_loss = low_list[i]
                         current_stop_loss = initial_stop_loss # 初始化实时止损
-                else:
+                else:       
+                    # A. 止损检查 (优先级最高，使用 current_stop_loss)
+                    if low_list[i] <= current_stop_loss:
+                        data.loc[current_idx_time, 'signal'] = -1
+                        data.loc[current_idx_time, 'sell_reason'] = f"触发止损(当前止损价:{current_stop_loss})"
+                        in_pos = False
+                        continue
+
                     # 持仓中：判定卖出
                     hold_count = i - buy_idx # 计算介入后的K线根数 (0为买入当天)
-
                     # --- 新增：介入后第三根K线逻辑 (hold_count == 3) ---
                     if hold_count == 3:
                         if close_list[i] < buy_price:
@@ -726,13 +727,6 @@ class TdxStockBacktest:
                         else:
                             # 高于或等于买入价，移动止损到成本价
                             current_stop_loss = max(current_stop_loss, buy_price)
-                    
-                    # A. 止损检查 (优先级最高，使用 current_stop_loss)
-                    if low_list[i] <= current_stop_loss:
-                        data.loc[current_idx_time, 'signal'] = -1
-                        data.loc[current_idx_time, 'sell_reason'] = f"触发止损(当前止损价:{current_stop_loss})"
-                        in_pos = False
-                        continue
 
                     min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
                     data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss # 记录当前止损价，便于调试和分析
@@ -834,49 +828,49 @@ class TdxStockBacktest:
                 self.stop_loss_price = row['active_stop_loss']
             
             # ===== 止损逻辑：触发止损则强制卖出 =====
-            if self.in_position and low_price <= self.stop_loss_price:
-                # 触发止损，以收盘价卖出全部持仓
-                sell_num = position
-                fee = sell_num * close_price * commission
-                # 卖出收入 = 卖出数量 × 卖出价格 × (1 - 佣金率)
-                income = sell_num * close_price * (1 - commission)
+            # if self.in_position and low_price <= self.stop_loss_price:
+            #     # 触发止损，以收盘价卖出全部持仓
+            #     sell_num = position
+            #     fee = sell_num * close_price * commission
+            #     # 卖出收入 = 卖出数量 × 卖出价格 × (1 - 佣金率)
+            #     income = sell_num * close_price * (1 - commission)
                 
-                # 计算这笔止损交易的盈亏
-                total_buy_cost = sell_num * buy_price + buy_fee
-                total_sell_income = income - fee
-                pnl = total_sell_income - total_buy_cost
+            #     # 计算这笔止损交易的盈亏
+            #     total_buy_cost = sell_num * buy_price + buy_fee
+            #     total_sell_income = income - fee
+            #     pnl = total_sell_income - total_buy_cost
                 
-                # 更新资金和记录交易
-                cash += income
-                trade_detail = {
-                    '股票代码': code,
-                    '交易时间': datetime,
-                    '交易类型': '止损卖出',
-                    '价格': close_price,
-                    '数量': sell_num,
-                    '费用': fee,
-                    '单笔盈亏': pnl,
-                    '是否盈利': pnl > 0,
-                    '触发止损价': self.stop_loss_price,
-                    '当前K线最低价': low_price,
-                    '单笔风险金额': self.risk_per_trade,
-                    '实际盈亏比例': pnl/self.buy_in_total_asset*100
-                }
-                trade_records.append(trade_detail)
-                self.trade_pnl.append(pnl)
-                self.all_trades_detail.append(trade_detail)  # 存入交易明细
+            #     # 更新资金和记录交易
+            #     cash += income
+            #     trade_detail = {
+            #         '股票代码': code,
+            #         '交易时间': datetime,
+            #         '交易类型': '止损卖出',
+            #         '价格': close_price,
+            #         '数量': sell_num,
+            #         '费用': fee,
+            #         '单笔盈亏': pnl,
+            #         '是否盈利': pnl > 0,
+            #         '触发止损价': self.stop_loss_price,
+            #         '当前K线最低价': low_price,
+            #         '单笔风险金额': self.risk_per_trade,
+            #         '实际盈亏比例': pnl/self.buy_in_total_asset*100
+            #     }
+            #     trade_records.append(trade_detail)
+            #     self.trade_pnl.append(pnl)
+            #     self.all_trades_detail.append(trade_detail)  # 存入交易明细
                 
-                # 重置持仓和止损参数
-                position = 0
-                buy_price = 0
-                buy_fee = 0
-                self.stop_loss_price = 0.0
-                self.in_position = False
-                buy_kline_low = 0.0
-                self.risk_per_trade = 0.0
+            #     # 重置持仓和止损参数
+            #     position = 0
+            #     buy_price = 0
+            #     buy_fee = 0
+            #     self.stop_loss_price = 0.0
+            #     self.in_position = False
+            #     buy_kline_low = 0.0
+            #     self.risk_per_trade = 0.0
                 
-                print(f"【止损触发】{datetime} - 价格{low_price} <= 止损价{self.stop_loss_price}，以收盘价{close_price}卖出{sell_num}股")
-                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际亏损:{pnl:.2f} | 实际盈亏比例:{abs(pnl)/self.buy_in_total_asset*100:.2f}%")
+            #     print(f"【止损触发】{datetime} - 价格{low_price} <= 止损价{self.stop_loss_price}，以收盘价{close_price}卖出{sell_num}股")
+            #     print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际亏损:{pnl:.2f} | 实际盈亏比例:{abs(pnl)/self.buy_in_total_asset*100:.2f}%")
             
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
             if row['signal'] == 1 and cash > close_price and not self.in_position:
@@ -1144,30 +1138,29 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
     all_metrics = []
     all_trades_detail = []  # 存储所有股票的交易明细
 
-    all_day_data = {}
-    # 步骤 A: 预抓取所有日线数据用于计算全局 RPS
-    print("正在预取日线数据以计算 RPS 强度...")
+    all_min30_data = {}
+    print("正在预取 30 分钟数据以计算日内 RPS 强度...")
     for code in stock_codes:
-        df = backtest.get_local_day_data(code)
+        # 改为读取 30 分钟数据
+        df = backtest.get_exact_tdx_30min(code) 
         if not df.empty:
-            all_day_data[code] = df
-    # 步骤 B: 计算多周期 RPS 强度
-    print("正在计算 RPS60 和 RPS120 强度矩阵...")
-    rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=60)
+            all_min30_data[code] = df
+    # 计算 30 分钟 RPS
+    # 注意：这里的 n 需要重新定义。如果你想要“一个月”的强度，30分钟线 n 约为 250
+    # 如果想要“五天”的强度，n 约为 40
+    print("正在计算 30 分钟级别的 RPS60 强度矩阵...")
+    rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_min30_data, n=60)
     # rps120_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=120)
     # 逐只股票回测
     for idx, code in enumerate(stock_codes):
         print(f"\n------------------- 进度 {idx+1}/{len(stock_codes)} -------------------")
         try:
-            # --- 核心逻辑修改：提取该股的两个 RPS 序列并计算“或”逻辑 ---
+            # 提取该股的 30 分钟 RPS 序列
             s60 = rps60_matrix[code] if code in rps60_matrix else pd.Series(0, index=rps60_matrix.index)
-            # s120 = rps120_matrix[code] if code in rps120_matrix else pd.Series(0, index=rps120_matrix.index)
             
-            # 只要其中一个大于 80，该序列即为 True (1)，否则为 False (0)
-            # 这样传给策略函数时，策略只需要判断这个综合信号即可
-
-            # combined_rps_filter = ((s60 >= 80) & (s120 >= 80)).astype(int)
-            combined_rps_filter = ((s60 >= 80)).astype(int)
+            # 核心修正：为了防止未来函数，RPS 必须 shift(1)
+            # 意味着当前 30 分钟的决策是基于上一个 30 分钟结束时的排名
+            combined_rps_filter = (s60 >= 80).astype(int).shift(1).fillna(0)
             _, metrics, trades_detail = backtest.run_backtest(
                 code=code,
                 init_cash=init_cash,
