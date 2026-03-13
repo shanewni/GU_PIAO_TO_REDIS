@@ -718,15 +718,13 @@ class TdxStockBacktest:
                     hold_count = i - buy_idx # 计算介入后的K线根数 (0为买入当天)
                     # --- 新增：介入后第三根K线逻辑 (hold_count == 3) ---
                     if hold_count == 3:
-                        if close_list[i] < buy_price:
-                            # data.loc[current_idx_time, 'signal'] = -1
-                            # data.loc[current_idx_time, 'sell_reason'] = "第三根K线低于买入价强制卖出"
-                            # in_pos = False
-                            # continue
-                            pass
-                        else:
+                        # 计算当前价格相对于初次买入价的涨幅
+                        profit_ratio = (close_list[i] - buy_price) / buy_price
+                        if close_list[i] >= buy_price and profit_ratio >= 0.005:
                             # 高于或等于买入价，移动止损到成本价
                             current_stop_loss = max(current_stop_loss, buy_price)
+                            # 【新增】产生加仓信号：2 
+                            data.loc[current_idx_time, 'signal'] = 2
 
                     min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
                     data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss # 记录当前止损价，便于调试和分析
@@ -750,269 +748,214 @@ class TdxStockBacktest:
             return data
     
     def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
-                     commission: float = 0.0003, stop_loss_ratio: float = 0.01,
-                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH,current_rps: pd.Series = None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
-        """
-        执行三买变体策略回测（30分钟周期）
-        升级：返回单股票交易明细列表，用于总笔数汇总
-        :param code: 股票代码
-        :param period: 回测周期（仅支持30min）
-        :param init_cash: 初始资金
-        :param commission: 交易佣金（默认0.03%）
-        :param stop_loss_ratio: 总资金止损百分比（默认2%）
-        :return: 回测结果DataFrame, 回测指标字典, 单股票交易明细列表
-        """
-        print(f"\n========== 开始回测股票 {code} ==========")
-        print(f"数据源模式：{'本地通达信数据' if use_local else '联网获取'}")
-   
-        # 重置单股票交易明细
-        self.all_trades_detail = []
-        
-        if period != '30min':
-            print("当前版本仅支持30分钟周期回测")
-            return pd.DataFrame(), {}, []
-        
-        # 联网模式需要先连接服务器
-        if not use_local:
-            connect_success = self.connect_tdx()
-            if not connect_success:
-                print("联网模式连接失败，终止回测")
-                return pd.DataFrame(), {}, []
-        
-        # 获取多周期数据（自动切换本地/联网）
-        multi_data = self.get_multi_period_data(code, count=800, use_local=use_local, tdx_path=tdx_path)
-        day_data = multi_data['day']
-        min30_data = multi_data['30min']
-        min30_high = multi_data['30min_high_list']
-        min30_low = multi_data['30min_low_list']
-        
-        if min30_data.empty:
-            print(f"股票 {code} 30分钟数据为空，无法回测")
-            return pd.DataFrame(), {}, []
-        
-        # 生成策略信号
-        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low,current_rps)
-        
-        # 初始化止损百分比
-        self.stop_loss_ratio = stop_loss_ratio
-        print(f"\n以损定量配置：单笔交易最大亏损 = 总资金 × {stop_loss_ratio*100}%")
-        
-        # 初始化回测参数
-        cash = init_cash  # 可用资金
-        position = 0  # 持仓数量
-        total_asset = init_cash  # 总资产（现金+持仓市值）
-        trade_records = []  # 交易记录
-        daily_results = []  # 每30分钟结果
-        self.trade_pnl = []      # 记录每笔交易的盈亏
-        
-        # 止损相关初始化
-        self.stop_loss_price = 0.0
-        self.in_position = False
-        buy_kline_low = 0.0
-        buy_datetime = None
-        
-        # 逐行执行回测
-        buy_price = 0
-        buy_fee = 0
-        
-        for datetime, row in data.iterrows():
-            close_price = row['收盘价']
-            low_price = row['最低价']
-            high_price = row['最高价']
-            current_total_asset = cash + position * close_price
-            current_idx = data.index.get_loc(datetime)  # 当前K线索引
+                        commission: float = 0.0003, stop_loss_ratio: float = 0.01,
+                        use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH,current_rps: pd.Series = None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+            print(f"\n========== 开始回测股票 {code} ==========")
+            print(f"数据源模式：{'本地通达信数据' if use_local else '联网获取'}")
+    
+            self.all_trades_detail = []
+            if period != '30min': return pd.DataFrame(), {}, []
+            if not use_local and not self.connect_tdx(): return pd.DataFrame(), {}, []
+            
+            multi_data = self.get_multi_period_data(code, count=800, use_local=use_local, tdx_path=tdx_path)
+            day_data = multi_data['day']
+            min30_data = multi_data['30min']
+            min30_high = multi_data['30min_high_list']
+            min30_low = multi_data['30min_low_list']
+            
+            if min30_data.empty: return pd.DataFrame(), {}, []
+            
+            data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low, current_rps)
+            
+            # 内部状态初始化
+            cash = init_cash
+            position = 0
+            total_asset = init_cash
+            trade_records = []
+            daily_results = []
+            self.trade_pnl = []
+            self.stop_loss_price = 0.0
+            self.in_position = False
+            
+            # 【新增】支持加仓的累计变量
+            self.total_buy_cost = 0.0  # 累计净买入花费金额
+            self.total_buy_fee = 0.0   # 累计手续费
+            self.initial_buy_price = 0.0 # 初次介入价格
+            self.has_added_pos = False   # 标记是否已经追加过仓位
+            
+            for datetime, row in data.iterrows():
+                close_price = row['收盘价']
+                low_price = row['最低价']
+                high_price = row['最高价']
+                current_total_asset = cash + position * close_price
+                current_idx = data.index.get_loc(datetime)
 
-            # 核心修改：实时更新回测器手中的止损价
-            if self.in_position:
-                # 这里的 active_stop_loss 包含了你新加的“第三根K线移位”后的价格
-                self.stop_loss_price = row['active_stop_loss']
-            
-            # ===== 止损逻辑：触发止损则强制卖出 =====
-            # if self.in_position and low_price <= self.stop_loss_price:
-            #     # 触发止损，以收盘价卖出全部持仓
-            #     sell_num = position
-            #     fee = sell_num * close_price * commission
-            #     # 卖出收入 = 卖出数量 × 卖出价格 × (1 - 佣金率)
-            #     income = sell_num * close_price * (1 - commission)
+                if self.in_position and 'active_stop_loss' in row:
+                    self.stop_loss_price = row['active_stop_loss']
                 
-            #     # 计算这笔止损交易的盈亏
-            #     total_buy_cost = sell_num * buy_price + buy_fee
-            #     total_sell_income = income - fee
-            #     pnl = total_sell_income - total_buy_cost
-                
-            #     # 更新资金和记录交易
-            #     cash += income
-            #     trade_detail = {
-            #         '股票代码': code,
-            #         '交易时间': datetime,
-            #         '交易类型': '止损卖出',
-            #         '价格': close_price,
-            #         '数量': sell_num,
-            #         '费用': fee,
-            #         '单笔盈亏': pnl,
-            #         '是否盈利': pnl > 0,
-            #         '触发止损价': self.stop_loss_price,
-            #         '当前K线最低价': low_price,
-            #         '单笔风险金额': self.risk_per_trade,
-            #         '实际盈亏比例': pnl/self.buy_in_total_asset*100
-            #     }
-            #     trade_records.append(trade_detail)
-            #     self.trade_pnl.append(pnl)
-            #     self.all_trades_detail.append(trade_detail)  # 存入交易明细
-                
-            #     # 重置持仓和止损参数
-            #     position = 0
-            #     buy_price = 0
-            #     buy_fee = 0
-            #     self.stop_loss_price = 0.0
-            #     self.in_position = False
-            #     buy_kline_low = 0.0
-            #     self.risk_per_trade = 0.0
-                
-            #     print(f"【止损触发】{datetime} - 价格{low_price} <= 止损价{self.stop_loss_price}，以收盘价{close_price}卖出{sell_num}股")
-            #     print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际亏损:{pnl:.2f} | 实际盈亏比例:{abs(pnl)/self.buy_in_total_asset*100:.2f}%")
-            
-            # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
-            if row['signal'] == 1 and cash > close_price and not self.in_position:
-                # 3. 原有的止损价计算逻辑
-                if current_idx > 0:
-                    prev_close = data['最高价'].iloc[current_idx - 1]
-                    loss_price = min(row['最低价'], prev_close)
+                # ===== 1. 初次介入买入逻辑 (强制0.5%风险) =====
+                if row['signal'] == 1 and cash > close_price and not self.in_position:
+                    if current_idx > 0:
+                        prev_close = data['最高价'].iloc[current_idx - 1]
+                        loss_price = min(row['最低价'], prev_close)
+                        if (close_price-loss_price)/loss_price*100 > 2.4: continue
+                        if (close_price-loss_price)/loss_price*100 < 0.5: continue
+                        self.stop_loss_price = loss_price
+                    else:
+                        self.stop_loss_price = row['最低价']
+                    
+                    # 【修改】使用 0.5% (0.005) 计算初次买入量
+                    self.stop_loss_ratio = stop_loss_ratio * 0.5
+                    buy_num = self.calculate_position_size(
+                        current_cash=current_total_asset,
+                        entry_price=close_price,
+                        stop_loss_price=self.stop_loss_price
+                    )
+                    
+                    if buy_num > 0:
+                        self.buy_in_total_asset = cash + position * close_price
+                        cost = buy_num * close_price * (1 + commission)
+                        fee = buy_num * close_price * commission
+                        if cash >= cost:
+                            position += buy_num
+                            cash -= cost
+                            
+                            # 初始化状态与成本累计
+                            self.initial_buy_price = close_price
+                            self.total_buy_cost = buy_num * close_price
+                            self.total_buy_fee = fee
+                            self.in_position = True
+                            self.has_added_pos = False
+                            
+                            trade_detail = {
+                                '股票代码': code,
+                                '交易时间': datetime,
+                                '交易类型': '初次买入',
+                                '价格': close_price,
+                                '数量': buy_num,
+                                '费用': fee,
+                                '单笔盈亏': 0.0,
+                                '是否盈利': None,
+                                '设置止损价': self.stop_loss_price,
+                                '单笔风险金额': self.risk_per_trade,
+                                '风险比例': stop_loss_ratio * 100 * 0.5,
+                                '单k涨幅': (close_price - self.stop_loss_price)/self.stop_loss_price*100 if self.stop_loss_price else 0
+                            }
+                            trade_records.append(trade_detail)
+                            self.all_trades_detail.append(trade_detail)
+                            print(f"【初次买入（0.5%风险）】{datetime} - 价格{close_price}，数量{buy_num}")
 
-                    if (close_price-loss_price)/loss_price*100 > 2.4:
-                        continue
-                    if (close_price-loss_price)/loss_price*100 < 0.5:
-                        continue
-                    self.stop_loss_price = loss_price
-                else:
-                    # 如果是第一根K线（无前值），则使用当前最低价
-                    self.stop_loss_price = row['最低价']
-                
-                # 4. 以损定量：计算可买数量
-                buy_num = self.calculate_position_size(
-                    current_cash=current_total_asset,
-                    entry_price=close_price,
-                    stop_loss_price=self.stop_loss_price
-                )
-                
-                if buy_num > 0:
-                    # 【核心修正】：记录买入这一刻的账户总资产，作为后续计算盈亏比的分母
-                    self.buy_in_total_asset = cash + position * close_price
-                    # 计算交易成本
-                    cost = buy_num * close_price * (1 + commission)
-                    fee = buy_num * close_price * commission
-                    if cash >= cost:
-                        position += buy_num
-                        cash -= cost
-                        buy_price = close_price
-                        buy_fee = fee
-                        self.in_position = True
-                        buy_datetime = datetime
+                # ===== 2. 追加仓位逻辑 (3K后符合条件追加0.5%风险) =====
+                elif row['signal'] == 2 and self.in_position and not self.has_added_pos:
+                    # 止损价锚定为起初介入价
+                    add_stop_loss = self.initial_buy_price
+                    
+                    if close_price > add_stop_loss:
+                        self.stop_loss_ratio = stop_loss_ratio * 0.5 # 追加使用总风险的另一半
+                        add_num = self.calculate_position_size(
+                            current_cash=current_total_asset,
+                            entry_price=close_price,
+                            stop_loss_price=add_stop_loss
+                        )
                         
-                        trade_detail = {
-                            '股票代码': code,
-                            '交易时间': datetime,
-                            '交易类型': '买入',
-                            '价格': close_price,
-                            '数量': buy_num,
-                            '费用': fee,
-                            '单笔盈亏': 0.0,  # 买入时盈亏为0，卖出时更新
-                            '是否盈利': None,
-                            '设置止损价': self.stop_loss_price,
-                            '单笔风险金额': self.risk_per_trade,
-                            '风险比例': self.stop_loss_ratio*100,
-                            '单k涨幅': (close_price - self.stop_loss_price)/self.stop_loss_price*100
-                        }
-                        trade_records.append(trade_detail)
-                        self.all_trades_detail.append(trade_detail)  # 存入交易明细
-                        
-                        print(f"【买入开仓（以损定量）】{datetime} - 价格{close_price}，数量{buy_num}")
-                        print(f"          - 止损价:{self.stop_loss_price} | 单笔风险金额:{self.risk_per_trade:.2f} | 风险比例:{self.stop_loss_ratio*100}%")
-                else:
-                    print(f"【买入失败】{datetime} - 以损定量计算可买数量为0（止损价{self.stop_loss_price} >= 买入价{close_price}）")
+                        if add_num > 0:
+                            cost = add_num * close_price * (1 + commission)
+                            fee = add_num * close_price * commission
+                            if cash >= cost:
+                                position += add_num
+                                cash -= cost
+                                
+                                # 累计成本叠加
+                                self.total_buy_cost += add_num * close_price
+                                self.total_buy_fee += fee
+                                self.has_added_pos = True
+                                
+                                trade_detail = {
+                                    '股票代码': code,
+                                    '交易时间': datetime,
+                                    '交易类型': '追加买入',
+                                    '价格': close_price,
+                                    '数量': add_num,
+                                    '费用': fee,
+                                    '单笔盈亏': 0.0,
+                                    '是否盈利': None,
+                                    '设置止损价': add_stop_loss,
+                                    '单笔风险金额': self.risk_per_trade,
+                                    '风险比例': stop_loss_ratio * 100 * 0.5,
+                                    '单k涨幅': 0.0
+                                }
+                                trade_records.append(trade_detail)
+                                self.all_trades_detail.append(trade_detail)
+                                print(f"【追加买入（0.5%风险）】{datetime} - 价格{close_price}，数量{add_num}，止损统一上移至{add_stop_loss}")
+
+                # ===== 3. 正常卖出信号执行 =====
+                elif row['signal'] == -1 and position > 0:
+                    current_kline_idx = data.index.get_loc(datetime) + 1
+                    sell_reason = row['sell_reason'] if 'sell_reason' in row else "未知原因"
+                    
+                    sell_num = position
+                    # 【修复】原代码中 total_sell_income 重复扣手续费的 Bug
+                    gross_income = sell_num * close_price
+                    sell_fee = gross_income * commission
+                    net_income = gross_income - sell_fee  # 这是真正到手的现金
+                    
+                    # 提取累计的所有成本
+                    total_cost_with_fee = self.total_buy_cost + self.total_buy_fee
+                    # 终极盈亏 = 净收入 - 总支出
+                    pnl = net_income - total_cost_with_fee
+                    
+                    cash += net_income
+                    trade_detail = {
+                        '股票代码': code,
+                        '交易时间': datetime,
+                        '交易类型': '策略卖出',
+                        '价格': close_price,
+                        '数量': sell_num,
+                        '费用': sell_fee,
+                        '单笔盈亏': pnl,
+                        '是否盈利': pnl > 0,
+                        '卖出原因': sell_reason,
+                        '当前K线索引': current_kline_idx,
+                        '单笔风险金额': self.risk_per_trade,
+                        '实际盈亏比例': pnl/self.buy_in_total_asset*100 if hasattr(self, 'buy_in_total_asset') else 0
+                    }
+                    trade_records.append(trade_detail)
+                    self.trade_pnl.append(pnl)
+                    self.all_trades_detail.append(trade_detail)
+                    
+                    print(f"【策略卖出】{datetime} - 第{current_kline_idx}根K线 | 价格{close_price}，数量{sell_num}，总盈亏{pnl:.2f}，实际盈亏比例{trade_detail['实际盈亏比例']:.2f}%")
+                    print(f"          - 卖出原因：{sell_reason}")
+
+                    # 彻底重置所有内部状态
+                    position = 0
+                    self.total_buy_cost = 0.0
+                    self.total_buy_fee = 0.0
+                    self.initial_buy_price = 0.0
+                    self.has_added_pos = False
+                    self.stop_loss_price = 0.0
+                    self.in_position = False
+                    self.risk_per_trade = 0.0
+                
+                total_asset = cash + position * close_price
+                daily_results.append({
+                    '时间': datetime,
+                    '收盘价': close_price,
+                    '持仓数量': position,
+                    '可用现金': cash,
+                    '总资产': total_asset,
+                    '累计收益': total_asset - init_cash,
+                    '累计收益率': (total_asset - init_cash) / init_cash * 100,
+                    '止损价格': self.stop_loss_price if self.in_position else 0.0,
+                    '单笔风险金额': self.risk_per_trade if self.in_position else 0.0
+                })
             
-            # ===== 正常卖出信号执行 =====
-            elif row['signal'] == -1 and position > 0:
-                # 获取当前K线索引（第几根K线）
-                current_kline_idx = data.index.get_loc(datetime) + 1  # 从1开始计数
-                # 获取卖出原因
-                sell_reason = row['sell_reason'] if 'sell_reason' in row else "未知原因"
-                
-                # 卖出全部持仓
-                sell_num = position
-                # 计算交易费用
-                fee = sell_num * close_price * commission
-                # 卖出收入 = 卖出数量 × 卖出价格 × (1 - 佣金率)
-                income = sell_num * close_price * (1 - commission)
-                # 计算这笔交易的盈亏
-                total_buy_cost = sell_num * buy_price + buy_fee
-                total_sell_income = income - fee
-                pnl = total_sell_income - total_buy_cost
-                
-                cash += income
-                trade_detail = {
-                    '股票代码': code,
-                    '交易时间': datetime,
-                    '交易类型': '策略卖出',
-                    '价格': close_price,
-                    '数量': sell_num,
-                    '费用': fee,
-                    '单笔盈亏': pnl,
-                    '是否盈利': pnl > 0,
-                    '卖出原因': sell_reason,
-                    '当前K线索引': current_kline_idx,
-                    '单笔风险金额': self.risk_per_trade,
-                    '实际盈亏比例': pnl/self.buy_in_total_asset*100
-                }
-                trade_records.append(trade_detail)
-                self.trade_pnl.append(pnl)
-                self.all_trades_detail.append(trade_detail)  # 存入交易明细
-                
-                # 重置持仓和止损参数
-                position = 0
-                buy_price = 0
-                buy_fee = 0
-                self.stop_loss_price = 0.0
-                self.in_position = False
-                buy_kline_low = 0.0
-                self.risk_per_trade = 0.0
-                
-                # 新增：打印卖出原因和K线索引
-                print(f"【策略卖出】{datetime} - 第{current_kline_idx}根K线 | 价格{close_price}，数量{sell_num}，盈亏{pnl:.2f}")
-                print(f"          - 卖出原因：{sell_reason}")
-                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际盈亏比例:{pnl/self.buy_in_total_asset*100:.2f}%")
+            self.backtest_result = pd.DataFrame(daily_results).set_index('时间')
+            self.trade_records = pd.DataFrame(trade_records)
+            metrics = self.calc_backtest_metrics(init_cash)
             
-            # 计算当前总资产
-            total_asset = cash + position * close_price
-            daily_results.append({
-                '时间': datetime,
-                '收盘价': close_price,
-                '持仓数量': position,
-                '可用现金': cash,
-                '总资产': total_asset,
-                '累计收益': total_asset - init_cash,
-                '累计收益率': (total_asset - init_cash) / init_cash * 100,
-                '止损价格': self.stop_loss_price if self.in_position else 0.0,
-                '单笔风险金额': self.risk_per_trade if self.in_position else 0.0
-            })
-        
-        # 整理回测结果
-        self.backtest_result = pd.DataFrame(daily_results)
-        self.backtest_result = self.backtest_result.set_index('时间')
-        
-        # 添加交易记录
-        self.trade_records = pd.DataFrame(trade_records)
-        
-        # 计算核心指标
-        metrics = self.calc_backtest_metrics(init_cash)
-        
-        # 打印单股票回测指标
-        print(f"\n===== 股票 {code} 回测核心指标 =====")
-        for k, v in metrics.items():
-            print(f"{k}: {v:.2f}")
-        
-        print(f"\n========== 股票 {code} 回测完成 ==========\n")
-        return self.backtest_result, metrics, self.all_trades_detail
+            print(f"\n===== 股票 {code} 回测核心指标 =====")
+            for k, v in metrics.items(): print(f"{k}: {v:.2f}")
+            return self.backtest_result, metrics, self.all_trades_detail
 
 
 def parse_tdx_blk_file(file_path: str) -> List[str]:
