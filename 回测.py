@@ -13,7 +13,7 @@ from mootdx.reader import Reader
 warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -827,51 +827,6 @@ class TdxStockBacktest:
                 # 这里的 active_stop_loss 包含了你新加的“第三根K线移位”后的价格
                 self.stop_loss_price = row['active_stop_loss']
             
-            # ===== 止损逻辑：触发止损则强制卖出 =====
-            # if self.in_position and low_price <= self.stop_loss_price:
-            #     # 触发止损，以收盘价卖出全部持仓
-            #     sell_num = position
-            #     fee = sell_num * close_price * commission
-            #     # 卖出收入 = 卖出数量 × 卖出价格 × (1 - 佣金率)
-            #     income = sell_num * close_price * (1 - commission)
-                
-            #     # 计算这笔止损交易的盈亏
-            #     total_buy_cost = sell_num * buy_price + buy_fee
-            #     total_sell_income = income - fee
-            #     pnl = total_sell_income - total_buy_cost
-                
-            #     # 更新资金和记录交易
-            #     cash += income
-            #     trade_detail = {
-            #         '股票代码': code,
-            #         '交易时间': datetime,
-            #         '交易类型': '止损卖出',
-            #         '价格': close_price,
-            #         '数量': sell_num,
-            #         '费用': fee,
-            #         '单笔盈亏': pnl,
-            #         '是否盈利': pnl > 0,
-            #         '触发止损价': self.stop_loss_price,
-            #         '当前K线最低价': low_price,
-            #         '单笔风险金额': self.risk_per_trade,
-            #         '实际盈亏比例': pnl/self.buy_in_total_asset*100
-            #     }
-            #     trade_records.append(trade_detail)
-            #     self.trade_pnl.append(pnl)
-            #     self.all_trades_detail.append(trade_detail)  # 存入交易明细
-                
-            #     # 重置持仓和止损参数
-            #     position = 0
-            #     buy_price = 0
-            #     buy_fee = 0
-            #     self.stop_loss_price = 0.0
-            #     self.in_position = False
-            #     buy_kline_low = 0.0
-            #     self.risk_per_trade = 0.0
-                
-            #     print(f"【止损触发】{datetime} - 价格{low_price} <= 止损价{self.stop_loss_price}，以收盘价{close_price}卖出{sell_num}股")
-            #     print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际亏损:{pnl:.2f} | 实际盈亏比例:{abs(pnl)/self.buy_in_total_asset*100:.2f}%")
-            
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
             if row['signal'] == 1 and cash > close_price and not self.in_position:
                 # 3. 原有的止损价计算逻辑
@@ -908,6 +863,7 @@ class TdxStockBacktest:
                         buy_fee = fee
                         self.in_position = True
                         buy_datetime = datetime
+                        self.buy_kline_index = current_idx  # 【新增】记录买入时的全局 K 线索引
                         
                         trade_detail = {
                             '股票代码': code,
@@ -948,7 +904,7 @@ class TdxStockBacktest:
                 total_buy_cost = sell_num * buy_price + buy_fee
                 total_sell_income = income - fee
                 pnl = total_sell_income - total_buy_cost
-                
+                hold_k_count = current_idx - self.buy_kline_index + 1  # 持仓K线数量
                 cash += income
                 trade_detail = {
                     '股票代码': code,
@@ -961,6 +917,7 @@ class TdxStockBacktest:
                     '是否盈利': pnl > 0,
                     '卖出原因': sell_reason,
                     '当前K线索引': current_kline_idx,
+                    '持仓K线数量': hold_k_count,  # 【新增】记录相对持仓时长
                     '单笔风险金额': self.risk_per_trade,
                     '实际盈亏比例': pnl/self.buy_in_total_asset*100
                 }
@@ -1057,7 +1014,7 @@ def calculate_total_trades_metrics(all_trades_detail: List[Dict]) -> Dict:
         return {}
     
     # 过滤出有盈亏的交易（买入交易无盈亏，仅统计卖出/止损交易）
-    pnl_trades = [trade for trade in all_trades_detail if trade['单笔盈亏'] != 0.0]
+    pnl_trades = [t for t in all_trades_detail if t.get('单笔盈亏', 0) != 0.0 and '持仓K线数量' in t]
     if not pnl_trades:
         return {
             '总交易笔数（含买入）': len(all_trades_detail),
@@ -1074,6 +1031,22 @@ def calculate_total_trades_metrics(all_trades_detail: List[Dict]) -> Dict:
             '最大单笔盈利': 0.0,
             '最大单笔亏损': 0.0
         }
+
+    # 2. 提取不同类别的持仓数据
+    hold_periods = [t['持仓K线数量'] for t in pnl_trades]
+    win_hold_periods = [t['持仓K线数量'] for t in pnl_trades if t['是否盈利']]
+    loss_hold_periods = [t['持仓K线数量'] for t in pnl_trades if not t['是否盈利']]
+
+    # 基础指标计算...
+    total_pnl_trades = len(pnl_trades)
+    win_trades = [t for t in pnl_trades if t['是否盈利']]
+    loss_trades = [t for t in pnl_trades if not t['是否盈利']]
+    
+    # 3. 计算要求的指标
+    avg_hold_k = np.mean(hold_periods) if hold_periods else 0.0
+    avg_win_hold_k = np.mean(win_hold_periods) if win_hold_periods else 0.0
+    avg_loss_hold_k = np.mean(loss_hold_periods) if loss_hold_periods else 0.0
+    max_hold_k = np.max(hold_periods) if hold_periods else 0.0
     
     # 核心计算
     total_trades_all = len(all_trades_detail)          # 所有交易笔数（含买入）
@@ -1112,7 +1085,12 @@ def calculate_total_trades_metrics(all_trades_detail: List[Dict]) -> Dict:
         '平均每笔亏损': avg_loss_per_trade,
         '总盈亏比': total_profit_loss_ratio,
         '最大单笔盈利': max_single_win,
-        '最大单笔亏损': max_single_loss
+        '最大单笔亏损': max_single_loss,
+        # --- 暴露给前端的持仓时间指标 -----
+        '平均持仓K线数量': round(avg_hold_k, 2),
+        '盈利平均K线数量': round(avg_win_hold_k, 2),
+        '亏损平均K线数量': round(avg_loss_hold_k, 2),
+        '最高持仓K线数量': int(max_hold_k)
     }
     
     return total_metrics
