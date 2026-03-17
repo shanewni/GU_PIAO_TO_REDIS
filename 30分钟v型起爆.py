@@ -118,6 +118,9 @@ def three_buy_variant(frac, high, low):
                     return pf_out  # 向上线段中有价格高于最近高点，不满足
                 i += 1
 
+    if last_k_idx -1 <= down_seg_end:
+        return pf_out  # 最后一根K线过近，不满足
+    
     # 所有条件满足，标记信号
     pf_out[last_k_idx] = 1.0
     return pf_out

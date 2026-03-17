@@ -386,52 +386,63 @@ class TdxStockBacktest:
         return pf_out
     
     @staticmethod
-    def calculate_three_buy_signals( high_full, low_full, close_full) -> List[float]:
+    def calculate_three_buy_signals(high_full, low_full, close_full) -> List[float]:
         """
         遍历完整数据序列，逐段计算三买变体买点信号
-        :param high_full: 完整的最高价序列（全量数据）
-        :param low_full: 完整的最低价序列（全量数据）
-        :return: 全量数据的买点信号列表，1.0表示对应位置是买点，0.0表示无
+        优化：每次计算仅使用最近 200 根 K 线以提升效率
         """
         # 校验全量数据长度一致
-        if  len(high_full) != len(low_full) or len(high_full) != len(close_full):
+        if len(high_full) != len(low_full) or len(high_full) != len(close_full):
             raise ValueError("high_full、low_full、close_full必须长度一致")
         
         total_length = len(high_full)
         # 初始化全量信号数组（默认全为0）
         full_signals = [0.0] * total_length
         
+        # 设定滑动窗口大小
+        LOOKBACK_WINDOW = 200
+        
         # 遍历每个数据点，逐步扩展窗口计算信号
         for window_end in range(1, total_length + 1):
-            # 截取当前窗口的子数据（从0到window_end-1）
-            high_window = high_full[:window_end]
-            low_window = low_full[:window_end]
-            frac_window = gupiaojichu.identify_turns(window_end, high_window, low_window)
+            # --- 核心优化：只取最后 200 根 K 线 ---
+            start_idx = max(0, window_end - LOOKBACK_WINDOW)
             
-            # 调用三买变体函数，计算当前窗口的信号
+            high_window = high_full[start_idx : window_end]
+            low_window = low_full[start_idx : window_end]
+            close_window = close_full[start_idx : window_end]
+            
+            # 计算当前窗口内的转折点
+            # 注意：window_end 在 identify_turns 中通常作为长度参考
+            frac_window = gupiaojichu.identify_turns(len(high_window), high_window, low_window)
+            
+            # 调用三买变体函数
             try:
                 window_signal = TdxStockBacktest.three_buy_variant(frac_window, high_window, low_window)
-            except Exception as e:
-                # 若窗口数据不足，跳过并保持0
+            except Exception:
                 continue
-                # 如果当前窗口有信号，需要检查收盘价是否高于最近顶分型最高价
+                
+            # 如果当前窗口最后一个位置有信号，执行收盘价确认逻辑
             if window_signal[-1] == 1.0:
-                current_close = close_full[window_end - 1]
-                # 在frac_window中找最后一个顶分型（值为1.0）的索引
+                current_close = close_window[-1]
+                
+                # 在当前 frac_window 中找最后一个顶分型（值为1.0）
+                # 寻找的是“突破K线”之前最近的一个顶
                 last_top_idx = -1
-                for i in range(window_end - 1, -1, -1):
+                for i in range(len(frac_window) - 1, -1, -1):
                     if frac_window[i] == 1.0:
-                        last_top_idx = i
-                        if last_top_idx != window_end - 1:  
+                        # 排除掉当前K线本身（如果是顶的话）
+                        if i < len(frac_window) - 1:
+                            last_top_idx = i
                             break
+                
                 if last_top_idx != -1:
                     last_top_high = high_window[last_top_idx]
+                    # 条件：收盘价必须高于前顶分型最高价，否则撤销信号
                     if current_close <= last_top_high:
-                        window_signal[-1] = 0.0  # 不满足收盘价高于前顶分型，撤销信号
+                        window_signal[-1] = 0.0
 
-            # 提取当前窗口最后一个位置的信号
-            current_signal = window_signal[-1]
-            full_signals[window_end - 1] = current_signal
+            # 将窗口最后的计算结果映射回全量信号列表
+            full_signals[window_end - 1] = window_signal[-1]
         
         return full_signals
     
