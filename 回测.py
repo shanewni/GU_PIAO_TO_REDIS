@@ -364,9 +364,9 @@ class TdxStockBacktest:
                 return pf_out  # 线段间隔过近，不满足
         
         # 检查向上线段中是否有价格突破最近高点
+        down_seg_start, down_seg_end = down_segments[0]
+        up_seg_start, up_seg_end = up_segments[0]
         if len(down_segments) > 0:
-            down_seg_start, down_seg_end = down_segments[0]
-            up_seg_start, up_seg_end = up_segments[0]
             if up_seg_end <= down_seg_end:
                 return pf_out  # 最近的向下线段结束位置过近，不满足
             if down_seg_start+6 > up_seg_end:
@@ -377,7 +377,10 @@ class TdxStockBacktest:
                     if high[i] >= latest_high:
                         return pf_out  # 向上线段中有价格高于最近高点，不满足
                     i += 1
-
+        
+        if last_k_idx -1 <= down_seg_end:
+            return pf_out  # 最后一根K线过近，不满足
+        
         # 所有条件满足，标记信号
         pf_out[last_k_idx] = 1.0
         return pf_out
@@ -1117,28 +1120,28 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
     all_trades_detail = []  # 存储所有股票的交易明细
 
     all_min30_data = {}
-    print("正在预取 30 分钟数据以计算日内 RPS 强度...")
-    for code in stock_codes:
-        # 改为读取 30 分钟数据
-        df = backtest.get_exact_tdx_30min(code) 
-        if not df.empty:
-            all_min30_data[code] = df
+    # print("正在预取 30 分钟数据以计算日内 RPS 强度...")
+    # for code in stock_codes:
+    #     # 改为读取 30 分钟数据
+    #     df = backtest.get_exact_tdx_30min(code) 
+    #     if not df.empty:
+    #         all_min30_data[code] = df
     # 计算 30 分钟 RPS
     # 注意：这里的 n 需要重新定义。如果你想要“一个月”的强度，30分钟线 n 约为 250
     # 如果想要“五天”的强度，n 约为 40
     print("正在计算 30 分钟级别的 RPS60 强度矩阵...")
-    rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_min30_data, n=60)
+    # rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_min30_data, n=60)
     # rps120_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=120)
     # 逐只股票回测
     for idx, code in enumerate(stock_codes):
         print(f"\n------------------- 进度 {idx+1}/{len(stock_codes)} -------------------")
         try:
             # 提取该股的 30 分钟 RPS 序列
-            s60 = rps60_matrix[code] if code in rps60_matrix else pd.Series(0, index=rps60_matrix.index)
+            # s60 = rps60_matrix[code] if code in rps60_matrix else pd.Series(0, index=rps60_matrix.index)
             
             # 核心修正：为了防止未来函数，RPS 必须 shift(1)
             # 意味着当前 30 分钟的决策是基于上一个 30 分钟结束时的排名
-            combined_rps_filter = (s60 >= 80).astype(int).shift(1).fillna(0)
+            # combined_rps_filter = (s60 >= 80).astype(int).shift(1).fillna(0)
             _, metrics, trades_detail = backtest.run_backtest(
                 code=code,
                 init_cash=init_cash,
@@ -1146,7 +1149,8 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 stop_loss_ratio=stop_loss_ratio,
                 use_local=True  ,# 统一使用联网模式获取数据
                 tdx_path=DEFAULT_TDX_PATH,
-                current_rps=combined_rps_filter
+                # current_rps=combined_rps_filter
+                current_rps=None
             )
             if metrics:  # 仅保留有有效指标的股票
                 metrics['股票代码'] = code
