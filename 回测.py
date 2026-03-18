@@ -687,6 +687,7 @@ class TdxStockBacktest:
             data['signal'] = 0
             data['sell_reason'] = ""
             data['active_stop_loss'] = np.nan
+            data['actual_buy_price'] = np.nan  # 新增：专门存储计算出的成交价
             
             in_pos = False
             is_ready = False          # 是否已满足3根K线后的强度确认
@@ -702,34 +703,20 @@ class TdxStockBacktest:
                 curr_open = data['开盘价'].iloc[i] # 这里的开盘价用于后续回踩逻辑
 
                 if not in_pos:
-                    # 1. 识别突破K线
+                # A. 识别突破K
                     if data['raw_break_signal'].iloc[i] == 1.0:
-                        # --- 核心修改：将止损和强度限制逻辑移动到此处 ---
                         if i > 0:
-                            prev_k_high = high_list[i-1]
-                            # 止损价定义：突破K低点 或 突破K前一根K高点 (取较小值)
-                            temp_stop_loss = min(curr_low, prev_k_high)
-                            
-                            # 计算“突破K收盘价”相对于“止损价”的涨幅（即你说的以损定量幅度）
-                            risk_ratio = (curr_close - temp_stop_loss) / temp_stop_loss * 100
-                            
-                            # 过滤逻辑：
-                            # 如果 涨幅 > 2.4% (风险过大，不买) 
-                            # 或 涨幅 < 0.5% (力度不足，不买)
-                            if risk_ratio > 2.4 or risk_ratio < 0.5:
-                                # 重置状态，这个突破信号无效
+                            temp_stop = min(low_list[i], high_list[i-1])
+                            # 增加 > 0.01 判断，彻底解决 001979 的 division by zero
+                            if temp_stop > 0.01:
+                                risk = (curr_close - temp_stop) / temp_stop * 100
+                                if 0.5 <= risk <= 2.4:
+                                    break_k_idx, break_k_close = i, curr_close
+                                    break_k_time = current_idx_time # 记录时间
+                                    stop_loss_price = temp_stop
+                                    is_ready = False
+                            else:
                                 break_k_idx = -1
-                                continue
-                            
-                            # 满足要求，记录这根有效的突破K线信息
-                            break_k_idx = i
-                            break_k_close = curr_close
-                            stop_loss_price = temp_stop_loss
-                            is_ready = False # 开始等待3根K线确认
-                        else:
-                            # 如果是第一根K线，通常无法获取前K高点，可根据需要跳过或简易处理
-                            break_k_idx = -1
-                            continue
 
                     # 2. 强度确认：突破3根K线后 (即 i = break_k_idx + 3)
                     if break_k_idx != -1 and (i - break_k_idx) == 3:
@@ -738,48 +725,29 @@ class TdxStockBacktest:
                         else:
                             break_k_idx = -1 # 第三根没站稳突破点上方0.5%，作废
 
-                    # 3. 买入执行与超时逻辑
+                    # C. 买入执行 (超时逻辑 8k)
                     if is_ready:
-                        # 超时：从突破K算起，超过8根K线没触发回踩则取消
-                        if (i - break_k_idx) > 8:
+                        if (i - break_k_idx) > 8: 
                             is_ready = False
                             break_k_idx = -1
                             continue
                         
-                        # 买入窗口：从第4根K线开始寻找机会
                         if (i - break_k_idx) >= 4:
-                            # 你的核心防线：买入价格上限
-                            buy_limit_price = break_k_close * 1.01
-                            
-                            # 获取当前K线的开盘价和最低价
-                            curr_open = data['开盘价'].iloc[i]
-                            
-                            # 条件 A：日线/RPS环境允许
-                            # 条件 B：当前K线最低点确实触及或低于了 buy_limit_price
-                            if curr_low <= buy_limit_price and data['day_signal_valid'].iloc[i] and data['rps_ok_flag'].iloc[i] == 1:
+                            buy_limit = break_k_close * 1.01
+                            if curr_low <= buy_limit and data['day_signal_valid'].iloc[i]:
+                                # --- 确定精确成交价 ---
+                                # 如果开盘就在1%内，按开盘买；否则按1%准点买
+                                fill_price = curr_open if curr_open <= buy_limit else buy_limit
                                 
                                 data.loc[current_idx_time, 'signal'] = 1
-                                in_pos = True
+                                data.loc[current_idx_time, 'break_k_date'] = break_k_time
+                                data.loc[current_idx_time, 'actual_buy_price'] = fill_price # 存入Data
                                 
-                                # --- 核心价格确定逻辑 ---
-                                if curr_open <= buy_limit_price:
-                                    # 如果开盘就在1%以内，按开盘价成交（可能比1%更便宜）
-                                    buy_price = curr_open
-                                else:
-                                    # 如果开盘在1%以外，但最低价踩进来了，按1%那个限价成交
-                                    buy_price = buy_limit_price
-                                
-                                buy_idx = i
+                                in_pos, buy_price, buy_idx = True, fill_price, i
                                 current_stop_loss = stop_loss_price
-                                
                                 is_ready = False
                                 break_k_idx = -1
                                 continue
-
-                            # 价格保护：回踩成功前，如果收盘价跌破止损点，视为走势走坏，取消准备
-                            if curr_close < stop_loss_price:
-                                is_ready = False
-                                break_k_idx = -1
 
                 else:
                     # --- 持仓逻辑 ---
@@ -887,6 +855,7 @@ class TdxStockBacktest:
             
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
             if row['signal'] == 1 and cash > close_price and not self.in_position:
+                final_buy_price = row['actual_buy_price'] if pd.notna(row['actual_buy_price']) else row['收盘价']
                 # 3. 原有的止损价计算逻辑
                 if current_idx > 0:
                     prev_close = data['最高价'].iloc[current_idx - 1]
@@ -899,20 +868,20 @@ class TdxStockBacktest:
                 # 4. 以损定量：计算可买数量
                 buy_num = self.calculate_position_size(
                     current_cash=current_total_asset,
-                    entry_price=close_price,
+                    entry_price=final_buy_price,
                     stop_loss_price=self.stop_loss_price
                 )
                 
                 if buy_num > 0:
                     # 【核心修正】：记录买入这一刻的账户总资产，作为后续计算盈亏比的分母
-                    self.buy_in_total_asset = cash + position * close_price
+                    self.buy_in_total_asset = cash + position * final_buy_price
                     # 计算交易成本
-                    cost = buy_num * close_price * (1 + commission)
-                    fee = buy_num * close_price * commission
+                    cost = buy_num * final_buy_price * (1 + commission)
+                    fee = buy_num * final_buy_price * commission
                     if cash >= cost:
                         position += buy_num
                         cash -= cost
-                        buy_price = close_price
+                        buy_price = final_buy_price
                         buy_fee = fee
                         self.in_position = True
                         buy_datetime = datetime
@@ -922,7 +891,7 @@ class TdxStockBacktest:
                             '股票代码': code,
                             '交易时间': datetime,
                             '交易类型': '买入',
-                            '价格': close_price,
+                            '价格': final_buy_price,
                             '数量': buy_num,
                             '费用': fee,
                             '单笔盈亏': 0.0,  # 买入时盈亏为0，卖出时更新
@@ -935,10 +904,10 @@ class TdxStockBacktest:
                         trade_records.append(trade_detail)
                         self.all_trades_detail.append(trade_detail)  # 存入交易明细
                         
-                        print(f"【买入开仓（以损定量）】{datetime} - 价格{close_price}，数量{buy_num}")
+                        print(f"【买入开仓（以损定量）】{datetime} - 价格{final_buy_price}，数量{buy_num}")
                         print(f"          - 止损价:{self.stop_loss_price} | 单笔风险金额:{self.risk_per_trade:.2f} | 风险比例:{self.stop_loss_ratio*100}%")
                 else:
-                    print(f"【买入失败】{datetime} - 以损定量计算可买数量为0（止损价{self.stop_loss_price} >= 买入价{close_price}）")
+                    print(f"【买入失败】{datetime} - 以损定量计算可买数量为0（止损价{self.stop_loss_price} >= 买入价{final_buy_price}）")
             
             # ===== 正常卖出信号执行 =====
             elif row['signal'] == -1 and position > 0:
