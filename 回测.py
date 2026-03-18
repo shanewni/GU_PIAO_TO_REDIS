@@ -647,7 +647,7 @@ class TdxStockBacktest:
         return False, ""   
     
     def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float], 
-                           rps_series: pd.Series = None) -> pd.DataFrame:
+                            rps_series: pd.Series = None) -> pd.DataFrame:
             data = min30_data.copy()
             data.index.name = 'datetime'
             day_df.index.name = 'datetime'
@@ -662,29 +662,20 @@ class TdxStockBacktest:
             data['date_only'] = data.index.date
             day_df['date_only'] = day_df.index.date
             data = data.reset_index().merge(
-                day_df[['date_only', 'day_signal_valid']], 
-                on='date_only', 
-                how='left'
+                day_df[['date_only', 'day_signal_valid']], on='date_only', how='left'
             ).set_index('datetime')
 
-            # --- 修正后的同步逻辑 ---
+            # --- RPS 同步逻辑 ---
             if rps_series is not None:
-                # rps_series 现在的 index 是 datetime (30min)
                 rps_df = rps_series.to_frame(name='rps_ok_flag')
-                # 直接通过索引合并，不再通过 date_only
-                data = data.merge(
-                    rps_df[['rps_ok_flag']], 
-                    left_index=True, 
-                    right_index=True, 
-                    how='left'
-                )
+                data = data.merge(rps_df[['rps_ok_flag']], left_index=True, right_index=True, how='left')
                 data['rps_ok_flag'] = data['rps_ok_flag'].fillna(0)
             else:
                 data['rps_ok_flag'] = 1
 
             # --- 2. 预计算基础指标 ---
-            buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
-            data['buy_signal'] = buy_signals
+            # 调用你不需要动的 calculate_three_buy_signals
+            data['raw_break_signal'] = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
             data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
             
             close_list = data['收盘价'].tolist()
@@ -695,65 +686,105 @@ class TdxStockBacktest:
             # --- 3. 核心状态机循环 ---
             data['signal'] = 0
             data['sell_reason'] = ""
+            data['active_stop_loss'] = np.nan
+            
             in_pos = False
-            buy_price = 0.0
-            buy_idx = 0
-            initial_stop_loss = 0.0
-            current_stop_loss = 0.0 # 新增：当前实时执行的止损价
+            is_ready = False          # 是否已满足3根K线后的强度确认
+            break_k_idx = -1          # 突破K线的索引
+            break_k_close = 0.0       # 突破K线的收盘价
+            stop_loss_price = 0.0     # 确定的止损价
             
             for i in range(len(data)):
                 current_idx_time = data.index[i]
-                
+                curr_close = close_list[i]
+                curr_low = low_list[i]
+                curr_high = high_list[i]
+                curr_open = data['开盘价'].iloc[i] # 这里的开盘价用于后续回踩逻辑
+
                 if not in_pos:
-                    # 尝试买入
-                     # 核心买入判定：原 rps_cond 修改为直接读取我们合并后的标识
-                    rps_is_strong = data['rps_ok_flag'].iloc[i] == 1
-                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i] and rps_is_strong:
-                        data.loc[current_idx_time, 'signal'] = 1
-                        in_pos = True
-                        buy_price = close_list[i]
-                        buy_idx = i
-                        # 设置初始止损价
+                    # 1. 识别突破K线
+                    if data['raw_break_signal'].iloc[i] == 1.0:
+                        # --- 核心修改：将止损和强度限制逻辑移动到此处 ---
                         if i > 0:
-                            prev_high = high_list[i-1]
-                            initial_stop_loss = min(low_list[i], prev_high)
+                            prev_k_high = high_list[i-1]
+                            # 止损价定义：突破K低点 或 突破K前一根K高点 (取较小值)
+                            temp_stop_loss = min(curr_low, prev_k_high)
+                            
+                            # 计算“突破K收盘价”相对于“止损价”的涨幅（即你说的以损定量幅度）
+                            risk_ratio = (curr_close - temp_stop_loss) / temp_stop_loss * 100
+                            
+                            # 过滤逻辑：
+                            # 如果 涨幅 > 2.4% (风险过大，不买) 
+                            # 或 涨幅 < 0.5% (力度不足，不买)
+                            if risk_ratio > 2.4 or risk_ratio < 0.5:
+                                # 重置状态，这个突破信号无效
+                                break_k_idx = -1
+                                continue
+                            
+                            # 满足要求，记录这根有效的突破K线信息
+                            break_k_idx = i
+                            break_k_close = curr_close
+                            stop_loss_price = temp_stop_loss
+                            is_ready = False # 开始等待3根K线确认
                         else:
-                            initial_stop_loss = low_list[i]
-                        current_stop_loss = initial_stop_loss # 初始化实时止损
-                else:       
-                    # A. 止损检查 (优先级最高，使用 current_stop_loss)
-                    if low_list[i] <= current_stop_loss:
+                            # 如果是第一根K线，通常无法获取前K高点，可根据需要跳过或简易处理
+                            break_k_idx = -1
+                            continue
+
+                    # 2. 强度确认：突破3根K线后 (即 i = break_k_idx + 3)
+                    if break_k_idx != -1 and (i - break_k_idx) == 3:
+                        if curr_close > (break_k_close * 1.005):
+                            is_ready = True
+                        else:
+                            break_k_idx = -1 # 第三根没站稳突破点上方0.5%，作废
+
+                    # 3. 买入执行与超时逻辑
+                    if is_ready:
+                        # 超时：8根K内没触发回踩就取消
+                        if (i - break_k_idx) > 8:
+                            is_ready = False
+                            break_k_idx = -1
+                            continue
+                        
+                        # 买入窗口：从第4根开始
+                        if (i - break_k_idx) >= 4:
+                            buy_limit_price = break_k_close * 1.01
+                            
+                            # 买入时机：价格回踩到突破K收盘价1%以内
+                            if curr_low <= buy_limit_price and data['day_signal_valid'].iloc[i] and data['rps_ok_flag'].iloc[i] == 1:
+                                data.loc[current_idx_time, 'signal'] = 1
+                                in_pos = True
+                                # 确定成交价
+                                buy_price = min(data['开盘价'].iloc[i], buy_limit_price)
+                                buy_idx = i
+                                current_stop_loss = stop_loss_price
+                                
+                                is_ready = False
+                                break_k_idx = -1
+                                continue
+
+                            # 价格保护：回踩成功前直接收盘跌破止损位
+                            if curr_close < stop_loss_price:
+                                is_ready = False
+                                break_k_idx = -1
+
+                else:
+                    # --- 持仓逻辑 ---
+                    data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
+                    
+                    # A. 静态止损
+                    if curr_low <= current_stop_loss:
                         data.loc[current_idx_time, 'signal'] = -1
-                        data.loc[current_idx_time, 'sell_reason'] = f"触发止损(当前止损价:{current_stop_loss})"
+                        data.loc[current_idx_time, 'sell_reason'] = f"以损定量止损({current_stop_loss:.2f})"
                         in_pos = False
                         continue
-
-                    # 持仓中：判定卖出
-                    hold_count = i - buy_idx # 计算介入后的K线根数 (0为买入当天)
-                    # --- 新增：介入后第三根K线逻辑 (hold_count == 3) ---
-                    if hold_count == 3:
-                        if close_list[i] < buy_price:
-                            # data.loc[current_idx_time, 'signal'] = -1
-                            # data.loc[current_idx_time, 'sell_reason'] = "第三根K线低于买入价强制卖出"
-                            # in_pos = False
-                            # continue
-                            pass
-                        else:
-                            # 高于或等于买入价，移动止损到成本价
-                            current_stop_loss = max(current_stop_loss, buy_price)
-
-                    min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
-                    data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss # 记录当前止损价，便于调试和分析
+                    
                     # B. 动态卖出检查
+                    min30_frac = gupiaojichu.identify_turns(i, high_list[:i+1], low_list[:i+1])
                     is_sell, reason = self.check_dynamic_sell_condition(
-                        current_idx=i,
-                        high_full=high_list,
-                        low_full=low_list,
-                        close_full=close_list,
-                        ma60_full=ma60_list,
-                        buy_price=buy_price,
-                        buy_idx=buy_idx,
-                        min30_frac=min30_frac
+                        current_idx=i, high_full=high_list, low_full=low_list,
+                        close_full=close_list, ma60_full=ma60_list,
+                        buy_price=buy_price, buy_idx=buy_idx, min30_frac=min30_frac
                     )
                     
                     if is_sell:
