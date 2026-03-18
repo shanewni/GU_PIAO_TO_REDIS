@@ -740,22 +740,35 @@ class TdxStockBacktest:
 
                     # 3. 买入执行与超时逻辑
                     if is_ready:
-                        # 超时：8根K内没触发回踩就取消
+                        # 超时：从突破K算起，超过8根K线没触发回踩则取消
                         if (i - break_k_idx) > 8:
                             is_ready = False
                             break_k_idx = -1
                             continue
                         
-                        # 买入窗口：从第4根开始
+                        # 买入窗口：从第4根K线开始寻找机会
                         if (i - break_k_idx) >= 4:
+                            # 你的核心防线：买入价格上限
                             buy_limit_price = break_k_close * 1.01
                             
-                            # 买入时机：价格回踩到突破K收盘价1%以内
+                            # 获取当前K线的开盘价和最低价
+                            curr_open = data['开盘价'].iloc[i]
+                            
+                            # 条件 A：日线/RPS环境允许
+                            # 条件 B：当前K线最低点确实触及或低于了 buy_limit_price
                             if curr_low <= buy_limit_price and data['day_signal_valid'].iloc[i] and data['rps_ok_flag'].iloc[i] == 1:
+                                
                                 data.loc[current_idx_time, 'signal'] = 1
                                 in_pos = True
-                                # 确定成交价
-                                buy_price = min(data['开盘价'].iloc[i], buy_limit_price)
+                                
+                                # --- 核心价格确定逻辑 ---
+                                if curr_open <= buy_limit_price:
+                                    # 如果开盘就在1%以内，按开盘价成交（可能比1%更便宜）
+                                    buy_price = curr_open
+                                else:
+                                    # 如果开盘在1%以外，但最低价踩进来了，按1%那个限价成交
+                                    buy_price = buy_limit_price
+                                
                                 buy_idx = i
                                 current_stop_loss = stop_loss_price
                                 
@@ -763,7 +776,7 @@ class TdxStockBacktest:
                                 break_k_idx = -1
                                 continue
 
-                            # 价格保护：回踩成功前直接收盘跌破止损位
+                            # 价格保护：回踩成功前，如果收盘价跌破止损点，视为走势走坏，取消准备
                             if curr_close < stop_loss_price:
                                 is_ready = False
                                 break_k_idx = -1
@@ -878,11 +891,6 @@ class TdxStockBacktest:
                 if current_idx > 0:
                     prev_close = data['最高价'].iloc[current_idx - 1]
                     loss_price = min(row['最低价'], prev_close)
-
-                    if (close_price-loss_price)/loss_price*100 > 2.4:
-                        continue
-                    if (close_price-loss_price)/loss_price*100 < 0.5:
-                        continue
                     self.stop_loss_price = loss_price
                 else:
                     # 如果是第一根K线（无前值），则使用当前最低价
