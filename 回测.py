@@ -14,8 +14,8 @@ from collections import defaultdict, deque
 warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
-# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
+# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -648,8 +648,7 @@ class TdxStockBacktest:
         if cond_pattern: return True, pattern_reason
         return False, ""   
     
-    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float], 
-                           rps_series: pd.Series = None) -> pd.DataFrame:
+    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
             data = min30_data.copy()
             data.index.name = 'datetime'
             day_df.index.name = 'datetime'
@@ -668,21 +667,6 @@ class TdxStockBacktest:
                 on='date_only', 
                 how='left'
             ).set_index('datetime')
-
-            # --- 修正后的同步逻辑 ---
-            if rps_series is not None:
-                # rps_series 现在的 index 是 datetime (30min)
-                rps_df = rps_series.to_frame(name='rps_ok_flag')
-                # 直接通过索引合并，不再通过 date_only
-                data = data.merge(
-                    rps_df[['rps_ok_flag']], 
-                    left_index=True, 
-                    right_index=True, 
-                    how='left'
-                )
-                data['rps_ok_flag'] = data['rps_ok_flag'].fillna(0)
-            else:
-                data['rps_ok_flag'] = 1
 
             # --- 2. 预计算基础指标 ---
             buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
@@ -767,7 +751,7 @@ class TdxStockBacktest:
     
     def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
                      commission: float = 0.0003, stop_loss_ratio: float = 0.01,
-                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH,current_rps: pd.Series = None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
         """
         执行三买变体策略回测（30分钟周期）
         升级：返回单股票交易明细列表，用于总笔数汇总
@@ -807,7 +791,7 @@ class TdxStockBacktest:
             return pd.DataFrame(), {}, []
         
         # 生成策略信号
-        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low,current_rps)
+        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low)
         
         # 初始化止损百分比
         self.stop_loss_ratio = stop_loss_ratio
@@ -1132,38 +1116,17 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
     all_metrics = []
     all_trades_detail = []  # 存储所有股票的交易明细
 
-    # all_min30_data = {}
-    # print("正在预取 30 分钟数据以计算日内 RPS 强度...")
-    # for code in stock_codes:
-    #     # 改为读取 30 分钟数据
-    #     df = backtest.get_exact_tdx_30min(code) 
-    #     if not df.empty:
-    #         all_min30_data[code] = df
-    # 计算 30 分钟 RPS
-    # 注意：这里的 n 需要重新定义。如果你想要“一个月”的强度，30分钟线 n 约为 250
-    # 如果想要“五天”的强度，n 约为 40
-    # print("正在计算 30 分钟级别的 RPS60 强度矩阵...")
-    # rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_min30_data, n=60)
-    # rps120_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=120)
     # 逐只股票回测
     for idx, code in enumerate(stock_codes):
         print(f"\n------------------- 进度 {idx+1}/{len(stock_codes)} -------------------")
         try:
-            # 提取该股的 30 分钟 RPS 序列
-            # s60 = rps60_matrix[code] if code in rps60_matrix else pd.Series(0, index=rps60_matrix.index)
-            
-            # 核心修正：为了防止未来函数，RPS 必须 shift(1)
-            # 意味着当前 30 分钟的决策是基于上一个 30 分钟结束时的排名
-            # combined_rps_filter = (s60 >= 80).astype(int).shift(1).fillna(0)
             _, metrics, trades_detail = backtest.run_backtest(
                 code=code,
                 init_cash=init_cash,
                 commission=commission,
                 stop_loss_ratio=stop_loss_ratio,
                 use_local=True  ,# 统一使用联网模式获取数据
-                tdx_path=DEFAULT_TDX_PATH,
-                # current_rps=combined_rps_filter
-                current_rps=None
+                tdx_path=DEFAULT_TDX_PATH
             )
             if metrics:  # 仅保留有有效指标的股票
                 metrics['股票代码'] = code
