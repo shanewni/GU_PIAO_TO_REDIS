@@ -14,6 +14,7 @@ from collections import defaultdict, deque
 warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
+BLOB_FILE_PATH_INDEX = r"D:\zd_hbzq\T0002\blocknew\YJSJBK.blk"
 BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
 # BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
 # 本地通达信数据默认路径
@@ -252,6 +253,56 @@ class TdxStockBacktest:
         # 每一行（每一个30分钟时间点）进行全成员排名
         rps_df = extrs_df.rank(axis=1, pct=True, ascending=True) * 100
         return rps_df
+
+    @staticmethod
+    def calculate_top_stocks_by_time(stock_codes_index, top_n=60, use_local=True, tdx_path=DEFAULT_TDX_PATH):
+        """
+        读取板块成分股的30分钟数据，计算每个时间点的涨幅排名前top_n的股票集合
+        :return: dict {datetime: set(股票代码)}
+        """
+        from collections import defaultdict
+        import pandas as pd
+
+        # 存储每只股票的收盘价序列（时间对齐用）
+        price_dict = {}
+        all_times = set()
+
+        for code in stock_codes_index:
+            # 获取30分钟数据（使用本地数据）
+            df = TdxStockBacktest().get_exact_tdx_30min(code, tdx_path)  # 注意这里需要实例化或静态调用
+            if df.empty:
+                continue
+            # 只保留收盘价，并重命名为股票代码
+            s = df['收盘价'].rename(code)
+            price_dict[code] = s
+            all_times.update(s.index)
+
+        if not price_dict:
+            return {}
+
+        # 统一时间轴（升序排序）
+        all_times = sorted(all_times)
+        # 构建涨幅DataFrame：行为时间，列为股票代码，值为涨幅（相对于前一根K线）
+        pct_dict = {}
+        for code, series in price_dict.items():
+            # 计算涨幅（相邻K线），缺失值填充NaN
+            pct = series.pct_change().reindex(all_times)
+            pct_dict[code] = pct
+
+        pct_df = pd.DataFrame(pct_dict)  # 行=时间，列=股票代码
+
+        # 构建排名字典
+        top_stocks_by_time = {}
+        for dt in all_times:
+            # 获取该时间点所有股票的涨幅（排除NaN）
+            row = pct_df.loc[dt].dropna()
+            if row.empty:
+                continue
+            # 按涨幅降序排序，取前top_n的股票代码
+            top_codes = row.sort_values(ascending=False).head(top_n).index.tolist()
+            top_stocks_by_time[dt] = set(top_codes)
+
+        return top_stocks_by_time
     
     def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
         """
@@ -692,9 +743,7 @@ class TdxStockBacktest:
                 
                 if not in_pos:
                     # 尝试买入
-                     # 核心买入判定：原 rps_cond 修改为直接读取我们合并后的标识
-                    rps_is_strong = data['rps_ok_flag'].iloc[i] == 1
-                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i] and rps_is_strong:
+                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
                         data.loc[current_idx_time, 'signal'] = 1
                         in_pos = True
                         buy_price = close_list[i]
@@ -751,7 +800,8 @@ class TdxStockBacktest:
     
     def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
                      commission: float = 0.0003, stop_loss_ratio: float = 0.01,
-                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH,
+                    top_stocks_by_time: dict = None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
         """
         执行三买变体策略回测（30分钟周期）
         升级：返回单股票交易明细列表，用于总笔数汇总
@@ -829,6 +879,12 @@ class TdxStockBacktest:
             
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
             if row['signal'] == 1 and cash > close_price and not self.in_position:
+                # 【新增】排名检查
+                if top_stocks_by_time is not None:
+                    if datetime not in top_stocks_by_time or code not in top_stocks_by_time[datetime]:
+                        # 不满足排名条件，跳过此次买入
+                        continue
+
                 # 3. 原有的止损价计算逻辑
                 if current_idx > 0:
                     prev_close = data['最高价'].iloc[current_idx - 1]
@@ -1095,11 +1151,13 @@ def calculate_total_trades_metrics(all_trades_detail: List[Dict]) -> Dict:
     
     return total_metrics
 
-def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0, 
-                   commission: float = 0.0003, stop_loss_ratio: float = 0.01) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
+def batch_backtest(stock_codes: List[str], stock_codes_index: List[str], init_cash: float = 100000.0, 
+                   commission: float = 0.0003, stop_loss_ratio: float = 0.01,
+                   top_n: int = 60) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
     """
     批量回测股票列表（升级：新增总笔数汇总）
     :param stock_codes: 股票代码列表
+    :param stock_codes_index: 指数成分股代码列表
     :param init_cash: 单股票初始资金
     :param commission: 佣金比例
     :param stop_loss_ratio: 止损比例
@@ -1112,6 +1170,16 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
         print("通达信服务器连接失败，无法执行批量回测")
         return pd.DataFrame(), pd.DataFrame(), {}
     
+        # ===== 新增：预先计算板块涨幅排名 =====
+    print("正在计算板块成分股涨幅排名...")
+    top_stocks_by_time = TdxStockBacktest.calculate_top_stocks_by_time(
+        stock_codes_index,
+        top_n=top_n,
+        use_local=True,          # 与 run_backtest 保持一致
+        tdx_path=DEFAULT_TDX_PATH
+    )
+    print(f"排名计算完成，共 {len(top_stocks_by_time)} 个时间点有排名数据")
+
     # 存储所有股票的回测指标 + 所有交易明细
     all_metrics = []
     all_trades_detail = []  # 存储所有股票的交易明细
@@ -1126,7 +1194,8 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 commission=commission,
                 stop_loss_ratio=stop_loss_ratio,
                 use_local=True  ,# 统一使用联网模式获取数据
-                tdx_path=DEFAULT_TDX_PATH
+                tdx_path=DEFAULT_TDX_PATH,
+                top_stocks_by_time=top_stocks_by_time   # 传入排名字典
             )
             if metrics:  # 仅保留有有效指标的股票
                 metrics['股票代码'] = code
@@ -1349,6 +1418,7 @@ def analyze_by_buy_date(trades_df: pd.DataFrame) -> pd.DataFrame:
 if __name__ == "__main__":
     # 1. 解析通达信板块文件
     stock_list = parse_tdx_blk_file(BLOB_FILE_PATH)
+    stock_list_index = parse_tdx_blk_file(BLOB_FILE_PATH_INDEX)  # 重新解析一次，确保最新数据
     # stock_list = stock_list[:10]  # 测试时可限制股票数量
     
     if not stock_list:
@@ -1357,9 +1427,11 @@ if __name__ == "__main__":
         # 2. 执行批量回测
         stock_summary_result, trades_detail_result, total_trades_metrics = batch_backtest(
             stock_codes=stock_list,
+            stock_codes_index=stock_list_index,
             init_cash=100000.0,    # 单股票初始资金10万
             commission=0.0003,     # 佣金0.03%
-            stop_loss_ratio=0.01   # 单笔止损1%
+            stop_loss_ratio=0.01,   # 单笔止损1%
+            top_n=60                # 只回测排名前60的股票
         )
         # ================== 执行理论复利计算 ==================
         trades_list = trades_detail_result.to_dict('records') if not trades_detail_result.empty else []
