@@ -1130,7 +1130,7 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
     all_metrics = []
     all_trades_detail = []  # 存储所有股票的交易明细
 
-    all_min30_data = {}
+    # all_min30_data = {}
     # print("正在预取 30 分钟数据以计算日内 RPS 强度...")
     # for code in stock_codes:
     #     # 改为读取 30 分钟数据
@@ -1140,7 +1140,7 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
     # 计算 30 分钟 RPS
     # 注意：这里的 n 需要重新定义。如果你想要“一个月”的强度，30分钟线 n 约为 250
     # 如果想要“五天”的强度，n 约为 40
-    print("正在计算 30 分钟级别的 RPS60 强度矩阵...")
+    # print("正在计算 30 分钟级别的 RPS60 强度矩阵...")
     # rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_min30_data, n=60)
     # rps120_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=120)
     # 逐只股票回测
@@ -1273,56 +1273,35 @@ def calculate_pure_compounding(all_trades_detail: List[Dict], init_cash: float =
     }
 
 def analyze_loss_periods(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    分析每日盈亏表现：左侧盈利排名，右侧亏损排名
+    """
     if trades_df.empty:
         return pd.DataFrame()
     
     df = trades_df.copy()
-    # 转换时间格式
-    df['交易时间'] = pd.to_datetime(df['交易时间'])
-    df['月份'] = df['交易时间'].dt.to_period('M')
-    df['周几'] = df['交易时间'].dt.day_name()
-    df['日期'] = df['交易时间'].dt.date
+    df['日期'] = pd.to_datetime(df['交易时间']).dt.date
     
-    # 修正字段名：原代码中记录盈亏的列名是 '单笔盈亏'
-    loss_df = df[df['单笔盈亏'] < 0]
-    
-    if loss_df.empty:
-        print("\n太棒了，没有亏损单！")
-        return pd.DataFrame()
-    
-    # --- 维度1：按月份统计亏损额 ---
-    monthly_loss = loss_df.groupby('月份')['单笔盈亏'].sum().sort_values()
-    
-    # --- 维度2：按日期统计（找出最惨烈的几天） ---
-    # 这里用全量df去算，因为要知道那一天的胜率
-    daily_stats = df.groupby('日期').agg(
-        当日净损益=('单笔盈亏', 'sum'),
-        交易笔数=('单笔盈亏', 'count'),
-        亏损占比=('单笔盈亏', lambda x: (x < 0).mean() * 100)
-    ).sort_values(by='当日净损益')
+    # 1. 基础按日汇总
+    daily_stats = df[df['单笔盈亏'] != 0].groupby('日期')['单笔盈亏'].agg(['count', 'sum']).reset_index()
+    daily_stats.columns = ['日期', '成交笔数', '当日净损益']
 
-    print("\n" + "!"*20 + " 亏损时间分布报告 " + "!"*20)
-    print("\n[1] 亏损最严重的月份:")
-    print(monthly_loss.head())
-    
-    print("\n[2] 亏损最严重的 5 个交易日:")
-    print(daily_stats.head(5))
-    
-    # --- 维度3：连续亏损预警 ---
-    # 如果某天亏损笔数 > 5 且 胜率 < 10%，定义为“系统性收割日”
-    trap_days = daily_stats[(daily_stats['交易笔数'] > 5) & (daily_stats['亏损占比'] > 80)]
-    if not trap_days.empty:
-        print("\n[3] 识别到“系统性收割日”（大面积止损）:")
-        print(trap_days.index.tolist())
-    
-    # === 核心提取：将所有亏损日期提取出来，用于返回并存入Excel ===
-    # 统计每一天发生的具体亏损情况
-    loss_dates_summary = loss_df.groupby('日期').agg(
-        亏损单数量=('股票代码', 'count'),
-        当日总亏损额=('单笔盈亏', 'sum')
-    ).reset_index().sort_values(by='当日总亏损额', ascending=True)
+    # 2. 提取盈利日并排序 (金额从大到小)
+    profit_days = daily_stats[daily_stats['当日净损益'] > 0].copy()
+    profit_days = profit_days.sort_values(by='当日净损益', ascending=False).reset_index(drop=True)
+    profit_days.columns = ['盈利日期', '盈利单数', '盈利金额']
 
-    return loss_dates_summary
+    # 3. 提取亏损日并排序 (金额从小到大，即亏得最多的在最上面)
+    loss_days = daily_stats[daily_stats['当日净损益'] < 0].copy()
+    loss_days = loss_days.sort_values(by='当日净损益', ascending=True).reset_index(drop=True)
+    loss_days.columns = ['亏损日期', '亏损单数', '亏损金额']
+
+    # 4. 左右强行合并 (通过 concat 横向拼接)
+    # 为了防止左右行数不一致，pandas 会自动补 NaN
+    combined_df = pd.concat([profit_days, loss_days], axis=1)
+
+    print(f"\n统计完成：盈利天数 {len(profit_days)}，亏损天数 {len(loss_days)}")
+    return combined_df
 
 # ------------------- 主执行入口 -------------------
 if __name__ == "__main__":
