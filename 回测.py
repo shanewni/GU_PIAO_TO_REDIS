@@ -8,12 +8,14 @@ from typing import Callable, Dict, List, Tuple
 import gupiaojichu
 import struct
 from mootdx.reader import Reader
+from collections import defaultdict, deque
 
 # 忽略无关警告
 warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
+# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -1303,6 +1305,83 @@ def analyze_loss_periods(trades_df: pd.DataFrame) -> pd.DataFrame:
     print(f"\n统计完成：盈利天数 {len(profit_days)}，亏损天数 {len(loss_days)}")
     return combined_df
 
+def analyze_by_buy_date(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    根据买入日期统计每日盈亏（将每笔卖出盈亏归属到对应的买入日期）
+    :param trades_df: 所有交易明细DataFrame（包含买入和卖出记录）
+    :return: 包含两列：左侧盈利日期、盈利单数、盈利金额；右侧亏损日期、亏损单数、亏损金额
+    """
+    if trades_df.empty:
+        return pd.DataFrame()
+
+    # 确保按时间排序
+    trades_df = trades_df.sort_values('交易时间').reset_index(drop=True)
+
+    # 使用队列记录每只股票的未匹配买入记录
+    buy_queue = defaultdict(deque)  # key: 股票代码, value: deque of (买入时间, 数量)
+
+    # 存储按买入日期汇总的盈亏数据
+    buy_date_summary = {}  # key: 买入日期, value: {'盈利金额':0, '盈利单数':0, '亏损金额':0, '亏损单数':0}
+
+    for _, row in trades_df.iterrows():
+        code = row['股票代码']
+        ttype = row['交易类型']
+
+        if ttype == '买入':
+            # 记录买入
+            buy_queue[code].append((row['交易时间'], row['数量']))
+        elif '卖出' in ttype:
+            # 卖出，匹配最近的买入（先进先出）
+            if code in buy_queue and buy_queue[code]:
+                buy_time, _ = buy_queue[code].popleft()
+                pnl = row['单笔盈亏']
+                buy_date = pd.to_datetime(buy_time).date()
+
+                if buy_date not in buy_date_summary:
+                    buy_date_summary[buy_date] = {
+                        '盈利金额': 0.0,
+                        '盈利单数': 0,
+                        '亏损金额': 0.0,
+                        '亏损单数': 0
+                    }
+
+                if pnl > 0:
+                    buy_date_summary[buy_date]['盈利金额'] += pnl
+                    buy_date_summary[buy_date]['盈利单数'] += 1
+                else:
+                    buy_date_summary[buy_date]['亏损金额'] += pnl  # 负数
+                    buy_date_summary[buy_date]['亏损单数'] += 1
+            else:
+                print(f"警告: 卖出记录 {row.to_dict()} 没有对应的买入记录")
+
+    # 构建 DataFrame
+    rows = []
+    for date, vals in buy_date_summary.items():
+        rows.append({
+            '日期': date,
+            '盈利单数': vals['盈利单数'],
+            '盈利金额': vals['盈利金额'],
+            '亏损单数': vals['亏损单数'],
+            '亏损金额': vals['亏损金额']  # 保留负数
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # 分离盈利日和亏损日
+    profit_days = df[df['盈利金额'] > 0][['日期', '盈利单数', '盈利金额']].copy()
+    profit_days = profit_days.rename(columns={'日期': '盈利日期'})
+    profit_days = profit_days.sort_values('盈利金额', ascending=False).reset_index(drop=True)
+
+    loss_days = df[df['亏损金额'] < 0][['日期', '亏损单数', '亏损金额']].copy()
+    loss_days = loss_days.rename(columns={'日期': '亏损日期'})
+    loss_days = loss_days.sort_values('亏损金额', ascending=True).reset_index(drop=True)  # 亏损最多（负值最小）在前
+
+    # 左右合并
+    combined = pd.concat([profit_days, loss_days], axis=1)
+    return combined
+
 # ------------------- 主执行入口 -------------------
 if __name__ == "__main__":
     # 1. 解析通达信板块文件
@@ -1338,6 +1417,7 @@ if __name__ == "__main__":
         # ================== 执行亏损日期分析 ==================
         loss_dates_df = analyze_loss_periods(trades_detail_result)
         t = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(time.time()))
+        buy_date_stats = analyze_by_buy_date(trades_detail_result)
         # 3. 保存结果到Excel（多sheet）
         if not stock_summary_result.empty:
             with pd.ExcelWriter(f"板块回测汇总结果_含总笔数{t}.xlsx", engine="openpyxl") as writer:
@@ -1351,5 +1431,7 @@ if __name__ == "__main__":
                 # Sheet4：提取的亏损明细表
                 if loss_dates_df is not None and not loss_dates_df.empty:
                     loss_dates_df.to_excel(writer, sheet_name="亏损日期提取", index=False)
-            
+                # 新增 sheet
+                if not buy_date_stats.empty:
+                    buy_date_stats.to_excel(writer, sheet_name="按买入日期统计", index=False)
             print(f"\n汇总结果已保存到: 板块回测汇总结果_含总笔数.xlsx，请查看 '亏损日期提取' Sheet。")
