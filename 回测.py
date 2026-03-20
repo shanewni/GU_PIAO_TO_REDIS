@@ -253,6 +253,23 @@ class TdxStockBacktest:
         rps_df = extrs_df.rank(axis=1, pct=True, ascending=True) * 100
         return rps_df
     
+    def get_index_filter(self, index_code: str = "880005", count: int = 800, use_local: bool = True):
+        """
+        获取指数的趋势过滤信号
+        条件：当前30min K线收盘价 > 前一根30min K线收盘价
+        """
+        # 逻辑与获取个股一致
+        multi_data = self.get_multi_period_data(index_code, count=count, use_local=use_local)
+        df_index = multi_data['30min']
+        
+        if df_index.empty:
+            return pd.Series()
+
+        # 计算条件：当前收盘 > 昨收 (shift(1))
+        # 1 表示通过，0 表示不通过
+        index_trend = (df_index['收盘价'] > df_index['收盘价'].shift(1)).astype(int)
+        return index_trend
+
     def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
         """
         以损定量核心计算：根据止损百分比计算可买数量
@@ -648,7 +665,8 @@ class TdxStockBacktest:
         if cond_pattern: return True, pattern_reason
         return False, ""   
     
-    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
+    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float], 
+                       index_filter: pd.Series = None) -> pd.DataFrame:
             data = min30_data.copy()
             data.index.name = 'datetime'
             day_df.index.name = 'datetime'
@@ -667,6 +685,12 @@ class TdxStockBacktest:
                 on='date_only', 
                 how='left'
             ).set_index('datetime')
+
+            # 将指数信号合并到主 data 中，确保时间戳对齐
+            if index_filter is not None:
+                data['index_ok'] = index_filter
+            else:
+                data['index_ok'] = 1  # 如果没传，默认不限制
 
             # --- 2. 预计算基础指标 ---
             buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
@@ -692,9 +716,9 @@ class TdxStockBacktest:
                 
                 if not in_pos:
                     # 尝试买入
-                     # 核心买入判定：原 rps_cond 修改为直接读取我们合并后的标识
-                    rps_is_strong = data['rps_ok_flag'].iloc[i] == 1
-                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i] and rps_is_strong:
+                    # 新增：指数过滤条件
+                    index_is_ok = data['index_ok'].iloc[i] == 1
+                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i] and index_is_ok:
                         data.loc[current_idx_time, 'signal'] = 1
                         in_pos = True
                         buy_price = close_list[i]
@@ -751,7 +775,7 @@ class TdxStockBacktest:
     
     def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
                      commission: float = 0.0003, stop_loss_ratio: float = 0.01,
-                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH, index_filter_series: pd.Series = None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
         """
         执行三买变体策略回测（30分钟周期）
         升级：返回单股票交易明细列表，用于总笔数汇总
@@ -791,7 +815,7 @@ class TdxStockBacktest:
             return pd.DataFrame(), {}, []
         
         # 生成策略信号
-        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low)
+        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low, index_filter=index_filter_series)
         
         # 初始化止损百分比
         self.stop_loss_ratio = stop_loss_ratio
@@ -1115,7 +1139,9 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
     # 存储所有股票的回测指标 + 所有交易明细
     all_metrics = []
     all_trades_detail = []  # 存储所有股票的交易明细
-
+    index_filter_series = backtest.get_index_filter("880005", count=800, use_local=True)
+    print(f"指数过滤条件（880005）已获取，长度：{len(index_filter_series)}")  # 调试输出，确认指数过滤条件长度和内容
+    print(index_filter_series.tail())  # 输出后几行，确认数据正确加载
     # 逐只股票回测
     for idx, code in enumerate(stock_codes):
         print(f"\n------------------- 进度 {idx+1}/{len(stock_codes)} -------------------")
@@ -1126,7 +1152,8 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 commission=commission,
                 stop_loss_ratio=stop_loss_ratio,
                 use_local=True  ,# 统一使用联网模式获取数据
-                tdx_path=DEFAULT_TDX_PATH
+                tdx_path=DEFAULT_TDX_PATH,
+                index_filter_series=index_filter_series  # 传入指数过滤条件
             )
             if metrics:  # 仅保留有有效指标的股票
                 metrics['股票代码'] = code
