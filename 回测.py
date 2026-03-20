@@ -9,6 +9,8 @@ import gupiaojichu
 import struct
 from mootdx.reader import Reader
 from collections import defaultdict, deque
+import os
+import logging
 
 # 忽略无关警告
 warnings.filterwarnings('ignore')
@@ -255,21 +257,27 @@ class TdxStockBacktest:
         return rps_df
 
     @staticmethod
-    def calculate_top_stocks_by_time(stock_codes_index, top_n=60, use_local=True, tdx_path=DEFAULT_TDX_PATH):
+    def calculate_top_stocks_by_time(stock_codes, top_n=60, use_local=True, tdx_path=DEFAULT_TDX_PATH):
         """
-        读取板块成分股的30分钟数据，计算每个时间点的涨幅排名前top_n的股票集合
+        读取给定股票列表的30分钟数据，计算每个时间点的涨幅排名前top_n的股票集合
+        :param stock_codes: 股票代码列表
+        :param top_n: 取涨幅前多少名
+        :param use_local: 是否使用本地数据
+        :param tdx_path: 本地数据路径
         :return: dict {datetime: set(股票代码)}
         """
-        from collections import defaultdict
-        import pandas as pd
-
-        # 存储每只股票的收盘价序列（时间对齐用）
+        # 创建临时实例用于读取数据
+        temp_backtest = TdxStockBacktest()
         price_dict = {}
         all_times = set()
 
-        for code in stock_codes_index:
-            # 获取30分钟数据（使用本地数据）
-            df = TdxStockBacktest().get_exact_tdx_30min(code, tdx_path)  # 注意这里需要实例化或静态调用
+        for code in stock_codes:
+            if use_local:
+                df = temp_backtest.get_exact_tdx_30min(code, tdx_path)
+            else:
+                # 联网模式暂不支持，可根据需要扩展
+                print("警告：calculate_top_stocks_by_time 目前仅支持本地数据模式")
+                continue
             if df.empty:
                 continue
             # 只保留收盘价，并重命名为股票代码
@@ -285,8 +293,7 @@ class TdxStockBacktest:
         # 构建涨幅DataFrame：行为时间，列为股票代码，值为涨幅（相对于前一根K线）
         pct_dict = {}
         for code, series in price_dict.items():
-            # 计算涨幅（相邻K线），缺失值填充NaN
-            pct = series.pct_change().reindex(all_times)
+            pct = series.pct_change().reindex(all_times)  # 相邻K线涨幅
             pct_dict[code] = pct
 
         pct_df = pd.DataFrame(pct_dict)  # 行=时间，列=股票代码
@@ -294,15 +301,70 @@ class TdxStockBacktest:
         # 构建排名字典
         top_stocks_by_time = {}
         for dt in all_times:
-            # 获取该时间点所有股票的涨幅（排除NaN）
             row = pct_df.loc[dt].dropna()
             if row.empty:
                 continue
-            # 按涨幅降序排序，取前top_n的股票代码
             top_codes = row.sort_values(ascending=False).head(top_n).index.tolist()
             top_stocks_by_time[dt] = set(top_codes)
 
         return top_stocks_by_time
+    
+    @staticmethod
+    def load_tdx_mapping(tdx_install_path):
+        """
+        加载通达信股票-行业、股票-指数映射关系
+        Args:
+            tdx_install_path: 通达信安装目录（如 D:/new_tdx_x/new_tdx）
+        Returns:
+            tuple: (stock_to_industry_map, stock_to_zs_map)
+                若加载失败，返回 (None, None)
+        """
+        # 构建.cfg文件路径
+        hq_cache_path = os.path.join(tdx_install_path, 'T0002', 'hq_cache')
+        tdxhy_file = os.path.join(hq_cache_path, 'tdxhy.cfg')  # 股票-行业映射文件
+        tdxzs_file = os.path.join(hq_cache_path, 'tdxzs3.cfg')  # 指数列表文件
+
+        # 初始化映射字典
+        stock_to_industry_map = None
+        stock_to_zs_map = None
+
+        # 1. 读取股票-行业映射
+        try:
+            df_hy = pd.read_csv(
+                tdxhy_file, 
+                sep='|', 
+                encoding='gbk', 
+                dtype=str, 
+                header=None, 
+                engine='python'
+            )
+            stock_to_industry_map = pd.Series(df_hy[5].values, index=df_hy[1]).to_dict()
+            logging.info(f"成功构建股票-行业映射，共 {len(stock_to_industry_map)} 条记录")
+        except FileNotFoundError:
+            logging.error(f"未找到股票-行业映射文件: {tdxhy_file}，请检查通达信路径是否正确")
+        except Exception as e:
+            logging.error(f"读取股票-行业映射文件出错: {e}")
+
+        # 2. 读取股票-指数映射
+        try:
+            df_zs = pd.read_csv(
+                tdxzs_file, 
+                sep='|', 
+                header=None, 
+                dtype=str,
+                encoding='gbk', 
+                engine='python'
+            )
+            mask = df_zs[5].str.startswith('X')  # 过滤指数标识
+            filtered_series = pd.Series(df_zs.loc[mask, 5].values, index=df_zs.loc[mask, 1])
+            stock_to_zs_map = filtered_series.to_dict()
+            logging.info(f"成功构建股票-指数映射，共 {len(stock_to_zs_map)} 条记录")
+        except FileNotFoundError:
+            logging.error(f"未找到指数映射文件: {tdxzs_file}，请检查通达信路径是否正确")
+        except Exception as e:
+            logging.error(f"读取指数映射文件出错: {e}")
+
+        return stock_to_industry_map, stock_to_zs_map
     
     def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
         """
@@ -801,7 +863,7 @@ class TdxStockBacktest:
     def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
                      commission: float = 0.0003, stop_loss_ratio: float = 0.01,
                      use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH,
-                    top_stocks_by_time: dict = None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+                    top_stocks_by_time: dict = None, stock_to_zs_final_map: dict = None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
         """
         执行三买变体策略回测（30分钟周期）
         升级：返回单股票交易明细列表，用于总笔数汇总
@@ -881,7 +943,7 @@ class TdxStockBacktest:
             if row['signal'] == 1 and cash > close_price and not self.in_position:
                 # 【新增】排名检查
                 if top_stocks_by_time is not None:
-                    if datetime not in top_stocks_by_time or code not in top_stocks_by_time[datetime]:
+                    if datetime not in top_stocks_by_time or stock_to_zs_final_map.get(code) not in top_stocks_by_time[datetime]:
                         # 不满足排名条件，跳过此次买入
                         continue
 
@@ -1171,6 +1233,18 @@ def batch_backtest(stock_codes: List[str], stock_codes_index: List[str], init_ca
         return pd.DataFrame(), pd.DataFrame(), {}
     
         # ===== 新增：预先计算板块涨幅排名 =====
+    stock_to_industry_map, stock_to_zs_map = TdxStockBacktest.load_tdx_mapping(DEFAULT_TDX_PATH)
+    # 2. 转换 stock_to_zs_map 方便反查 (行业名称 -> 指数代码)
+    # 使用字典推导式快速反转
+    industry_to_zs_code = {v: k for k, v in stock_to_zs_map.items()}
+    # 3. 生成新的 Map (股票代码 -> 行业指数代码)
+    # 逻辑：通过股票找到行业，再通过行业找到指数代码
+    stock_to_zs_final_map = {
+        stock_code: industry_to_zs_code.get(industry)
+        for stock_code, industry in stock_to_industry_map.items()
+        if industry in industry_to_zs_code
+    }
+
     print("正在计算板块成分股涨幅排名...")
     top_stocks_by_time = TdxStockBacktest.calculate_top_stocks_by_time(
         stock_codes_index,
@@ -1179,6 +1253,14 @@ def batch_backtest(stock_codes: List[str], stock_codes_index: List[str], init_ca
         tdx_path=DEFAULT_TDX_PATH
     )
     print(f"排名计算完成，共 {len(top_stocks_by_time)} 个时间点有排名数据")
+    # 检查是否为字典且不为空
+    if isinstance(top_stocks_by_time, dict) and top_stocks_by_time:
+        # 获取排序后的最后一个日期（Key）
+        last_date = sorted(top_stocks_by_time.keys())[-1]
+        print(f"最后日期: {last_date}, 数据长度: {len(top_stocks_by_time[last_date])}")
+        print(f"最后数据内容: {top_stocks_by_time[last_date]}")
+    else:
+        print("数据格式不正确或为空")
 
     # 存储所有股票的回测指标 + 所有交易明细
     all_metrics = []
@@ -1195,7 +1277,8 @@ def batch_backtest(stock_codes: List[str], stock_codes_index: List[str], init_ca
                 stop_loss_ratio=stop_loss_ratio,
                 use_local=True  ,# 统一使用联网模式获取数据
                 tdx_path=DEFAULT_TDX_PATH,
-                top_stocks_by_time=top_stocks_by_time   # 传入排名字典
+                top_stocks_by_time=top_stocks_by_time,   # 传入排名字典
+                stock_to_zs_final_map=stock_to_zs_final_map    # 传入股票-指数映射
             )
             if metrics:  # 仅保留有有效指标的股票
                 metrics['股票代码'] = code
