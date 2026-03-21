@@ -692,9 +692,7 @@ class TdxStockBacktest:
                 
                 if not in_pos:
                     # 尝试买入
-                     # 核心买入判定：原 rps_cond 修改为直接读取我们合并后的标识
-                    rps_is_strong = data['rps_ok_flag'].iloc[i] == 1
-                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i] and rps_is_strong:
+                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
                         data.loc[current_idx_time, 'signal'] = 1
                         in_pos = True
                         buy_price = close_list[i]
