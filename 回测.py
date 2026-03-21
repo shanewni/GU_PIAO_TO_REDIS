@@ -255,20 +255,29 @@ class TdxStockBacktest:
     
     def get_index_filter(self, index_code: str = "880005", count: int = 800, use_local: bool = True):
         """
-        获取指数的趋势过滤信号
-        条件：当前30min K线收盘价 > 前一根30min K线收盘价
+        获取指数的趋势过滤信号 (修改后：日线反转逻辑)
+        逻辑：昨日收盘 < 前日收盘 -> 今日允许买入 (1)；否则禁止 (0)
         """
-        # 逻辑与获取个股一致
-        multi_data = self.get_multi_period_data(index_code, count=count, use_local=use_local)
-        df_index = multi_data['30min']
+        # 强制获取日线数据
+        if use_local:
+            df_index = self.get_local_day_data(index_code, DEFAULT_TDX_PATH)
+        else:
+            # 联网获取日线 (ktype=9)
+            df_index, _, _ = self.get_stock_k_data(index_code, count=count, ktype=9)
         
         if df_index.empty:
             return pd.Series()
 
-        # 计算条件：当前收盘 > 昨收 (shift(1))
-        # 1 表示通过，0 表示不通过
-        index_trend = (df_index['收盘价'] > df_index['收盘价'].shift(1)).astype(int)
-        return index_trend
+        # 计算逻辑：
+        # 1. 判断昨日是否下跌：df_index['收盘价'].shift(1) < df_index['收盘价'].shift(2)
+        # 2. 将结果映射到每一天
+        index_condition = (df_index['收盘价'].shift(1) < df_index['收盘价'].shift(2)).astype(int)
+        
+        # 将索引日期化，方便后续 30min 数据按日期 merge
+        index_condition.index = df_index.index.date
+        index_condition.name = 'index_ok'
+        
+        return index_condition
 
     def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
         """
@@ -686,11 +695,26 @@ class TdxStockBacktest:
                 how='left'
             ).set_index('datetime')
 
-            # 将指数信号合并到主 data 中，确保时间戳对齐
+             # --- 修改：指数信号合并逻辑 ---
             if index_filter is not None:
-                data['index_ok'] = index_filter
+                # index_filter 现在是以 date 为索引的 Series
+                data['date_only'] = data.index.date
+                # 将 index_filter 转为 DataFrame 方便 merge
+                index_df = index_filter.to_frame(name='index_ok')
+                index_df.index.name = 'date_only'
+                
+                # 通过 date_only 关联，让这一天内所有的 30min K线都共享同一个 index_ok 信号
+                data = data.reset_index().merge(
+                    index_df, 
+                    left_on='date_only', 
+                    right_index=True, 
+                    how='left'
+                ).set_index('datetime')
+                
+                # 填充缺失值（如果有的话，默认不买入）
+                data['index_ok'] = data['index_ok'].fillna(0)
             else:
-                data['index_ok'] = 1  # 如果没传，默认不限制
+                data['index_ok'] = 1
 
             # --- 2. 预计算基础指标 ---
             buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
