@@ -188,6 +188,23 @@ class TdxStockBacktest:
         }
         return ktype_map.get(ktype, f'未知周期({ktype})')
     
+    def get_local_week_data(self, symbol, tdx_path=DEFAULT_TDX_PATH):
+        """从本地日线合成周线数据"""
+        df_day = self.get_local_day_data(symbol, tdx_path)
+        if df_day.empty:
+            return pd.DataFrame()
+            
+        # 按周重采样：开盘价(first), 最高价(max), 最低价(min), 收盘价(last)
+        df_week = df_day.resample('W-FRI').agg({
+            '开盘价': 'first',
+            '最高价': 'max',
+            '最低价': 'min',
+            '收盘价': 'last',
+            '成交量': 'sum',
+            '成交额': 'sum'
+        }).dropna()
+        return df_week
+    
     def get_multi_period_data(self, code: str, count: int = 800, use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH) -> Dict[str, pd.DataFrame]:
         """
         一键获取日线+30分钟线数据（支持本地/联网切换）
@@ -203,6 +220,7 @@ class TdxStockBacktest:
             # 本地模式：读取本地数据
             day_data = self.get_local_day_data(code, tdx_path)
             min30_data = self.get_exact_tdx_30min(code, tdx_path)
+            week_data = self.get_local_week_data(code, tdx_path) # 新增周线
             
             # 提取高低价列表
             min30_high = min30_data['最高价'].astype(float).tolist() if not min30_data.empty else []
@@ -210,6 +228,7 @@ class TdxStockBacktest:
             
             result = {
                 'day': day_data,
+                'week': week_data,
                 '30min_high_list': min30_high,
                 '30min_low_list': min30_low,
                 '30min': min30_data
@@ -218,17 +237,18 @@ class TdxStockBacktest:
             # 联网模式：原有逻辑
             day_data, day_high_list, day_low_list = self.get_stock_k_data(code, count=count, ktype=9)
             min30_data, min30_high_list, min30_low_list = self.get_stock_k_data(code, count=count, ktype=2)
+            week_data, _, _ = self.get_stock_k_data(code, count=count, ktype=8) # 联网获取周线
             
             result = {
                 'day': day_data,
+                'week': week_data,
                 '30min_high_list': min30_high_list,
                 '30min_low_list': min30_low_list,
                 '30min': min30_data
             }
         
         # 存储到实例变量
-        self.stock_data['day'] = result['day']
-        self.stock_data['30min'] = result['30min']
+        self.stock_data.update(result)
         
         return result
     
@@ -648,10 +668,37 @@ class TdxStockBacktest:
         if cond_pattern: return True, pattern_reason
         return False, ""   
     
-    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
+    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float], 
+                           week_df: pd.DataFrame) -> pd.DataFrame:
             data = min30_data.copy()
             data.index.name = 'datetime'
             day_df.index.name = 'datetime'
+
+            # --- 新增：周线过滤逻辑 ---
+            week_df = week_df.copy()
+            # 计算：上一根周K收盘 > 上上根周K收盘
+            week_df['week_up'] = week_df['收盘价'] > week_df['收盘价'].shift(1)
+            # 将信号下移一格，确保买入时使用的是“已经收盘”的周线数据
+            week_df['week_signal_valid'] = week_df['week_up'].shift(1).fillna(False)
+            # print(week_df.tail(20))
+            
+            # 将周线信号映射到日期
+            week_df['date_only'] = week_df.index.date
+            data['date_only'] = data.index.date
+            
+            # 由于周线索引通常是周五或周日，我们需要通过 forward fill 将周信号覆盖到该周的所有交易日
+            # 1. 先合并周信号到日线级别
+            day_signals = pd.DataFrame(index=day_df.index)
+            day_signals['date_only'] = day_signals.index.date
+            day_signals = day_signals.merge(week_df[['date_only', 'week_signal_valid']], on='date_only', how='left')
+            day_signals['week_signal_valid'] = day_signals['week_signal_valid'].ffill().fillna(False)
+
+            # 2. 合并到 30 分钟线
+            data = data.reset_index().merge(
+                day_signals[['date_only', 'week_signal_valid']], 
+                on='date_only', 
+                how='left'
+            ).set_index('datetime')
             
             # --- 1. 日线过滤条件 (保持原逻辑) ---
             day_df = day_df.copy()
@@ -692,9 +739,7 @@ class TdxStockBacktest:
                 
                 if not in_pos:
                     # 尝试买入
-                     # 核心买入判定：原 rps_cond 修改为直接读取我们合并后的标识
-                    rps_is_strong = data['rps_ok_flag'].iloc[i] == 1
-                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i] and rps_is_strong:
+                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]  and data['week_signal_valid'].iloc[i]:
                         data.loc[current_idx_time, 'signal'] = 1
                         in_pos = True
                         buy_price = close_list[i]
@@ -785,13 +830,14 @@ class TdxStockBacktest:
         min30_data = multi_data['30min']
         min30_high = multi_data['30min_high_list']
         min30_low = multi_data['30min_low_list']
+        week_data = multi_data['week'] # 获取周线
         
         if min30_data.empty:
             print(f"股票 {code} 30分钟数据为空，无法回测")
             return pd.DataFrame(), {}, []
         
         # 生成策略信号
-        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low)
+        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low,week_data)
         
         # 初始化止损百分比
         self.stop_loss_ratio = stop_loss_ratio
