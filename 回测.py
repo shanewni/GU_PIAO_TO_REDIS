@@ -832,7 +832,7 @@ class TdxStockBacktest:
                     prev_close = data['最高价'].iloc[current_idx - 1]
                     loss_price = min(row['最低价'], prev_close)
 
-                    if (close_price-loss_price)/loss_price*100 > 3:
+                    if (close_price-loss_price)/loss_price*100 > 2.4:
                         continue
                     if (close_price-loss_price)/loss_price*100 < 0.5:
                         continue
