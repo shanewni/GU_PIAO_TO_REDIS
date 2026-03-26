@@ -402,7 +402,7 @@ class TdxStockBacktest:
         full_signals = [0.0] * total_length
         
         # 设定滑动窗口大小
-        LOOKBACK_WINDOW = 200
+        LOOKBACK_WINDOW = 150
         
         # 遍历每个数据点，逐步扩展窗口计算信号
         for window_end in range(1, total_length + 1):
@@ -807,8 +807,6 @@ class TdxStockBacktest:
         # 止损相关初始化
         self.stop_loss_price = 0.0
         self.in_position = False
-        buy_kline_low = 0.0
-        buy_datetime = None
         
         # 逐行执行回测
         buy_price = 0
@@ -816,15 +814,14 @@ class TdxStockBacktest:
         
         for datetime, row in data.iterrows():
             close_price = row['收盘价']
-            low_price = row['最低价']
-            high_price = row['最高价']
             current_total_asset = cash + position * close_price
             current_idx = data.index.get_loc(datetime)  # 当前K线索引
 
             # 核心修改：实时更新回测器手中的止损价
-            if self.in_position:
+            # if self.in_position:
                 # 这里的 active_stop_loss 包含了你新加的“第三根K线移位”后的价格
-                self.stop_loss_price = row['active_stop_loss']
+                # self.stop_loss_price = row['active_stop_loss']
+
             red = close_price > row['开盘价']
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
             if row['signal'] == 1 and cash > close_price and not self.in_position and red:
@@ -861,7 +858,7 @@ class TdxStockBacktest:
                         buy_price = close_price
                         buy_fee = fee
                         self.in_position = True
-                        buy_datetime = datetime
+                        # buy_datetime = datetime
                         self.buy_kline_index = current_idx  # 【新增】记录买入时的全局 K 线索引
                         
                         trade_detail = {
@@ -930,7 +927,7 @@ class TdxStockBacktest:
                 buy_fee = 0
                 self.stop_loss_price = 0.0
                 self.in_position = False
-                buy_kline_low = 0.0
+                # buy_kline_low = 0.0
                 self.risk_per_trade = 0.0
                 
                 # 新增：打印卖出原因和K线索引
@@ -1133,7 +1130,7 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
             if trades_detail:  # 收集交易明细
                 all_trades_detail.extend(trades_detail)
             # 避免请求过快，休眠0.1秒
-            time.sleep(0.1)
+            time.sleep(0.001)
         except Exception as e:
             print(f"股票 {code} 回测异常: {e}")
             continue
