@@ -445,8 +445,6 @@ class TdxStockBacktest:
                     if current_close <= last_top_high:
                         window_signal[-1] = 0.0
 
-                if 
-
             # 将窗口最后的计算结果映射回全量信号列表
             full_signals[window_end - 1] = window_signal[-1]
         
