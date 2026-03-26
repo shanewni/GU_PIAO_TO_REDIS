@@ -388,7 +388,7 @@ class TdxStockBacktest:
         return pf_out
     
     @staticmethod
-    def calculate_three_buy_signals(high_full, low_full, close_full, open_full) -> List[float]:
+    def calculate_three_buy_signals(high_full, low_full, close_full) -> List[float]:
         """
         遍历完整数据序列，逐段计算三买变体买点信号
         优化：每次计算仅使用最近 200 根 K 线以提升效率
@@ -412,7 +412,6 @@ class TdxStockBacktest:
             high_window = high_full[start_idx : window_end]
             low_window = low_full[start_idx : window_end]
             close_window = close_full[start_idx : window_end]
-            open_window = open_full[start_idx : window_end]
             
             # 计算当前窗口内的转折点
             # 注意：window_end 在 identify_turns 中通常作为长度参考
@@ -427,7 +426,6 @@ class TdxStockBacktest:
             # 如果当前窗口最后一个位置有信号，执行收盘价确认逻辑
             if window_signal[-1] == 1.0:
                 current_close = close_window[-1]
-                current_close = open_window[-1]
                 
                 # 在当前 frac_window 中找最后一个顶分型（值为1.0）
                 # 寻找的是“突破K线”之前最近的一个顶
@@ -671,7 +669,7 @@ class TdxStockBacktest:
             ).set_index('datetime')
 
             # --- 2. 预计算基础指标 ---
-            buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist(), data['开盘价'].tolist())
+            buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
             data['buy_signal'] = buy_signals
             data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
             
