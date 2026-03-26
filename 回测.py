@@ -388,7 +388,7 @@ class TdxStockBacktest:
         return pf_out
     
     @staticmethod
-    def calculate_three_buy_signals(high_full, low_full, close_full) -> List[float]:
+    def calculate_three_buy_signals(high_full, low_full, close_full, open_full) -> List[float]:
         """
         遍历完整数据序列，逐段计算三买变体买点信号
         优化：每次计算仅使用最近 200 根 K 线以提升效率
@@ -412,6 +412,7 @@ class TdxStockBacktest:
             high_window = high_full[start_idx : window_end]
             low_window = low_full[start_idx : window_end]
             close_window = close_full[start_idx : window_end]
+            open_window = open_full[start_idx : window_end]
             
             # 计算当前窗口内的转折点
             # 注意：window_end 在 identify_turns 中通常作为长度参考
@@ -426,6 +427,7 @@ class TdxStockBacktest:
             # 如果当前窗口最后一个位置有信号，执行收盘价确认逻辑
             if window_signal[-1] == 1.0:
                 current_close = close_window[-1]
+                current_close = open_window[-1]
                 
                 # 在当前 frac_window 中找最后一个顶分型（值为1.0）
                 # 寻找的是“突破K线”之前最近的一个顶
@@ -442,6 +444,8 @@ class TdxStockBacktest:
                     # 条件：收盘价必须高于前顶分型最高价，否则撤销信号
                     if current_close <= last_top_high:
                         window_signal[-1] = 0.0
+
+                if 
 
             # 将窗口最后的计算结果映射回全量信号列表
             full_signals[window_end - 1] = window_signal[-1]
@@ -669,7 +673,7 @@ class TdxStockBacktest:
             ).set_index('datetime')
 
             # --- 2. 预计算基础指标 ---
-            buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
+            buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist(), data['开盘价'].tolist())
             data['buy_signal'] = buy_signals
             data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
             
@@ -724,7 +728,8 @@ class TdxStockBacktest:
                             pass
                         else:
                             # 高于或等于买入价，移动止损到成本价
-                            current_stop_loss = max(current_stop_loss, buy_price)
+                            # current_stop_loss = max(current_stop_loss, buy_price)
+                            pass
 
                     min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
                     data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss # 记录当前止损价，便于调试和分析
@@ -824,9 +829,9 @@ class TdxStockBacktest:
             if self.in_position:
                 # 这里的 active_stop_loss 包含了你新加的“第三根K线移位”后的价格
                 self.stop_loss_price = row['active_stop_loss']
-            
+            red = close_price > row['开盘价']
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
-            if row['signal'] == 1 and cash > close_price and not self.in_position:
+            if row['signal'] == 1 and cash > close_price and not self.in_position and red:
                 # 3. 原有的止损价计算逻辑
                 if current_idx > 0:
                     prev_close = data['最高价'].iloc[current_idx - 1]
