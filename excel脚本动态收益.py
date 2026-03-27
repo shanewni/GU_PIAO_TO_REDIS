@@ -7,7 +7,7 @@ from openpyxl.styles import Font, Alignment
 import os
 
 # =================配置区域=================
-file_path = '板块回测汇总结果_含总笔数2026-03-12-13-57-01_test_30f_rps__bug版第三根有可能卖出.xlsx'
+file_path = '板块回测汇总结果_含总笔数2026-03-26-18-58-35_涨幅1-3%.xlsx'
 sheet_name = '所有交易明细'           
 column_name = '实际盈亏比例'                
 initial_capital = 100000              
@@ -15,7 +15,7 @@ num_simulations = 100
 output_sheet = '随机复利模拟结果动态收益'
 
 # 动态风险控制参数
-DD_THRESHOLD = 0.15  # 回撤阈值：10%
+DD_THRESHOLD = 0.10  # 回撤阈值：10%
 RISK_REDUCTION = 0.5  # 风险缩减系数：回撤后只承担 0.5 倍风险
 # ==========================================
 
