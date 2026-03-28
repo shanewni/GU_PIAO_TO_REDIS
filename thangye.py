@@ -2,92 +2,113 @@ import pandas as pd
 import akshare as ak
 import time
 from datetime import timedelta
+import os
 
 # 1. 配置路径
 file_path = '板块回测汇总结果_含总笔数2026-03-26-18-58-35_涨幅0.5-3%.xlsx'
-output_path = '交易非技术特征画像报告.xlsx'
+output_path = '交易行情特征画像分析_纯净版.xlsx'
 
-def get_stock_daily_features(symbol, trade_date):
-    """
-    获取指定股票在交易日前一天的非技术特征
-    """
+def get_market_features(symbol, trade_date):
+    """仅获取行情与市值特征，避开财务接口"""
     try:
-        # 格式化代码：AkShare通常需要 6 位数字
         symbol = str(symbol).zfill(6)
-        # 获取前复权日频数据
-        # 实际操作中建议先下载全量数据到本地缓存，避免频繁调用API被封
+        date_str = trade_date.strftime('%Y%m%d')
+        
+        # --- A. 行情数据 (AkShare 最稳接口) ---
+        # 获取包含交易日前后的数据
         df_hist = ak.stock_zh_a_hist(symbol=symbol, period="daily", 
-                                    start_date=(trade_date - timedelta(days=10)).strftime('%Y%m%d'),
-                                    end_date=trade_date.strftime('%Y%m%d'), 
-                                    adjust="qfq")
+                                    start_date=(trade_date - timedelta(days=15)).strftime('%Y%m%d'),
+                                    end_date=date_str, adjust="qfq")
         
-        if df_hist.empty: return None
+        if df_hist.empty or len(df_hist) < 2: 
+            return None
         
-        # 找到交易日当天或前一天的行
-        last_day = df_hist.iloc[-2] # 前一日数据
-        current_day = df_hist.iloc[-1] # 交易当日数据
-        
-        return {
+        # 前一日与当日行
+        last_day = df_hist.iloc[-2]
+        current_day = df_hist.iloc[-1]
+
+        res = {
             '前日换手率': last_day['换手率'],
-            '当日成交额': current_day['成交额'],
             '前日振幅': last_day['振幅'],
-            '当日涨跌幅': current_day['涨跌幅']
+            '前日涨跌幅': last_day['涨跌幅'],
+            '当日成交额': current_day['成交额'],
+            '当日涨跌幅': current_day['涨跌幅'],
+            '当日换手率': current_day['换手率'],
+            '总市值(亿)': 0,
+            '流通市值(亿)': 0
         }
-    except:
+
+        # --- B. 市值指标 (独立接口，通常比财务报表更稳) ---
+        try:
+            df_indicator = ak.stock_a_indicator_lg(symbol=symbol)
+            df_indicator['trade_date'] = pd.to_datetime(df_indicator['trade_date'])
+            # 匹配最接近交易日的指标
+            indicator_match = df_indicator[df_indicator['trade_date'] <= trade_date]
+            if not indicator_match.empty:
+                latest_ind = indicator_match.iloc[-1]
+                res['总市值(亿)'] = round(latest_ind['total_mv'] / 10000, 2)
+                res['流通市值(亿)'] = round(latest_ind['circ_mv'] / 10000, 2)
+        except:
+            pass
+
+        return res
+    except Exception as e:
+        print(f"解析 {symbol} 出错: {e}")
         return None
 
-# 2. 读取回测明细
-print("正在读取回测数据...")
+# 2. 读取回测数据
+print("正在读取回测数据并筛选下午交易...")
 df_detail = pd.read_excel(file_path, sheet_name='所有交易明细')
-
-# 3. 筛选出下午的交易单（基于你上午不买的逻辑）
 df_detail['交易时间'] = pd.to_datetime(df_detail['交易时间'])
+
+# 筛选下午（13:00后）买入的单子
 afternoon_buys = df_detail[(df_detail['交易类型'] == '买入') & 
                            (df_detail['交易时间'].dt.hour >= 13)].copy()
 
-# 4. 关联 AkShare 数据（演示前 50 笔，实战建议全量处理并加 Time.sleep）
-print(f"开始关联非技术特征，共需处理 {len(afternoon_buys)} 笔交易...")
+# 3. 循环处理
 results = []
+# 如果你想跑全量，可以将 head(50) 去掉
+process_count = 10000
+print(f"开始分析特征，预计处理 {process_count} 笔大收益单...")
 
-for index, row in afternoon_buys.iterrows(): # 演示前50笔
-    stock_code = row['股票代码']
-    trade_time = row['交易时间']
-    
-    # 获取卖出结果（下一行）
+for index, row in afternoon_buys.iterrows():
+    # 获取卖出后的结果（下一行通常是平仓单）
     try:
         sell_row = df_detail.iloc[index + 1]
         pnl = sell_row['单笔盈亏']
+        hold_k = sell_row['持仓K线数量']
     except:
-        pnl = 0
+        pnl, hold_k = 0, 0
 
-    features = get_stock_daily_features(stock_code, trade_time)
-    
-    trade_profile = {
-        '股票代码': stock_code,
-        '交易时间': trade_time,
-        '盈亏金额': pnl,
-        '结果标签': '盈利' if pnl > 0 else '亏损'
-    }
-    
+    features = get_market_features(row['股票代码'], row['交易时间'])
     if features:
-        trade_profile.update(features)
+        # 合并交易信息与行情特征
+        features.update({
+            '股票代码': row['股票代码'],
+            '买入时间': row['交易时间'],
+            '盈亏金额': pnl,
+            '持仓K线': hold_k
+        })
+        results.append(features)
+        print(f"已处理: {row['股票代码']} | 盈亏: {pnl:.2f}")
+
+    # 达到处理笔数上限跳出（演示用）
+    if len(results) >= process_count:
+        break
     
-    results.append(trade_profile)
-    time.sleep(0.2) # 礼貌访问接口
+    time.sleep(0.3) # 避免触发频率限制
 
-# 5. 生成画像报告
-df_final = pd.DataFrame(results)
-
-# 6. 非技术特征统计分析（直观看到提升点）
-if not df_final.empty:
-    analysis = df_final.groupby('结果标签').agg({
-        '前日换手率': 'mean',
-        '当日成交额': 'mean',
-        '前日振幅': 'mean'
-    })
-    print("\n=== 非技术特征对比分析 ===")
-    print(analysis)
+# 4. 排序与保存
+if results:
+    df_final = pd.DataFrame(results)
+    # 核心步骤：按盈亏金额降序排列，收益最高的在前
+    df_final = df_final.sort_values(by='盈亏金额', ascending=False)
     
     # 保存结果
-    df_final.to_excel(output_path, index=False)
-    print(f"\n报告已生成至: {output_path}")
+    try:
+        df_final.to_excel(output_path, index=False)
+        print(f"\n✅ 分析完成！结果已按收益排序存入: {output_path}")
+    except PermissionError:
+        print("\n❌ 错误：Excel文件被占用，请关闭后重新运行。")
+else:
+    print("未获取到有效数据。")

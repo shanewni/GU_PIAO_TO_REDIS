@@ -821,10 +821,11 @@ class TdxStockBacktest:
             # if self.in_position:
                 # 这里的 active_stop_loss 包含了你新加的“第三根K线移位”后的价格
                 # self.stop_loss_price = row['active_stop_loss']
-
+            # 获取当前时间点
+            current_time = datetime.time()
             red = close_price > row['开盘价']
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
-            if row['signal'] == 1 and cash > close_price and not self.in_position and red:
+            if row['signal'] == 1 and cash > close_price and not self.in_position and red and current_time >= pd.Timestamp('11:20').time():
                 # 3. 原有的止损价计算逻辑
                 if current_idx > 0:
                     prev_close = data['最高价'].iloc[current_idx - 1]
