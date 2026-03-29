@@ -449,6 +449,40 @@ class TdxStockBacktest:
         return full_signals
     
     @staticmethod
+    def calculate_mfi(df, n=14):
+        """
+        修正后的 MFI 计算
+        传入整个 df 自动识别字段
+        """
+        # 自动适配列名：有些数据是 '收盘价'，有些是 'close'
+        c = df['收盘价'] if '收盘价' in df.columns else df['close']
+        h = df['最高价'] if '最高价' in df.columns else df['high']
+        l = df['最低价'] if '最低价' in df.columns else df['low']
+        v = df['成交量'] if '成交量' in df.columns else df['vol']
+
+        # 确保数据是浮点数且填充 0
+        v = v.fillna(0).astype(float)
+        
+        typ = (h + l + c) / 3
+        mf = typ * v  # 资金流量
+        
+        typ_shift = typ.shift(1)
+        
+        # 辅助序列：上涨流量和下跌流量
+        pos_mf = pd.Series(np.where(typ > typ_shift, mf, 0), index=df.index)
+        neg_mf = pd.Series(np.where(typ < typ_shift, mf, 0), index=df.index)
+        
+        # 计算 N 日滚动和
+        sum_pos_mf = pos_mf.rolling(window=n, min_periods=n).sum()
+        sum_neg_mf = neg_mf.rolling(window=n, min_periods=n).sum()
+        
+        # 计算 MFI
+        # 加上一个小值 1e-10 避免除以 0
+        mfi = 100 - (100 / (1 + (sum_pos_mf / (sum_neg_mf + 1e-10))))
+        
+        return mfi
+
+    @staticmethod
     def calculate_dynamic_sell_signals(high_full: List[float], low_full: List[float], 
                                      close_full: List[float], ma60_full: pd.Series,
                                      buy_price: float = None, buy_idx: int = None) -> tuple[List[bool], List[str]]:
@@ -672,6 +706,25 @@ class TdxStockBacktest:
             buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
             data['buy_signal'] = buy_signals
             data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
+
+            # 计算：昨日MFI > 前三日MFI均值
+            # 注意：对于日线来说，当日只能看到“昨日”的数据
+            day_df['mfi'] = self.calculate_mfi(day_df, n=14)
+            day_df['mfi_ref1'] = day_df['mfi'].shift(1)
+            day_df['mfi_avg_3d'] = (day_df['mfi'].shift(2) + day_df['mfi'].shift(3) + day_df['mfi'].shift(4)) / 3
+            day_df['mfi_valid'] = day_df['mfi_ref1'] > day_df['mfi_avg_3d']
+
+            # 提取日期列用于合并（假设 index 是 datetime）
+            day_df['date_key'] = day_df.index.date
+            mfi_lookup = day_df[['date_key', 'mfi_valid']]
+
+            # 2. 将日线 MFI 信号映射到 30 分钟数据上
+            data['date_key'] = data.index.date
+            # 使用 merge 将日线的判断结果传给每一根 30 分钟 K 线
+            data = data.reset_index().merge(mfi_lookup, on='date_key', how='left').set_index('datetime')
+            # 计算完后查看前20行结果
+            # print(data[['mfi_valid']].tail(120))
+
             
             close_list = data['收盘价'].tolist()
             ma60_list = data['ma60'].tolist()
@@ -692,7 +745,8 @@ class TdxStockBacktest:
                 
                 if not in_pos:
                     # 尝试买入
-                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
+                    is_mfi_ok = data['mfi_valid'].iloc[i] # 检查 MFI 筛选条件
+                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i] and is_mfi_ok:
                         data.loc[current_idx_time, 'signal'] = 1
                         in_pos = True
                         buy_price = close_list[i]
@@ -716,7 +770,7 @@ class TdxStockBacktest:
                     hold_count = i - buy_idx # 计算介入后的K线根数 (0为买入当天)
                     # --- 新增：介入后第三根K线逻辑 (hold_count == 3) ---
                     if hold_count == 3:
-                        if close_list[i] < buy_price:
+                        if close_list[i] <= buy_price:
                             # data.loc[current_idx_time, 'signal'] = -1
                             # data.loc[current_idx_time, 'sell_reason'] = "第三根K线低于买入价强制卖出"
                             # in_pos = False
@@ -724,8 +778,8 @@ class TdxStockBacktest:
                             pass
                         else:
                             # 高于或等于买入价，移动止损到成本价
-                            # current_stop_loss = max(current_stop_loss, buy_price)
-                            pass
+                            current_stop_loss = max(current_stop_loss, buy_price)
+                            # pass
 
                     min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
                     data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss # 记录当前止损价，便于调试和分析
@@ -818,9 +872,9 @@ class TdxStockBacktest:
             current_idx = data.index.get_loc(datetime)  # 当前K线索引
 
             # 核心修改：实时更新回测器手中的止损价
-            # if self.in_position:
+            if self.in_position:
                 # 这里的 active_stop_loss 包含了你新加的“第三根K线移位”后的价格
-                # self.stop_loss_price = row['active_stop_loss']
+                self.stop_loss_price = row['active_stop_loss']
             # 获取当前时间点
             current_time = datetime.time()
             red = close_price > row['开盘价']
