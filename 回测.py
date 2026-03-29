@@ -879,7 +879,7 @@ class TdxStockBacktest:
             current_time = datetime.time()
             red = close_price > row['开盘价']
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
-            if row['signal'] == 1 and cash > close_price and not self.in_position and red and current_time >= pd.Timestamp('11:20').time():
+            if row['signal'] == 1 and cash > close_price and not self.in_position and red and current_time >= pd.Timestamp('13:00').time():
                 # 3. 原有的止损价计算逻辑
                 if current_idx > 0:
                     prev_close = data['最高价'].iloc[current_idx - 1]

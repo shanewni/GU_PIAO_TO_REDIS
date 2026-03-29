@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 # 1. 加载数据
-file_path = '板块回测汇总结果_含总笔数2026-03-29-12-02-30_涨幅0.5-3%_11点30-15点_mfi_昨日与平均线比较_3k保本.xlsx'
+file_path = '板块回测汇总结果_含总笔数2026-03-29-10-10-04_涨幅0.5-3%_11点30-15点_3k保本.xlsx'
 sheet_name = '所有交易明细' 
 
 try:
