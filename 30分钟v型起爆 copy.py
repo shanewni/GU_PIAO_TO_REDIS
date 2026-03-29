@@ -1,6 +1,5 @@
 import pandas as pd
 from pytdx.hq import TdxHq_API
-import redis
 import time
 import schedule
 import os
@@ -9,7 +8,6 @@ import gupiaojichu
 import logging
 import json
 import winsound
-import re  # 确保已导入re模块（代码开头已有，无需重复）
 
 # 配置日志
 logging.basicConfig(
@@ -82,62 +80,119 @@ def three_buy_variant(frac, high, low):
     down_segments.sort(key=lambda x: -x[1])  # 按end_idx降序排列
     up_segments.sort(key=lambda x: -x[1])  # 按end_idx降序排列
     
-    # 至少需要3个向下线段才可能形成信号
-    if len(down_segments) < 3:
+    # 至少需要1个向下线段才可能形成信号
+    if len(down_segments) < 1:
         return pf_out
     
-    # 取最近的3个向下线段
+    # 取最近的向下线段
     latest_seg = down_segments[0]    # 最近的向下线段
-    prev_seg = down_segments[1]      # 前一个向下线段
-
-    if segments[len(segments)-1][2] == 1:
-        up_prev_seg = up_segments[0]      # 最近的向上线段
-    else:
-        up_prev_seg = up_segments[1]      # 前一个向上线段  
-    
-    
-    
-    # 4. 条件1：低点依次降低（前2线段低点 > 前1线段低点 > 最近线段低点）
-    latest_low = low[latest_seg[1]]    # 最近线段终点（低点）的价格
-    prev_low = low[prev_seg[1]]        # 前一线段终点（低点）的价格
-    up_prev_low = low[up_prev_seg[0]]     # 前一线段终点（低点）的价格
-
     latest_high = high[latest_seg[0]]    # 最近线段起点（高点）的价格
-    prev_high = high[prev_seg[0]]        # 前一线段起点（高点）的价格
-    up_prev_high = high[up_prev_seg[1]]      # 前一线段起点（高点）的价格
 
-    if  latest_high >= prev_high:
-        return pf_out  # 最近线段高点不高于前一线段，不满足
-    
-    if latest_low >= prev_low:
-        return pf_out  # 最近线段低点不低于前一线段，不满足
-    
-    
-    # 5. 条件2：最后一根K线价格突破最近两个向下线段的起点高点之一
+    # 条件：最后一根K线价格突破最近向下线段的起点高点
     last_k_idx = data_len - 1  # 最后一根K线的索引
-    if high[last_k_idx] <= up_prev_high:
-        return pf_out  # 未突破任一高点，不满足
+    if high[last_k_idx] <= latest_high:
+        return pf_out  # 未突破高点，不满足
     
-    sum = latest_seg[1] - prev_seg[0]
-    if data_len-1 - latest_seg[1] > sum/3:
-        return pf_out  # 线段间隔过近，不满足
+    # 线段间隔条件判断
+    seg_length = latest_seg[1] - latest_seg[0]
+    after_seg_length = last_k_idx - latest_seg[1]
+    if seg_length >= 9:
+        if after_seg_length * 1.2 > seg_length:
+            return pf_out  # 线段间隔过近，不满足
+    else:
+        if after_seg_length > seg_length:
+            return pf_out  # 线段间隔过近，不满足
+    
+    # 检查向上线段中是否有价格突破最近高点
+    if len(down_segments) > 0:
+        down_seg_start, down_seg_end = down_segments[0]
+        up_seg_start, up_seg_end = up_segments[0]
+        if up_seg_end <= down_seg_end:
+            return pf_out  # 最近的向下线段结束位置过近，不满足
+        if down_seg_start+6 > up_seg_end:
+            return pf_out  # 最近的向上线段过短，不满足
+        i = down_seg_end
+        if i < last_k_idx:
+            while i < last_k_idx:
+                if high[i] >= latest_high:
+                    return pf_out  # 向上线段中有价格高于最近高点，不满足
+                i += 1
+
+    if last_k_idx -1 <= down_seg_end:
+        return pf_out  # 最后一根K线过近，不满足
     
     # 所有条件满足，标记信号
     pf_out[last_k_idx] = 1.0
     return pf_out
 
+def load_tdx_mapping(tdx_install_path):
+    """
+    加载通达信股票-行业、股票-指数映射关系
+    Args:
+        tdx_install_path: 通达信安装目录（如 D:/new_tdx_x/new_tdx）
+    Returns:
+        tuple: (stock_to_industry_map, stock_to_zs_map)
+               若加载失败，返回 (None, None)
+    """
+    # 构建.cfg文件路径
+    hq_cache_path = os.path.join(tdx_install_path, 'T0002', 'hq_cache')
+    tdxhy_file = os.path.join(hq_cache_path, 'tdxhy.cfg')  # 股票-行业映射文件
+    tdxzs_file = os.path.join(hq_cache_path, 'tdxzs3.cfg')  # 指数列表文件
 
+    # 初始化映射字典
+    stock_to_industry_map = None
+    stock_to_zs_map = None
+
+    # 1. 读取股票-行业映射
+    try:
+        df_hy = pd.read_csv(
+            tdxhy_file, 
+            sep='|', 
+            encoding='gbk', 
+            dtype=str, 
+            header=None, 
+            engine='python'
+        )
+        stock_to_industry_map = pd.Series(df_hy[5].values, index=df_hy[1]).to_dict()
+        logging.info(f"成功构建股票-行业映射，共 {len(stock_to_industry_map)} 条记录")
+        logging.debug(f"股票-行业映射示例（前5项）: {list(stock_to_industry_map.items())[:5]}")
+    except FileNotFoundError:
+        logging.error(f"未找到股票-行业映射文件: {tdxhy_file}，请检查通达信路径是否正确")
+    except Exception as e:
+        logging.error(f"读取股票-行业映射文件出错: {e}")
+
+    # 2. 读取股票-指数映射
+    try:
+        df_zs = pd.read_csv(
+            tdxzs_file, 
+            sep='|', 
+            header=None, 
+            dtype=str,
+            encoding='gbk', 
+            engine='python'
+        )
+        mask = df_zs[5].str.startswith('X')  # 过滤指数标识
+        filtered_series = pd.Series(df_zs.loc[mask, 5].values, index=df_zs.loc[mask, 1])
+        stock_to_zs_map = filtered_series.to_dict()
+        logging.info(f"成功构建股票-指数映射，共 {len(stock_to_zs_map)} 条记录")
+        logging.debug(f"股票-指数映射示例（前5项）: {list(stock_to_zs_map.items())[:5]}")
+    
+    except FileNotFoundError:
+        logging.error(f"未找到指数映射文件: {tdxzs_file}，请检查通达信路径是否正确")
+    except Exception as e:
+        logging.error(f"读取指数映射文件出错: {e}")
+
+    return stock_to_industry_map, stock_to_zs_map
 
 class StockDataCollector:
-    def __init__(self, blk_file_path,blk_file_path_index):
+    def __init__(self, blk_file_path, blk_file_path_index, tdx_install_path=None):
         """
         初始化股票数据收集器
         
         Args:
             blk_file_path: blk文件路径
-            redis_host: Redis主机
-            redis_port: Redis端口
-            redis_db: Redis数据库编号
+            blk_file_path_index: 指数blk文件路径
+            tdx_install_path: 通达信安装路径（可选，用于加载行业/指数映射）
         """
         self.blk_file_path = blk_file_path
         self.blk_file_path_index = blk_file_path_index
@@ -149,7 +204,13 @@ class StockDataCollector:
             ('36.153.42.16', 7709)
         ]
         
-        logging.info(f"初始化完成，共加载 {len(self.blk_file_path_index)} 只指数")
+        # 加载通达信行业/指数映射（如果传入路径）
+        self.stock_to_industry = None
+        self.stock_to_zs = None
+        if tdx_install_path:
+            self.stock_to_industry, self.stock_to_zs = load_tdx_mapping(tdx_install_path)
+        
+        logging.info(f"初始化完成，共加载 {len(self.stock_list_index)} 只指数")
         logging.info(f"初始化完成，共加载 {len(self.stock_list)} 只股票")
     
     def load_stock_list(self):
@@ -345,6 +406,15 @@ class StockDataCollector:
                 with open(file_path, 'a', encoding='utf-8') as f:
                     f.write(f"{blk_code}\n")
                 logging.info(f"成功将 {blk_code} 写入 {file_path}")
+                
+                # 可选：输出股票对应的行业/指数信息（如果映射加载成功）
+                if self.stock_to_industry and stock_code in self.stock_to_industry:
+                    industry = self.stock_to_industry[stock_code]
+                    logging.info(f"股票 {stock_code} 所属行业: {industry}")
+                if self.stock_to_zs and stock_code in self.stock_to_zs:
+                    zs_info = self.stock_to_zs[stock_code]
+                    logging.info(f"股票 {stock_code} 对应指数标识: {zs_info}")
+                    
             except Exception as e:
                 logging.error(f"写入文件 {file_path} 失败: {e}")
 
@@ -390,8 +460,18 @@ class StockDataCollector:
         # 按涨幅降序排序
         sorted_index_gains = sorted(index_gain_dict.items(), key=lambda x: x[1], reverse=True)
         # 取前30名，转为字典（map）
-        top30_index_map = dict(sorted_index_gains[:30])
-        
+        top30_index_map = dict(sorted_index_gains[:60])
+        # ===================== 新增代码开始 =====================
+        # 假设 stock_to_zs_map 是已定义的字典（key: 指数代码, value: 对应zs值）
+        # 创建新map，存储前30个指数对应的stock_to_zs_map值
+        top30_zs_map = {}
+        # 遍历sorted_index_gains前30个元素，提取指数代码并匹配stock_to_zs_map
+        for code, _ in sorted_index_gains[:60]:
+            if code in self.stock_to_zs:  # 避免KeyError，先检查键是否存在
+                top30_zs_map[self.stock_to_zs.get(code)] = code
+            else:
+                logging.warning(f"指数代码 {code} 在stock_to_zs_map中无对应值，跳过")
+        # ===================== 新增代码结束 =====================       
         # 日志输出前30名指数信息
         logging.info("="*50)
         logging.info("涨幅排名前30的板块指数：")
@@ -401,9 +481,32 @@ class StockDataCollector:
         
         for market, stock_code, full_code in self.stock_list:
             try:
+                if stock_code in self.stock_to_industry:  # 避免KeyError，先检查键是否存在
+                    industry = self.stock_to_industry.get(stock_code)
+                    if industry not in top30_zs_map:
+                        logging.debug(f"股票 {stock_code} 所属行业 {industry} 不在涨幅前30名内，跳过")
+                        continue  # 跳过该股票
+
                 # 获取股票数据（200条）
                 stock_data,stock_data_high,stock_data_low = self.get_5min_data(market, stock_code, full_code,top30_index_map)
+                # ========== 新增：判断最后一根K线涨幅逻辑 ==========
+                last_kline = stock_data[-1]  # 获取最后一根K线
+                last_kline2 = stock_data[-2]  # 获取最后一根K线
+                open_price = last_kline2['close']
+                close_price = last_kline['close']
                 
+                # 计算涨幅（避免除以零）
+                if open_price == 0:
+                    kline_gain = 0.0
+                else:
+                    kline_gain = (close_price - open_price) / open_price * 100  # 涨幅百分比
+                kline_gain = round(kline_gain, 2)
+                
+                # 涨幅大于2.4%则跳过本次循环
+                if kline_gain > 2.4 or kline_gain <= 0:
+                    logging.debug(f"股票 {full_code} 最后一根K线涨幅 {kline_gain}% > 2.4%，跳过本次循环")
+                    continue  # 跳过后续的信号判断和写入逻辑
+                # ========== 新增逻辑结束 ==========
                 if stock_data:
                     data_len = len(stock_data_high)
                     stock_data_frac =gupiaojichu.identify_turns(data_len,stock_data_high,stock_data_low)
@@ -424,12 +527,9 @@ class StockDataCollector:
                 fail_count += 1
                 logging.error(f"处理 {full_code} 时发生错误: {e}")
                 
-        
         logging.info(f"数据更新完成: 成功 {success_count}, 失败 {fail_count}")
         return success_count, fail_count
 
-
-    
     def get_stock_data_from_redis(self, full_code):
         """
         从Redis获取某只股票的所有数据
@@ -461,7 +561,6 @@ class StockDataCollector:
         Args:
             interval_seconds: 更新间隔（秒）
         """
-        
         logging.info(f"开始定时数据收集，间隔: {interval_seconds}秒")
         
         # 立即执行一次
@@ -479,31 +578,30 @@ class StockDataCollector:
         except Exception as e:
             logging.error(f"程序运行出错: {e}")
 
-
 def main():
     """
     主函数
     """
     # 配置参数
-    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\FXDXT.blk"
+    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\60RJXS.blk"
     BLOB_FILE_PATH_INDEX = r"D:\zd_hbzq\T0002\blocknew\YJSJBK.blk"
-    UPDATE_INTERVAL = 20       # 更新间隔（秒）
+    UPDATE_INTERVAL = 60       # 更新间隔（秒）
+    TDX_INSTALL_PATH = r'D:/new_tdx_x/new_tdx'  # 通达信安装路径（请修改为实际路径）
     
     # 检查blk文件是否存在
     if not os.path.exists(BLOB_FILE_PATH):
         logging.error(f"blk文件不存在: {BLOB_FILE_PATH}")
         return
     
-    # 创建并运行数据收集器
+    # 创建并运行数据收集器（传入通达信路径，加载行业/指数映射）
     collector = StockDataCollector(
         blk_file_path=BLOB_FILE_PATH,
-        blk_file_path_index=BLOB_FILE_PATH_INDEX
+        blk_file_path_index=BLOB_FILE_PATH_INDEX,
+        tdx_install_path=TDX_INSTALL_PATH  # 新增：传入通达信路径
     )
     
     # 运行收集器
     collector.run(interval_seconds=UPDATE_INTERVAL)
 
-
 if __name__ == "__main__":
     main()
-

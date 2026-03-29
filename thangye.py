@@ -5,7 +5,7 @@ from datetime import timedelta
 import os
 
 # 1. 配置路径
-file_path = '板块回测汇总结果_含总笔数2026-03-26-18-58-35_涨幅0.5-3%.xlsx'
+file_path = '板块回测汇总结果_含总笔数2026-03-29-12-02-30_涨幅0.5-3%_11点30-15点_mfi_昨日与平均线比较_3k保本.xlsx'
 output_path = '交易行情特征画像分析_纯净版.xlsx'
 
 def get_market_features(symbol, trade_date):
