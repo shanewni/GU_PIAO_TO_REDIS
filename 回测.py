@@ -48,7 +48,7 @@ class TdxStockBacktest:
         except Exception as e:
             print(f"连接失败: {e}")
             return False
-    def get_exact_tdx_30min(self, symbol, tdx_path=DEFAULT_TDX_PATH):
+    def get_exact_tdx_30min(self, symbol, tdx_path=DEFAULT_TDX_PATH, start_date=None, end_date=None):
         """
         从本地通达信数据读取并合成精准30分钟K线
         :param symbol: 股票代码
@@ -97,10 +97,16 @@ class TdxStockBacktest:
         # 5. 最后修正一遍精度
         df_30m[price_cols] = df_30m[price_cols].round(2)
         df_30m.index.name = 'datetime'
-        print(f"成功从本地读取 {symbol} 30分钟数据，共 {len(df_30m)} 条")
+        # --- 新增：时间段过滤 ---
+        if start_date:
+            df_30m = df_30m[df_30m.index >= pd.to_datetime(start_date)]
+        if end_date:
+            df_30m = df_30m[df_30m.index <= pd.to_datetime(end_date)]
+            
+        print(f"成功合成 {symbol} 30min数据，时间段：{start_date or '不限'} - {end_date or '不限'}，共 {len(df_30m)} 条")
         return df_30m
     
-    def get_local_day_data(self, symbol, tdx_path=DEFAULT_TDX_PATH):
+    def get_local_day_data(self, symbol, tdx_path=DEFAULT_TDX_PATH, start_date=None, end_date=None):
         """
         从本地通达信数据读取日线
         :param symbol: 股票代码
@@ -120,14 +126,18 @@ class TdxStockBacktest:
             'close': '收盘价', 'volume': '成交量', 'amount': '成交额'
         })
         
-        # 精度修正
+        df_day.index = pd.to_datetime(df_day.index)
+            
+        # --- 新增：时间段过滤逻辑 ---
+        if start_date:
+            df_day = df_day[df_day.index >= pd.to_datetime(start_date)]
+        if end_date:
+            df_day = df_day[df_day.index <= pd.to_datetime(end_date)]
+        
         price_cols = ['开盘价', '最高价', '最低价', '收盘价']
         df_day[price_cols] = df_day[price_cols].round(2)
         
-        # 设置索引为datetime
-        df_day.index = pd.to_datetime(df_day.index)
-        
-        print(f"成功从本地读取 {symbol} 日线数据，共 {len(df_day)} 条")
+        print(f"成功读取 {symbol} 日线({start_date or '起点'}至{end_date or '至今'})，共 {len(df_day)} 条")
         return df_day
         
     def get_stock_k_data(self, code: str, start: int = 0, count: int = 1000, ktype: int = 9) -> pd.DataFrame:
@@ -188,7 +198,7 @@ class TdxStockBacktest:
         }
         return ktype_map.get(ktype, f'未知周期({ktype})')
     
-    def get_multi_period_data(self, code: str, count: int = 800, use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH) -> Dict[str, pd.DataFrame]:
+    def get_multi_period_data(self, code: str, count: int = 800, use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH, start_date=None, end_date=None) -> Dict[str, pd.DataFrame]:
         """
         一键获取日线+30分钟线数据（支持本地/联网切换）
         :param code: 股票代码
@@ -201,8 +211,8 @@ class TdxStockBacktest:
         
         if use_local:
             # 本地模式：读取本地数据
-            day_data = self.get_local_day_data(code, tdx_path)
-            min30_data = self.get_exact_tdx_30min(code, tdx_path)
+            day_data = self.get_local_day_data(code, tdx_path, start_date, end_date)
+            min30_data = self.get_exact_tdx_30min(code, tdx_path, start_date, end_date)
             
             # 提取高低价列表
             min30_high = min30_data['最高价'].astype(float).tolist() if not min30_data.empty else []
@@ -804,7 +814,7 @@ class TdxStockBacktest:
     
     def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
                      commission: float = 0.0003, stop_loss_ratio: float = 0.01,
-                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH, start_date=None, end_date=None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
         """
         执行三买变体策略回测（30分钟周期）
         升级：返回单股票交易明细列表，用于总笔数汇总
@@ -833,7 +843,7 @@ class TdxStockBacktest:
                 return pd.DataFrame(), {}, []
         
         # 获取多周期数据（自动切换本地/联网）
-        multi_data = self.get_multi_period_data(code, count=800, use_local=use_local, tdx_path=tdx_path)
+        multi_data = self.get_multi_period_data(code, count=800, use_local=use_local, tdx_path=tdx_path, start_date=start_date, end_date=end_date)
         day_data = multi_data['day']
         min30_data = multi_data['30min']
         min30_high = multi_data['30min_high_list']
@@ -1177,7 +1187,9 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 commission=commission,
                 stop_loss_ratio=stop_loss_ratio,
                 use_local=True  ,# 统一使用联网模式获取数据
-                tdx_path=DEFAULT_TDX_PATH
+                tdx_path=DEFAULT_TDX_PATH,
+                start_date='2024-01-01',
+                end_date='2025-04-02'
             )
             if metrics:  # 仅保留有有效指标的股票
                 metrics['股票代码'] = code
