@@ -889,7 +889,7 @@ class TdxStockBacktest:
             current_time = datetime.time()
             red = close_price > row['开盘价']
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
-            if row['signal'] == 1 and cash > close_price and not self.in_position and red and current_time >= pd.Timestamp('13:00').time():
+            if row['signal'] == 1 and cash > close_price and not self.in_position and red and current_time >= pd.Timestamp('13:40').time() and current_time < pd.Timestamp('14:20').time():
                 # 3. 原有的止损价计算逻辑
                 if current_idx > 0:
                     prev_close = data['最高价'].iloc[current_idx - 1]
@@ -1189,7 +1189,7 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 use_local=True  ,# 统一使用联网模式获取数据
                 tdx_path=DEFAULT_TDX_PATH,
                 start_date='2024-01-01',
-                end_date='2025-04-02'
+                end_date='2026-04-02'
             )
             if metrics:  # 仅保留有有效指标的股票
                 metrics['股票代码'] = code
