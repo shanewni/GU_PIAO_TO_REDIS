@@ -722,7 +722,8 @@ class TdxStockBacktest:
             day_df['mfi'] = self.calculate_mfi(day_df, n=14)
             day_df['mfi_ref1'] = day_df['mfi'].shift(1)
             day_df['mfi_avg_3d'] = (day_df['mfi'].shift(2) + day_df['mfi'].shift(3) + day_df['mfi'].shift(4)) / 3
-            day_df['mfi_valid'] = day_df['mfi_ref1'] > day_df['mfi_avg_3d']
+            # day_df['mfi_valid'] = day_df['mfi_ref1'] > day_df['mfi_avg_3d']
+            day_df['mfi_valid'] = True
 
             # 提取日期列用于合并（假设 index 是 datetime）
             day_df['date_key'] = day_df.index.date
@@ -788,8 +789,8 @@ class TdxStockBacktest:
                             pass
                         else:
                             # 高于或等于买入价，移动止损到成本价
-                            current_stop_loss = max(current_stop_loss, buy_price)
-                            # pass
+                            # current_stop_loss = max(current_stop_loss, buy_price)
+                            pass
 
                     min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
                     data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss # 记录当前止损价，便于调试和分析
@@ -1188,7 +1189,7 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 stop_loss_ratio=stop_loss_ratio,
                 use_local=True  ,# 统一使用联网模式获取数据
                 tdx_path=DEFAULT_TDX_PATH,
-                start_date='2025-12-01',
+                start_date='2023-12-01',
                 end_date='2026-05-28'
             )
             if metrics:  # 仅保留有有效指标的股票
