@@ -15,7 +15,7 @@ warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
 # BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST2.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -693,14 +693,14 @@ class TdxStockBacktest:
         return False, ""   
     
     def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
-        data = min30_data.copy()
+        data = day_df.copy()
         # 计算30分钟MA60
         data['ma60'] = data['收盘价'].rolling(window=60).mean()
         
         close_list = data['收盘价'].tolist()
         open_list = data['开盘价'].tolist()
-        high_list = min30_high
-        low_list = min30_low
+        high_list = data['最高价'].tolist()
+        low_list = data['最低价'].tolist()
         ma60_list = data['ma60'].tolist()
         
         data['signal'] = 0
@@ -885,9 +885,10 @@ class TdxStockBacktest:
                 # 这里的 active_stop_loss 包含了你新加的“第三根K线移位”后的价格
                 self.stop_loss_price = row['active_stop_loss']
             # 获取当前时间点
-            current_time = datetime.time()
+            # current_time = datetime.time()
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
-            if row['signal'] == 1 and cash > close_price and not self.in_position and current_time >= pd.Timestamp('03:40').time() and current_time < pd.Timestamp('17:20').time():
+            # if row['signal'] == 1 and cash > close_price and not self.in_position and current_time >= pd.Timestamp('03:40').time() and current_time < pd.Timestamp('17:20').time():
+            if row['signal'] == 1 and cash > close_price and not self.in_position:
                 self.stop_loss_price = row['active_stop_loss']
                 
                 # 4. 以损定量：计算可买数量
