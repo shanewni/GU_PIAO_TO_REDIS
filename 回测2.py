@@ -14,8 +14,8 @@ from collections import defaultdict, deque
 warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
-# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
+# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST2.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -694,10 +694,8 @@ class TdxStockBacktest:
     
     def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
         data = min30_data.copy()
-        data.index.name = 'datetime'
-        
-        # 1. 计算基础指标：30分钟MA60
-        data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
+        # 计算30分钟MA60
+        data['ma60'] = data['收盘价'].rolling(window=60).mean()
         
         close_list = data['收盘价'].tolist()
         open_list = data['开盘价'].tolist()
@@ -705,91 +703,110 @@ class TdxStockBacktest:
         low_list = min30_low
         ma60_list = data['ma60'].tolist()
         
-        # 预计算全量转折点（底分型标记为 -1.0）
-        all_frac = gupiaojichu.identify_turns(len(high_list), high_list, low_list)
-        
-        # 2. 初始化信号字段
         data['signal'] = 0
         data['sell_reason'] = ""
-        data['active_stop_loss'] = 0.0  # 核心修复：确保回测循环能读取到此字段
-        
+        data['active_stop_loss'] = 0.0 
+         
         in_pos = False
         buy_price = 0.0
         buy_idx = 0
         current_stop_loss = 0.0
         
-        # 存储卖出参考信息
-        down_swing_price_diff = 0.0 
-        down_swing_k_count = 0      
+        # 存储比例止盈相关的变量
+        target_profit_ratio = 0.0  # 前笔下跌比例
+        down_swing_k_count = 0      # 前笔K线数量
+        window_size = 300
 
         for i in range(len(data)):
             current_idx_time = data.index[i]
-            
+            if i < 60: continue
+
             if not in_pos:
-                # --- 买入逻辑修改 ---
-                # 寻找最近的一个底分型
-                last_bottom_idx = -1
-                for search_idx in range(i-1, max(-1, i-5), -1):
-                    if all_frac[search_idx] == -1.0:
-                        last_bottom_idx = search_idx
+                # --- 逐K计算窗口，规避未来函数 ---
+                start_idx = max(0, i - window_size)
+                w_high = high_list[start_idx:i+1]
+                w_low = low_list[start_idx:i+1]
+                
+                # 识别分型
+                window_turns = gupiaojichu.identify_turns(len(w_high), w_high, w_low)
+                
+                # 寻找最近底分型
+                last_bottom_rel = -1
+                for rel_idx in range(len(window_turns)-1, -1, -1):
+                    if window_turns[rel_idx] == -1.0:
+                        last_bottom_rel = rel_idx
                         break
                 
-                if last_bottom_idx != -1:
+                if last_bottom_rel != -1:
+                    last_bottom_idx = start_idx + last_bottom_rel
                     dist = i - last_bottom_idx
-                    # 规则：底分型出现后的前三根K线内
-                    if 1 <= dist <= 3:
-                        # 条件1：收盘在MA60上方
-                        cond_ma = close_list[i] > ma60_list[i]
-                        # 条件2：阳线
-                        cond_red = close_list[i] > open_list[i]
-                        # 条件3：涨幅 [0.5%, 3%]
-                        pct_chg = (close_list[i] - open_list[i]) / open_list[i]
-                        cond_pct = 0.005 <= pct_chg <= 0.03
+                    
+                    # 包含底分型在内的前三根 (0, 1, 2)
+                    if 0 <= dist <= 2:
+                        # 寻找笔起点（前一个顶分型）
+                        last_top_rel = -1
+                        for rel_t in range(last_bottom_rel - 1, -1, -1):
+                            if window_turns[rel_t] == 1.0:
+                                last_top_rel = rel_t
+                                break
                         
-                        if cond_ma and cond_red and cond_pct:
-                            data.loc[current_idx_time, 'signal'] = 1
-                            in_pos = True
-                            buy_price = close_list[i]
-                            buy_idx = i
+                        if last_top_rel != -1:
+                            last_top_idx = start_idx + last_top_rel
                             
-                            # 初始止损：min(买入K最低点, 买入K前一根最高点)
+                            # 1. 位置判定：前笔跨越MA60
+                            cond_range = (high_list[last_top_idx] > ma60_list[last_top_idx] and 
+                                          low_list[last_bottom_idx] < ma60_list[last_bottom_idx])
+                            
+                            # 2. 强度判定：笔内收盘均值 > 笔内MA60均值
+                            swing_close_avg = np.mean(close_list[last_top_idx : last_bottom_idx + 1])
+                            swing_ma60_avg = np.mean(ma60_list[last_top_idx : last_bottom_idx + 1])
+                            cond_intensity = swing_close_avg > swing_ma60_avg
+                            
+                            # 3. 当前K线形态过滤
+                            cond_ma = close_list[i] > ma60_list[i]
+                            cond_red = close_list[i] > open_list[i]
+                            
+
+                            # 止损：min(买入K最低, 买入前一根最高)
                             prev_high = high_list[i-1] if i > 0 else high_list[i]
                             current_stop_loss = min(low_list[i], prev_high)
+                            pct_chg = (close_list[i] - current_stop_loss) / current_stop_loss
+                            cond_pct = 0.005 <= pct_chg <= 0.03
                             
-                            # 获取前一个下跌笔信息用于止盈
-                            last_top_idx = -1
-                            for t_idx in range(last_bottom_idx-1, -1, -1):
-                                if all_frac[t_idx] == 1.0:
-                                    last_top_idx = t_idx
-                                    break
-                            if last_top_idx != -1:
-                                down_swing_price_diff = high_list[last_top_idx] - low_list[last_bottom_idx]
+                            if cond_range and cond_intensity and cond_ma and cond_red and cond_pct:
+                                data.loc[current_idx_time, 'signal'] = 1
+                                in_pos = True
+                                buy_price = close_list[i]
+                                buy_idx = i
+                                
+                                # --- 计算前笔跌幅比例 ---
+                                # 跌幅比例 = (顶价 - 底价) / 顶价
+                                top_price = high_list[last_top_idx]
+                                bot_price = low_list[last_bottom_idx]
+                                target_profit_ratio = (top_price - bot_price) / top_price
                                 down_swing_k_count = last_bottom_idx - last_top_idx
-                            else:
-                                down_swing_price_diff = 999.0
-                                down_swing_k_count = 999
             else:
-                # --- 卖出逻辑修改 ---
+                # --- 卖出逻辑 ---
                 # 1. 止损检查
                 if low_list[i] < current_stop_loss:
                     data.loc[current_idx_time, 'signal'] = -1
-                    data.loc[current_idx_time, 'sell_reason'] = f"止损:跌破{current_stop_loss:.2f}"
+                    data.loc[current_idx_time, 'sell_reason'] = f"止损"
                     in_pos = False
-                
-                # 2. 止盈检查
                 else:
                     hold_count = i - buy_idx
-                    current_profit = close_list[i] - buy_price
-                    # 规则：达到下跌笔涨幅 或 达到下跌笔K线数2倍
-                    cond_profit_space = current_profit >= down_swing_price_diff
-                    cond_profit_time = hold_count >= (down_swing_k_count * 2)
+                    # 计算当前涨幅比例 (基于买入价)
+                    current_gain_ratio = (high_list[i] - buy_price) / buy_price
                     
-                    if cond_profit_space or cond_profit_time:
+                    # 2. 比例止盈 或 时间止盈
+                    cond_profit_ratio = current_gain_ratio >= target_profit_ratio
+                    cond_profit_time = hold_count >= (down_swing_k_count * 1.3)
+                    
+                    if cond_profit_ratio or cond_profit_time:
                         data.loc[current_idx_time, 'signal'] = -1
-                        data.loc[current_idx_time, 'sell_reason'] = "空间止盈" if cond_profit_space else "时间止盈"
+                        data.loc[current_idx_time, 'sell_reason'] = "比例止盈" if cond_profit_ratio else "时间止盈"
                         in_pos = False
             
-            # 每一根K线都记录当前的执行止损价，供 run_backtest 使用
+            # 同步更新止损价字段，防止回测主循环报错
             data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss if in_pos else 0.0
             
         return data
