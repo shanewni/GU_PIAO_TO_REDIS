@@ -28,6 +28,7 @@ class TdxStockBacktest:
         self.backtest_result = None  # 存储回测结果
         self.trade_records = None  # 交易记录
         self.stop_loss_price = 0.0  # 止损价格（买入K线的最低点）
+        self.zhiying_sell = 0.0  # 止损价格（买入K线的最低点）
         self.in_position = False    # 是否持仓标记
         self.stop_loss_ratio = 0.02 # 新增：总资金止损百分比（默认2%）
         self.risk_per_trade = 0.0   # 新增：单笔交易可承受的最大亏损金额
@@ -698,25 +699,26 @@ class TdxStockBacktest:
         day_df = day_df.copy()
         day_df.index.name = 'datetime'
         
-        # 预计算30分钟基础指标
         buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
         data['buy_signal'] = buy_signals
-        data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
         
         close_list = data['收盘价'].tolist()
-        ma60_list = data['ma60'].tolist()
         high_list = min30_high
         low_list = min30_low
         
         # 状态机变量
         data['signal'] = 0
         data['sell_reason'] = ""
+        data['active_stop_loss'] = 0.0
+        data['zhiying_sell'] = 0.0
         in_pos = False
-        buy_price = 0.0
-        buy_idx = 0
         current_stop_loss = 0.0
+        target_take_profit = 0.0
         
-        # 预转换日线数据为列表，加速循环内切片访问
+        # 新增：记录下跌笔K线数和底分型位置
+        down_stroke_len = 0
+        day_bottom_idx = 0
+        
         day_high = day_df['最高价'].tolist()
         day_low = day_df['最低价'].tolist()
         day_dates = day_df.index.date.tolist()
@@ -725,99 +727,74 @@ class TdxStockBacktest:
             current_idx_time = data.index[i]
             current_date = current_idx_time.date()
             
+            # 定位当前时刻可见的最新日线索引
+            day_end_idx = 0
+            for d_idx, d_date in enumerate(day_dates):
+                if d_date < current_date:
+                    day_end_idx = d_idx + 1
+                else:
+                    break
+
             if not in_pos:
-                # 触发30分钟初步信号
                 if data['buy_signal'].iloc[i] == 1.0:
-                    
-                    # --- [核心修改：动态日线笔条件校验] ---
-                    # 1. 截取当前30min K线时刻可见的日线数据 (不包含当天或仅包含当天之前的日线)
-                    # 严格逻辑：起爆时我们只能看到前一天的日线笔结论
-                    day_end_idx = 0
-                    for d_idx, d_date in enumerate(day_dates):
-                        if d_date < current_date:
-                            day_end_idx = d_idx + 1
-                        else:
-                            break
-                    
-                    if day_end_idx < 10: # 数据太少不足以画笔
-                        continue
+                    if day_end_idx < 5: continue
 
                     slice_high = day_high[:day_end_idx]
                     slice_low = day_low[:day_end_idx]
-                    
-                    # 2. 计算日线转折点
                     day_frac = gupiaojichu.identify_turns(len(slice_high), slice_high, slice_low)
                     
-                    # 3. 寻找最近的日线下跌笔 (最近的顶和最近的底，且顶在底之前)
-                    last_top_price = 0.0
-                    last_bottom_price = 0.0
-                    found_down_stroke = False
+                    last_top_idx = -1
+                    last_bottom_idx = -1
                     
-                    # 逆序找最近的底
-                    tmp_bottom_idx = -1
+                    # 逆序寻找最近的下降笔
                     for j in range(len(day_frac)-1, -1, -1):
                         if day_frac[j] == -1.0:
-                            tmp_bottom_idx = j
-                            last_bottom_price = slice_low[j]
+                            last_bottom_idx = j
                             break
                     
-                    # 在底之前找最近的顶
-                    if tmp_bottom_idx > 0:
-                        for j in range(tmp_bottom_idx-1, -1, -1):
+                    if last_bottom_idx > 0:
+                        for j in range(last_bottom_idx-1, -1, -1):
                             if day_frac[j] == 1.0:
-                                last_top_price = slice_high[j]
-                                found_down_stroke = True
+                                last_top_idx = j
                                 break
                     
-                    if not found_down_stroke:
-                        continue # 未找到完整的日线下跌笔，过滤
-                    
-                    # 4. 计算50%分位价格和空间校验
-                    mid_price = (last_top_price + last_bottom_price) / 2
-                    p_close = close_list[i]
-                    
-                    # 计算止损价 (逻辑同原有：当前K最低与前一K最高取小)
-                    p_stop = min(low_list[i], high_list[i-1]) if i > 0 else low_list[i]
-                    
-                    # 核心判定公式：(中轨 - 收盘价) > (收盘价 - 止损价)
-                    dist_to_mid = mid_price - p_close
-                    dist_to_stop = p_close - p_stop
-                    
-                    if dist_to_mid > dist_to_stop:
-                        # 满足条件，允许买入
-                        data.loc[current_idx_time, 'signal'] = 1
-                        in_pos = True
-                        buy_price = p_close
-                        buy_idx = i
-                        current_stop_loss = p_stop
-                        # print(f"日线过滤通过: 中轨{mid_price:.2f}, 现价{p_close:.2f}, 空间{dist_to_mid:.2f} > 风险{dist_to_stop:.2f}")
+                    if last_top_idx != -1 and last_bottom_idx != -1:
+                        mid_price = (slice_high[last_top_idx] + slice_low[last_bottom_idx]) / 2
+                        p_close = close_list[i]
+                        p_stop = min(low_list[i], high_list[i-1]) if i > 0 else low_list[i]
+                        
+                        if (mid_price - p_close) > (p_close - p_stop):
+                            data.loc[current_idx_time, 'signal'] = 1
+                            in_pos = True
+                            current_stop_loss = p_stop
+                            target_take_profit = mid_price
+                            # --- 记录笔长度逻辑 ---
+                            down_stroke_len = last_bottom_idx - last_top_idx
+                            day_bottom_idx = last_bottom_idx 
                 
-            else:       
-                # A. 止损检查
+            else:
+                # 1. 检查止损
                 if low_list[i] <= current_stop_loss:
                     data.loc[current_idx_time, 'signal'] = -1
-                    data.loc[current_idx_time, 'sell_reason'] = f"触发止损(当前止损价:{current_stop_loss})"
+                    data.loc[current_idx_time, 'sell_reason'] = f"止损:{current_stop_loss}"
+                    data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
+                    in_pos = False
+                    continue
+                
+                # 2. 检查价格止盈
+                if high_list[i] >= target_take_profit:
+                    data.loc[current_idx_time, 'signal'] = -1
+                    data.loc[current_idx_time, 'sell_reason'] = f"止盈位:{target_take_profit:.2f}"
+                    data.loc[current_idx_time, 'zhiying_sell'] = target_take_profit
                     in_pos = False
                     continue
 
-                # B. 动态卖出检查
-                min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
-                data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
-                
-                is_sell, reason = self.check_dynamic_sell_condition(
-                    current_idx=i,
-                    high_full=high_list,
-                    low_full=low_list,
-                    close_full=close_list,
-                    ma60_full=ma60_list,
-                    buy_price=buy_price,
-                    buy_idx=buy_idx,
-                    min30_frac=min30_frac
-                )
-                
-                if is_sell:
+                # 3. 检查时间/笔长度限制（新增条件）
+                # 计算从日线底分型到现在经过的日线K线数量
+                current_up_len = day_end_idx - day_bottom_idx
+                if current_up_len > down_stroke_len:
                     data.loc[current_idx_time, 'signal'] = -1
-                    data.loc[current_idx_time, 'sell_reason'] = reason
+                    data.loc[current_idx_time, 'sell_reason'] = f"时间卖出:向上笔K线数({current_up_len}) > 向下笔({down_stroke_len})"
                     in_pos = False
 
         return data
@@ -880,6 +857,7 @@ class TdxStockBacktest:
         
         # 止损相关初始化
         self.stop_loss_price = 0.0
+        self.zhiying_sell = 0.0
         self.in_position = False
         
         # 逐行执行回测
@@ -890,16 +868,19 @@ class TdxStockBacktest:
             close_price = row['收盘价']
             current_total_asset = cash + position * close_price
             current_idx = data.index.get_loc(datetime)  # 当前K线索引
-
+            settle_price = close_price
+            signal = row['signal']
             # 核心修改：实时更新回测器手中的止损价
             if self.in_position:
                 # 这里的 active_stop_loss 包含了你新加的“第三根K线移位”后的价格
                 self.stop_loss_price = row['active_stop_loss']
+            if signal == -1:
+                self.zhiying_sell = row['zhiying_sell']
             # 获取当前时间点
             current_time = datetime.time()
             red = close_price > row['开盘价']
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
-            if row['signal'] == 1 and cash > close_price and not self.in_position and red and current_time >= pd.Timestamp('03:40').time() and current_time < pd.Timestamp('17:20').time():
+            if signal == 1 and cash > close_price and not self.in_position and red and current_time >= pd.Timestamp('03:40').time() and current_time < pd.Timestamp('17:20').time():
                 # 3. 原有的止损价计算逻辑
                 if current_idx > 0:
                     prev_close = data['最高价'].iloc[current_idx - 1]
@@ -959,11 +940,14 @@ class TdxStockBacktest:
                     print(f"【买入失败】{datetime} - 以损定量计算可买数量为0（止损价{self.stop_loss_price} >= 买入价{close_price}）")
             
             # ===== 正常卖出信号执行 =====
-            elif row['signal'] == -1 and position > 0:
+            elif signal == -1 and position > 0:
                 # 获取当前K线索引（第几根K线）
                 current_kline_idx = data.index.get_loc(datetime) + 1  # 从1开始计数
                 # 获取卖出原因
                 sell_reason = row['sell_reason'] if 'sell_reason' in row else "未知原因"
+                if sell_reason == "止盈位":
+                    close_price = self.zhiying_sell  # 使用止盈价进行盈亏计算
+                    settle_price = self.zhiying_sell
                 
                 # 卖出全部持仓
                 sell_num = position
@@ -1001,6 +985,7 @@ class TdxStockBacktest:
                 buy_price = 0
                 buy_fee = 0
                 self.stop_loss_price = 0.0
+                self.zhiying_sell = 0.0
                 self.in_position = False
                 # buy_kline_low = 0.0
                 self.risk_per_trade = 0.0
@@ -1011,10 +996,11 @@ class TdxStockBacktest:
                 print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际盈亏比例:{pnl/self.buy_in_total_asset*100:.2f}%")
             
             # 计算当前总资产
-            total_asset = cash + position * close_price
+            current_valuation_price = settle_price if signal == -1 else close_price
+            total_asset = cash + position * current_valuation_price
             daily_results.append({
                 '时间': datetime,
-                '收盘价': close_price,
+                '收盘价': current_valuation_price,
                 '持仓数量': position,
                 '可用现金': cash,
                 '总资产': total_asset,
