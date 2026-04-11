@@ -15,7 +15,7 @@ warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
 # BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST2.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -759,18 +759,28 @@ class TdxStockBacktest:
                                 break
                     
                     if last_top_idx != -1 and last_bottom_idx != -1:
-                        mid_price = (slice_high[last_top_idx] + slice_low[last_bottom_idx]) / 2
+                        # 1. 修正笔长度计算逻辑
+                        # 向下笔长度 = 顶到低点的距离 (包含两端)
+                        down_stroke_len = last_bottom_idx - last_top_idx
+                        # 当前向上笔长度 = 从底分型后一根开始算起到最新日线
+                        current_up_len = day_end_idx - last_bottom_idx
+
+                        # 2. 新增买入限制：买入时日线向上笔不能大于前向下笔K线数量
+                        if current_up_len > down_stroke_len:
+                            continue # 跳过信号，不执行买入
+
+                        mid_price = ((slice_high[last_top_idx] - slice_low[last_bottom_idx]) / 2)+slice_low[last_bottom_idx]
                         p_close = close_list[i]
                         p_stop = min(low_list[i], high_list[i-1]) if i > 0 else low_list[i]
                         
-                        if (mid_price - p_close) > (p_close - p_stop):
+                        if (mid_price - p_close) >= (p_close - p_stop)*4:
                             data.loc[current_idx_time, 'signal'] = 1
                             in_pos = True
                             current_stop_loss = p_stop
                             target_take_profit = mid_price
-                            # --- 记录笔长度逻辑 ---
-                            down_stroke_len = last_bottom_idx - last_top_idx
-                            day_bottom_idx = last_bottom_idx 
+                            # 记录买入时的笔数据
+                            self.down_stroke_len_at_buy = down_stroke_len
+                            self.day_bottom_idx_at_buy = last_bottom_idx
                 
             else:
                 # 1. 检查止损
@@ -789,12 +799,11 @@ class TdxStockBacktest:
                     in_pos = False
                     continue
 
-                # 3. 检查时间/笔长度限制（新增条件）
-                # 计算从日线底分型到现在经过的日线K线数量
-                current_up_len = day_end_idx - day_bottom_idx
-                if current_up_len > down_stroke_len:
+                # 5. 检查时间/笔长度卖出限制
+                current_up_len = day_end_idx - self.day_bottom_idx_at_buy
+                if current_up_len > self.down_stroke_len_at_buy:
                     data.loc[current_idx_time, 'signal'] = -1
-                    data.loc[current_idx_time, 'sell_reason'] = f"时间卖出:向上笔K线数({current_up_len}) > 向下笔({down_stroke_len})"
+                    data.loc[current_idx_time, 'sell_reason'] = f"时间卖出:向上笔K线数({current_up_len}) > 向下笔({self.down_stroke_len_at_buy})"
                     in_pos = False
 
         return data
@@ -945,7 +954,7 @@ class TdxStockBacktest:
                 current_kline_idx = data.index.get_loc(datetime) + 1  # 从1开始计数
                 # 获取卖出原因
                 sell_reason = row['sell_reason'] if 'sell_reason' in row else "未知原因"
-                if sell_reason == "止盈位":
+                if "止盈位" in sell_reason:
                     close_price = self.zhiying_sell  # 使用止盈价进行盈亏计算
                     settle_price = self.zhiying_sell
                 
