@@ -14,8 +14,8 @@ from collections import defaultdict, deque
 warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
-# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST2.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
+# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -263,6 +263,31 @@ class TdxStockBacktest:
         # 每一行（每一个30分钟时间点）进行全成员排名
         rps_df = extrs_df.rank(axis=1, pct=True, ascending=True) * 100
         return rps_df
+    
+    @staticmethod
+    def calculate_multi_period_rps(all_stocks_day_data: Dict[str, pd.DataFrame]) -> Dict[int, pd.DataFrame]:
+        """
+        计算多个周期的日线 RPS 矩阵
+        :param all_stocks_day_data: {股票代码: 日线DataFrame}
+        :return: {周期: RPS矩阵DataFrame}
+        """
+        periods = [60, 120, 250]
+        rps_results = {}
+        
+        for n in periods:
+            returns_dict = {}
+            for code, df in all_stocks_day_data.items():
+                if len(df) < n: continue
+                # 计算 N 日涨幅
+                returns_dict[code] = df['收盘价'].pct_change(n)
+            
+            if not returns_dict: continue
+            
+            # 转换为 DataFrame 并计算横向百分比排名
+            returns_df = pd.DataFrame(returns_dict)
+            rps_results[n] = returns_df.rank(axis=1, pct=True) * 100
+            
+        return rps_results
     
     def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
         """
@@ -693,7 +718,7 @@ class TdxStockBacktest:
         if cond_pattern: return True, pattern_reason
         return False, ""   
     
-    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
+    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float], rps_context=None,code=None) -> pd.DataFrame:
         data = min30_data.copy()
         data.index.name = 'datetime'
         day_df = day_df.copy()
@@ -739,6 +764,20 @@ class TdxStockBacktest:
                 if data['buy_signal'].iloc[i] == 1.0:
                     if day_end_idx < 5: continue
 
+                    # === 新增 RPS 强过滤逻辑 ===
+                    if rps_context and day_end_idx != -1:
+                        prev_date_str = day_dates[day_end_idx-1] # 前一日日期
+                        try:
+                            # 检查 60, 120, 250 三条线是否都 > 80
+                            r60 = rps_context[60].loc[pd.Timestamp(prev_date_str), code]
+                            # r120 = rps_context[120].loc[pd.Timestamp(prev_date_str), code]
+                            # r250 = rps_context[250].loc[pd.Timestamp(prev_date_str), code]
+                            
+                            # if r60 >= 80 or r120 >= 80 or r250 >= 80:
+                                # continue # 强度不足，放弃该信号
+                        except KeyError:
+                            continue # 缺少 RPS 数据，跳过
+
                     slice_high = day_high[:day_end_idx]
                     slice_low = day_low[:day_end_idx]
                     day_frac = gupiaojichu.identify_turns(len(slice_high), slice_high, slice_low)
@@ -769,11 +808,11 @@ class TdxStockBacktest:
                         if current_up_len > down_stroke_len:
                             continue # 跳过信号，不执行买入
 
-                        mid_price = ((slice_high[last_top_idx] - slice_low[last_bottom_idx]) / 2)+slice_low[last_bottom_idx]
+                        mid_price = (slice_high[last_top_idx] + slice_low[last_bottom_idx]) / 2
                         p_close = close_list[i]
                         p_stop = min(low_list[i], high_list[i-1]) if i > 0 else low_list[i]
                         
-                        if (mid_price - p_close) >= (p_close - p_stop)*4:
+                        if (mid_price - p_close) >= (p_close - p_stop)*4 and (mid_price-p_close)/p_close >= 0.1:
                             data.loc[current_idx_time, 'signal'] = 1
                             in_pos = True
                             current_stop_loss = p_stop
@@ -810,7 +849,7 @@ class TdxStockBacktest:
     
     def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
                      commission: float = 0.0003, stop_loss_ratio: float = 0.01,
-                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH, start_date=None, end_date=None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH, start_date=None, end_date=None,rps_context=None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
         """
         执行三买变体策略回测（30分钟周期）
         升级：返回单股票交易明细列表，用于总笔数汇总
@@ -850,7 +889,7 @@ class TdxStockBacktest:
             return pd.DataFrame(), {}, []
         
         # 生成策略信号
-        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low)
+        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low, rps_context=rps_context, code=code)
         
         # 初始化止损百分比
         self.stop_loss_ratio = stop_loss_ratio
@@ -1182,6 +1221,16 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
     all_metrics = []
     all_trades_detail = []  # 存储所有股票的交易明细
 
+
+    # 1. 预加载所有股票的日线数据用于 RPS 计算
+    all_day_data = {}
+    for code in stock_codes:
+        df = backtest.get_local_day_data(code, start_date='2020-01-01', end_date='2027-05-28') # 需提前足够长以计算 RPS250
+        if not df.empty:
+            all_day_data[code] = df
+
+    # 2. 计算全局 RPS 矩阵
+    global_rps = TdxStockBacktest.calculate_multi_period_rps(all_day_data)
     # 逐只股票回测
     for idx, code in enumerate(stock_codes):
         print(f"\n------------------- 进度 {idx+1}/{len(stock_codes)} -------------------")
@@ -1194,7 +1243,8 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 use_local=True  ,# 统一使用联网模式获取数据
                 tdx_path=DEFAULT_TDX_PATH,
                 start_date='2023-12-01',
-                end_date='2026-05-28'
+                end_date='2026-05-28',
+                rps_context=global_rps
             )
             if metrics:  # 仅保留有有效指标的股票
                 metrics['股票代码'] = code
