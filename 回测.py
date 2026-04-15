@@ -692,6 +692,124 @@ class TdxStockBacktest:
         if cond_pattern: return True, pattern_reason
         return False, ""   
     
+    def prepare_index_data(self, start_date, end_date, tdx_path):
+        """
+        新增：预先计算大盘指数（上证、深证成长）的过滤信号
+        """
+        print("\n" + "="*50)
+        print("开始获取并计算大盘指数过滤信号...")
+        
+        # 尝试获取指数数据 (通达信本地数据中，上证通常为 sh000001，深证成长可使用 sz399326 或 创业板 sz399006)
+        try:
+            sh_df = self.get_exact_tdx_30min('999999', tdx_path, start_date, end_date)
+            # 注：深证成长指数官方代码为 399326。如果你本地没有下载该指数的5分钟线，可以替换为常用的创业板指 'sz399006'
+            sz_df = self.get_exact_tdx_30min('399001', tdx_path, start_date, end_date) 
+        except Exception as e:
+            print(f"获取指数数据异常: {e}。请确保本地已下载 sh000001 和 sz399326 的5分钟数据！")
+            sh_df, sz_df = pd.DataFrame(), pd.DataFrame()
+
+        if sh_df.empty or sz_df.empty:
+            print("警告：大盘数据获取失败或不完整，回测将不会产生任何买入！")
+
+        # 计算单指数达标状态
+        print("正在计算上证指数状态...")
+        sh_sigs = self._calc_single_index_signal(sh_df)
+        print("正在计算深证成长指数状态...")
+        sz_sigs = self._calc_single_index_signal(sz_df)
+        
+        # 对齐时间，生成综合风险倍数字典
+        self.index_multiplier = pd.Series(0.0, index=sh_df.index) if not sh_df.empty else pd.Series(dtype=float)
+        
+        for dt in self.index_multiplier.index:
+            score = 0.0
+            if dt in sh_sigs and sh_sigs[dt] == 1:
+                score += 0.5  # 达标一个，给 50% 权重
+            if dt in sz_sigs and sz_sigs[dt] == 1:
+                score += 0.5  # 达标另一个，再加 50% 权重
+            self.index_multiplier[dt] = score
+            
+        print("大盘指数信号计算完成！")
+        print("="*50 + "\n")
+
+    def _calc_single_index_signal(self, df):
+        """
+        最终修正版：严格遵循“有效突破开启，底分型即封锁”逻辑
+        逻辑：
+        1. 寻找最近的“顶-底”结构，确定前一笔下跌 A->B。
+        2. 监控 B 点之后的走势：
+           - 如果 向上突破 A 点高点 且 耗时 <= A->B 耗时：激活信号 (Signal = 1)。
+           - 如果 出现底分型：说明新的向下笔可能开始，立即封锁信号 (Signal = 0)。
+        """
+        if df.empty: return {}
+        highs = df['最高价'].tolist()
+        lows = df['最低价'].tolist()
+        dts = df.index
+        
+        signals = {}
+        total_length = len(highs)
+        LOOKBACK_WINDOW = 250 
+        
+        # 记录当前状态：0-封锁/寻找突破中，1-已有效突破处于可买期
+        current_state = 0
+        
+        for i in range(1, total_length + 1):
+            dt = dts[i-1]
+            start_idx = max(0, i - LOOKBACK_WINDOW)
+            high_window = highs[start_idx : i]
+            low_window = lows[start_idx : i]
+            
+            try:
+                frac_window = gupiaojichu.identify_turns(len(high_window), high_window, low_window)
+            except:
+                signals[dt] = 0
+                continue
+            
+            # 提取所有转折点（原始分型）
+            turns = [(j, int(val)) for j, val in enumerate(frac_window) if val != 0.0]
+            if not turns:
+                signals[dt] = current_state
+                continue
+
+            # --- 逻辑 A：拦截逻辑（底分型封锁） ---
+            # 只要最近的一个分型是底分型 (-1)，无论之前是否有效突破，立即进入封锁态
+            if turns[-1][1] == -1:
+                current_state = 0
+            
+            # --- 逻辑 B：激活逻辑（有效突破判定） ---
+            # 只有在 current_state == 0 时才去寻找激活机会
+            if current_state == 0:
+                # 寻找最近的一组 顶(A) -> 底(B)
+                # 为了稳定，我们找最近的一个底点 turns[-1] (如果它是底)
+                # 或者倒数第二个点 (如果最后一点是顶)
+                temp_bottom_idx = -1
+                temp_prev_top_idx = -1
+                
+                for tidx in range(len(turns)-1, 0, -1):
+                    if turns[tidx][1] == -1: # 找到最近的底 B
+                        temp_bottom_idx = turns[tidx][0]
+                        # 往前找最近的顶 A
+                        for pidx in range(tidx-1, -1, -1):
+                            if turns[pidx][1] == 1:
+                                temp_prev_top_idx = turns[pidx][0]
+                                break
+                        break
+                
+                if temp_bottom_idx != -1 and temp_prev_top_idx != -1:
+                    down_stroke_len = temp_bottom_idx - temp_prev_top_idx
+                    prev_top_high = high_window[temp_prev_top_idx]
+                    
+                    # 检查从底点 B 到当前点，是否存在过高效突破
+                    up_stroke_data = high_window[temp_bottom_idx:]
+                    for k, h in enumerate(up_stroke_data):
+                        if h > prev_top_high:
+                            if k <= down_stroke_len: # 满足有效突破
+                                current_state = 1
+                                break
+            
+            signals[dt] = current_state
+                
+        return signals
+    
     def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
             data = min30_data.copy()
             data.index.name = 'datetime'
@@ -844,6 +962,22 @@ class TdxStockBacktest:
             red = close_price > row['开盘价']
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
             if row['signal'] == 1 and cash > close_price and not self.in_position and red and current_time >= pd.Timestamp('03:40').time() and current_time < pd.Timestamp('17:20').time():
+                # --- 新增：大盘系数校验 ---
+                idx_multiplier = 0.0
+                if hasattr(self, 'index_multiplier'):
+                    # 匹配时间戳，如果个股时间存在些微偏差，使用 ffill 寻找最近的指数状态
+                    closest_idx = self.index_multiplier.index.get_indexer([datetime], method='ffill')[0]
+                    if closest_idx != -1:
+                        idx_multiplier = self.index_multiplier.iloc[closest_idx]
+                
+                if idx_multiplier == 0.0:
+                    print(f"【大盘拦截】{datetime} - 指数未达标(上证/深成均弱)，取消买入")
+                    continue
+                
+                # 动态分配风险比例（0.5% 或 1%）
+                current_trade_risk_ratio = stop_loss_ratio * idx_multiplier
+                self.stop_loss_ratio = current_trade_risk_ratio
+                # -------------------------
                 # 3. 原有的止损价计算逻辑
                 if current_idx > 0:
                     prev_close = data['最高价'].iloc[current_idx - 1]
@@ -1127,6 +1261,14 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
         print("通达信服务器连接失败，无法执行批量回测")
         return pd.DataFrame(), pd.DataFrame(), {}
     
+    # ===== 新增：批量回测前，先计算大盘过滤信号 =====
+    backtest.prepare_index_data(
+        start_date='2023-12-01', 
+        end_date='2026-05-28', 
+        tdx_path=DEFAULT_TDX_PATH
+    )
+    # ==========================================
+    
     # 存储所有股票的回测指标 + 所有交易明细
     all_metrics = []
     all_trades_detail = []  # 存储所有股票的交易明细
@@ -1376,7 +1518,7 @@ if __name__ == "__main__":
             stock_codes=stock_list,
             init_cash=100000.0,    # 单股票初始资金10万
             commission=0.0003,     # 佣金0.03%
-            stop_loss_ratio=0.01   # 单笔止损1%
+            stop_loss_ratio=0.02   # 单笔止损1%
         )
         # ================== 执行理论复利计算 ==================
         trades_list = trades_detail_result.to_dict('records') if not trades_detail_result.empty else []
