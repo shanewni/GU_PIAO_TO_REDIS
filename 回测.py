@@ -710,12 +710,32 @@ class TdxStockBacktest:
     def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
         data = min30_data.copy()
         data.index.name = 'datetime'
+        
+        # ==========================================
+        # 1. 日线级别：利用滑动窗口和平移进行全面预处理
+        # ==========================================
+        day_df = day_df.copy()
         day_df.index.name = 'datetime'
         
-        # --- 1. 日线过滤条件 (保持原逻辑) ---
-        day_df = day_df.copy()
+        # 基础条件
+        day_df['is_yang'] = day_df['收盘价'] > day_df['开盘价']
+        day_df['is_rising'] = day_df['收盘价'] > day_df['收盘价'].shift(1)
+        day_df['valid_k'] = day_df['is_yang'] & day_df['is_rising']
+        
+        # 涨停判定 (以9.5%为界)
+        day_df['is_limit_up'] = (day_df['收盘价'] - day_df['收盘价'].shift(1)) / day_df['收盘价'].shift(1) >= 0.095
+        
+        # 滑动窗口：当前天及前两天，连续3天都满足 valid_k
+        day_df['3_days_valid'] = day_df['valid_k'].rolling(window=3).apply(lambda x: x.all(), raw=True).fillna(0).astype(bool)
+        
+        # 计算特殊止损价：第3K(当前K)的最低点 与 第2K(前一日K)的最高点 两者的最小值
+        day_df['k2_high'] = day_df['最高价'].shift(1)
+        day_df['k3_low'] = day_df['最低价']
+        day_df['target_stop_loss'] = day_df[['k2_high', 'k3_low']].min(axis=1)
 
-        # --- 2. 预计算基础指标 ---
+        # ==========================================
+        # 2. 30f级别预计算
+        # ==========================================
         buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist(), data['开盘价'].tolist())
         data['buy_signal'] = buy_signals
         data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
@@ -725,142 +745,101 @@ class TdxStockBacktest:
         high_list = min30_high
         low_list = min30_low
         
-        # --- 3. 核心状态机循环 ---
         data['signal'] = 0
         data['sell_reason'] = ""
         data['active_stop_loss'] = np.nan
         
+        # ==========================================
+        # 3. 状态机循环
+        # ==========================================
         in_pos = False
         buy_price = 0.0
         buy_idx = 0
         current_stop_loss = 0.0
         
-        # === 新增：延迟确认买入状态变量 ===
-        pending_buy = False       # 是否处于起爆后的观察期
-        yang_count = 0            # 记录起爆后连续阳线的天数
-        k2_high = 0.0             # 记录第2根日K线的最高点
-        k3_low = 0.0              # 记录第3根日K线的最低点
-        last_daily_close = 0.0    # 记录前一日收盘价，用于判断“收盘依次抬高”
-        trigger_date = None       # 30f起爆信号触发的具体日期
-        dummy_buy_idx = 0         # 模拟买入索引（用于在观察期检测是否触发卖出规则）
-        dummy_buy_price = 0.0     # 模拟买入价格
+        pending_buy = False
+        target_buy_date = None      # 预计买入日 (起爆日后面的第3个交易日)
+        dummy_buy_idx = 0
+        dummy_buy_price = 0.0
+        
+        # 获取日线的交易日列表，方便寻找 T+3 日
+        daily_dates = day_df.index.tolist()
         
         for i in range(len(data)):
             current_idx_time = data.index[i]
             current_date = current_idx_time.normalize()
-            # 判断当前30分钟K线是否是每天最后一根（15:00收盘），以获取确定的日线数据
             is_1500 = current_idx_time.strftime('%H:%M') == '15:00'
             
             if not in_pos:
-                # 1. 触发30f起爆，进入观察期
+                # 触发起爆，计算目标买入日 (T+3)
                 if not pending_buy and data['buy_signal'].iloc[i] == 1.0:
-                    pending_buy = True
-                    yang_count = 0
-                    dummy_buy_idx = i
-                    dummy_buy_price = close_list[i]
-                    trigger_date = current_date
-                    k2_high = 0.0
-                    k3_low = 0.0
-                    
+                    try:
+                        trigger_day_idx = daily_dates.index(current_date)
+                        if trigger_day_idx + 3 < len(daily_dates):
+                            target_buy_date = daily_dates[trigger_day_idx + 3]
+                            pending_buy = True
+                            dummy_buy_idx = i
+                            dummy_buy_price = close_list[i]
+                    except ValueError:
+                        pass # 当前日期不在日线数据中，忽略
+                
                 if pending_buy:
-                    # 2. 观察期内：中途不能出现卖出条件 (使用 dummy 数据检查分型破坏等)
+                    # 观察期内：中途不能出现卖出条件
                     min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
                     is_sell, _ = self.check_dynamic_sell_condition(
-                        current_idx=i,
-                        high_full=high_list,
-                        low_full=low_list,
-                        close_full=close_list,
-                        ma60_full=ma60_list,
-                        buy_price=dummy_buy_price,
-                        buy_idx=dummy_buy_idx,
-                        min30_frac=min30_frac
+                        current_idx=i, high_full=high_list, low_full=low_list,
+                        close_full=close_list, ma60_full=ma60_list,
+                        buy_price=dummy_buy_price, buy_idx=dummy_buy_idx, min30_frac=min30_frac
                     )
                     
                     if is_sell:
-                        pending_buy = False  # 出现卖出条件，观察期失败，重新等待信号
+                        pending_buy = False # 出现卖出条件，破位，取消本次计划
                         continue
                         
-                    # 3. 观察期内：每天 15:00 结算日K线条件
-                    if is_1500 and current_date in day_df.index:
-                        day_row = day_df.loc[current_date]
-                        d_open = day_row['开盘价']
-                        d_close = day_row['收盘价']
-                        d_high = day_row['最高价']
-                        d_low = day_row['最低价']
+                    # 到了目标日期的 15:00 尾盘
+                    if current_date == target_buy_date and is_1500:
+                        target_day_row = day_df.loc[target_buy_date]
                         
-                        if current_date == trigger_date:
-                            # 起爆日当天结束，记录起爆日K线的收盘价，作为K1比较基准
-                            last_daily_close = d_close
-                        else:
-                            # 起爆日之后的日子，检查日线阳线且收盘抬高
-                            is_yang = d_close > d_open
-                            is_rising = d_close > last_daily_close
+                        # 直接查表：日线连续3天满足要求 且 当天没涨停
+                        if target_day_row['3_days_valid'] and not target_day_row['is_limit_up']:
+                            # 执行买入
+                            data.loc[current_idx_time, 'signal'] = 1
+                            in_pos = True
+                            pending_buy = False
+                            buy_price = close_list[i]
+                            buy_idx = i
                             
-                            if is_yang and is_rising:
-                                yang_count += 1
-                                last_daily_close = d_close
-                                
-                                if yang_count == 2:
-                                    k2_high = d_high  # 记录第二k最高点
-                                    
-                                elif yang_count == 3:
-                                    k3_low = d_low    # 记录第三k最低点
-                                    
-                                    # 检查第三日是否涨停 (采用涨幅 >= 9.5% 作为近似涨停阈值)
-                                    is_limit_up = False
-                                    try:
-                                        idx_in_day = day_df.index.get_loc(current_date)
-                                        if idx_in_day > 0:
-                                            prev_d_close = day_df.iloc[idx_in_day - 1]['收盘价']
-                                            if (d_close - prev_d_close) / prev_d_close >= 0.095:
-                                                is_limit_up = True
-                                    except KeyError:
-                                        pass
-                                    
-                                    if is_limit_up:
-                                        pending_buy = False # 涨停价不买入，条件作废
-                                    else:
-                                        # === 满足所有严格条件，执行买入 ===
-                                        data.loc[current_idx_time, 'signal'] = 1
-                                        in_pos = True
-                                        pending_buy = False
-                                        buy_price = close_list[i]
-                                        buy_idx = i
-                                        
-                                        # 核心止损逻辑：第3k最低点和第2k最高点两者的最低点
-                                        current_stop_loss = min(k3_low, k2_high)
-                                        data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
-                            else:
-                                # 只要某一天不满足连阳或抬高，观察序列即告失败
-                                pending_buy = False
+                            # 从日线表中直接取算好的特殊止损价
+                            current_stop_loss = target_day_row['target_stop_loss']
+                            data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
+                        else:
+                            # 日线条件不满足，计划流产
+                            pending_buy = False
+                            
+                    # 如果超过了目标日期还没买入（防呆），取消计划
+                    elif current_date > target_buy_date:
+                        pending_buy = False
+
             else:       
-                # A. 止损检查 (优先级最高)
+                # 持仓中的止损与动态卖出判断 (保持原逻辑)
                 if low_list[i] <= current_stop_loss:
                     data.loc[current_idx_time, 'signal'] = -1
-                    data.loc[current_idx_time, 'sell_reason'] = f"触发止损(当前止损价:{current_stop_loss})"
-                    data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
-
+                    data.loc[current_idx_time, 'sell_reason'] = f"触发止损(止损价:{current_stop_loss})"
                     in_pos = False
                     continue
 
                 min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
+                data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
                 
-                # B. 动态卖出检查
                 is_sell, reason = self.check_dynamic_sell_condition(
-                    current_idx=i,
-                    high_full=high_list,
-                    low_full=low_list,
-                    close_full=close_list,
-                    ma60_full=ma60_list,
-                    buy_price=buy_price,
-                    buy_idx=buy_idx,
-                    min30_frac=min30_frac
+                    current_idx=i, high_full=high_list, low_full=low_list,
+                    close_full=close_list, ma60_full=ma60_list,
+                    buy_price=buy_price, buy_idx=buy_idx, min30_frac=min30_frac
                 )
                 
                 if is_sell:
                     data.loc[current_idx_time, 'signal'] = -1
                     data.loc[current_idx_time, 'sell_reason'] = reason
-                    data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
                     in_pos = False
 
         return data
