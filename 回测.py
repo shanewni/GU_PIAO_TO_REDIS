@@ -398,7 +398,7 @@ class TdxStockBacktest:
         return pf_out
     
     @staticmethod
-    def calculate_three_buy_signals(high_full, low_full, close_full) -> List[float]:
+    def calculate_three_buy_signals(high_full, low_full, close_full, open_full) -> List[float]:
         """
         遍历完整数据序列，逐段计算三买变体买点信号
         优化：每次计算仅使用最近 200 根 K 线以提升效率
@@ -422,6 +422,7 @@ class TdxStockBacktest:
             high_window = high_full[start_idx : window_end]
             low_window = low_full[start_idx : window_end]
             close_window = close_full[start_idx : window_end]
+            open_window = open_full[start_idx : window_end]
             
             # 计算当前窗口内的转折点
             # 注意：window_end 在 identify_turns 中通常作为长度参考
@@ -453,6 +454,20 @@ class TdxStockBacktest:
                     if current_close <= last_top_high:
                         window_signal[-1] = 0.0
 
+                                # 3. 原有的止损价计算逻辑
+                
+                prev_close = close_window[-2]  # 前一根K线的收盘价
+                loss_price = min(low_window[-1], prev_close)
+                close_price = close_window[-1]
+
+                if (close_price-loss_price)/loss_price*100 > 3:
+                    window_signal[-1] = 0.0
+                elif (close_price-loss_price)/loss_price*100 < 0.5:
+                    window_signal[-1] = 0.0
+                    
+                red = close_price <=  open_window[-1]
+                if red:
+                    window_signal[-1] = 0.0
             # 将窗口最后的计算结果映射回全量信号列表
             full_signals[window_end - 1] = window_signal[-1]
         
@@ -701,7 +716,7 @@ class TdxStockBacktest:
             day_df = day_df.copy()
 
             # --- 2. 预计算基础指标 ---
-            buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist())
+            buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist(), data['开盘价'].tolist())
             data['buy_signal'] = buy_signals
             data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
 
@@ -737,6 +752,7 @@ class TdxStockBacktest:
                         else:
                             initial_stop_loss = low_list[i]
                         current_stop_loss = initial_stop_loss # 初始化实时止损
+                        data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
                 else:       
                     # A. 止损检查 (优先级最高，使用 current_stop_loss)
                     if low_list[i] <= current_stop_loss:
@@ -836,28 +852,13 @@ class TdxStockBacktest:
             current_idx = data.index.get_loc(datetime)  # 当前K线索引
 
             # 核心修改：实时更新回测器手中的止损价
-            if self.in_position:
+            if row['signal'] == 1 or row['signal'] == -1:
                 # 这里的 active_stop_loss 包含了你新加的“第三根K线移位”后的价格
                 self.stop_loss_price = row['active_stop_loss']
-            # 获取当前时间点
-            current_time = datetime.time()
-            red = close_price > row['开盘价']
+            
+            
             # ===== 优化后的买入逻辑：加入收盘价高于前顶分型条件 =====
-            if row['signal'] == 1 and cash > close_price and not self.in_position and red and current_time >= pd.Timestamp('03:40').time() and current_time < pd.Timestamp('17:20').time():
-                # 3. 原有的止损价计算逻辑
-                if current_idx > 0:
-                    prev_close = data['最高价'].iloc[current_idx - 1]
-                    loss_price = min(row['最低价'], prev_close)
-
-                    if (close_price-loss_price)/loss_price*100 > 3:
-                        continue
-                    if (close_price-loss_price)/loss_price*100 < 0.5:
-                        continue
-                    self.stop_loss_price = loss_price
-                else:
-                    # 如果是第一根K线（无前值），则使用当前最低价
-                    self.stop_loss_price = row['最低价']
-                
+            if row['signal'] == 1 and cash > close_price and not self.in_position:   
                 # 4. 以损定量：计算可买数量
                 buy_num = self.calculate_position_size(
                     current_cash=current_total_asset,
