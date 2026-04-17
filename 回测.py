@@ -714,6 +714,18 @@ class TdxStockBacktest:
             
             # --- 1. 日线过滤条件 (保持原逻辑) ---
             day_df = day_df.copy()
+            day_df['ma60'] = day_df['收盘价'].rolling(window=60).mean()
+            day_df['ma60_shift3'] = day_df['ma60'].shift(3)
+            day_df['day_cond'] = (day_df['收盘价'] > day_df['ma60']) & (day_df['ma60'] > day_df['ma60_shift3'])
+            day_df['day_signal_valid'] = day_df['day_cond'].shift(1).fillna(False)
+
+            data['date_only'] = data.index.date
+            day_df['date_only'] = day_df.index.date
+            data = data.reset_index().merge(
+                day_df[['date_only', 'day_signal_valid']], 
+                on='date_only', 
+                how='left'
+            ).set_index('datetime')
 
             # --- 2. 预计算基础指标 ---
             buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist(), data['开盘价'].tolist())
@@ -740,7 +752,7 @@ class TdxStockBacktest:
                 
                 if not in_pos:
                     # 尝试买入
-                    if data['buy_signal'].iloc[i] == 1.0:
+                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
                         data.loc[current_idx_time, 'signal'] = 1
                         in_pos = True
                         buy_price = close_list[i]
