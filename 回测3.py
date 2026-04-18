@@ -172,7 +172,7 @@ class ThreeBuyVariantStrategy(bt.Strategy):
                             rebound_time = current_win_idx - last_bottom_idx
                             
                             # 增加容错时间：反弹时间必须 >= 下跌时间，且至少给予5根K线的反弹确认窗口
-                            time_cond = rebound_time >= max(drop_time, 5) 
+                            time_cond = rebound_time >= max(drop_time, 1) 
                             dist_cond = drop_time >= 3
                             
                             if time_cond and dist_cond:
@@ -421,4 +421,4 @@ def run_backtrader(symbol: str, tdx_path: str, start_date: str, end_date: str):
         print("无闭合交易记录。")
 
 if __name__ == '__main__':
-    run_backtrader(symbol='002824', tdx_path=r"D:\zd_hbzq", start_date='2022-12-01', end_date='2026-05-28')
+    run_backtrader(symbol='605555', tdx_path=r"D:\zd_hbzq", start_date='2022-12-01', end_date='2026-05-28')
