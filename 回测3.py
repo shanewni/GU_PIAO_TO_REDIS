@@ -4,6 +4,11 @@ import numpy as np
 import datetime
 from mootdx.reader import Reader
 import gupiaojichu  # 你的自定义模块
+import backtrader as bt
+import pandas as pd
+import os
+from datetime import datetime
+from typing import Callable, Dict, List, Tuple
 
 def get_exact_tdx_30min(symbol, tdx_path="", start_date=None, end_date=None):
     reader = Reader.factory(market='std', tdxdir=tdx_path)
@@ -376,49 +381,130 @@ class ThreeBuyVariantStrategy(bt.Strategy):
         pf_out[last_k_idx] = 1.0
         return pf_out
 
-def run_backtrader(symbol: str, tdx_path: str, start_date: str, end_date: str):
-    cerebro = bt.Cerebro()
-
-    cerebro.broker.setcash(100000.0)
-    cerebro.broker.setcommission(commission=0.0003)
-
-    print(f"正在加载 {symbol} 数据...")
-    df_30m = get_exact_tdx_30min(symbol, tdx_path, start_date, end_date)
-    df_day = get_local_day_data(symbol, tdx_path, start_date, end_date)
+def parse_tdx_blk_file(file_path: str) -> List[str]:
+    stock_list = []
     
-    if df_30m.empty or df_day.empty:
-        print("数据加载失败。")
-        return
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            
+        # 跳过第一行空白，从第二行开始处理
+        for line in lines[1:]:
+            line = line.strip()
+            if line:
+                # 第一位是市场代码，后六位是股票代码
+                market_code = line[0]
+                stock_code = line[1:7]
+                
+                # 将市场代码转换为pytdx需要的格式
+                # 0: 深圳, 1: 上海
+                if market_code == '0':
+                    market = 0  # 深圳
+                    market_prefix = 'sz'
+                else:
+                    market = 1  # 上海
+                    market_prefix = 'sh'
+                
+                full_code = f"{market_prefix}{stock_code}"
+                # stock_list.append((market, stock_code, full_code))            
+                stock_list.append((stock_code))            
+    except Exception as e:
+        print(f"读取blk文件失败: {e}")
+        
+    return stock_list
 
-    data_30m = TDXPandasData(dataname=df_30m, timeframe=bt.TimeFrame.Minutes, compression=30)
-    data_day = TDXPandasData(dataname=df_day, timeframe=bt.TimeFrame.Days)
+def run_batch_backtest(symbols: List[str], tdx_path, start_date, end_date, output_file="backtest_results.xlsx"):
+    """
+    批量执行回测并将结果保存到 Excel 文件
+    """
+    all_results = []
 
-    cerebro.adddata(data_30m, name='30m')
-    cerebro.adddata(data_day, name='day')
+    for symbol in symbols:
+        print(f"\n{'='*20} 正在回测: {symbol} {'='*20}")
+        
+        try:
+            # 1. 获取数据
+            df_30m = get_exact_tdx_30min(symbol, tdx_path, start_date, end_date)
+            df_day = get_local_day_data(symbol, tdx_path, start_date, end_date)
+            
+            if df_30m.empty or df_day.empty:
+                print(f"跳过 {symbol}: 数据获取失败")
+                continue
 
-    cerebro.addstrategy(ThreeBuyVariantStrategy, stop_loss_ratio=0.01)
+            # 2. 初始化 Cerebro
+            cerebro = bt.Cerebro()
+            cerebro.broker.setcash(100000.0)
+            cerebro.broker.setcommission(commission=0.0003)
 
-    cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
-    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-    cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
+            data_30m = TDXPandasData(dataname=df_30m, timeframe=bt.TimeFrame.Minutes, compression=30)
+            data_day = TDXPandasData(dataname=df_day, timeframe=bt.TimeFrame.Days)
 
-    print(f"========== 启动回测 {symbol} ==========")
-    print(f"期初总资金: {cerebro.broker.get_cash():.2f}")
-    results = cerebro.run()
-    strat = results[0]
+            cerebro.adddata(data_30m, name='30m')
+            cerebro.adddata(data_day, name='day')
 
-    print(f"期末总资金: {cerebro.broker.get_value():.2f}")
-    
-    analysis_trades = strat.analyzers.trades.get_analysis()
-    if 'total' in analysis_trades and analysis_trades.total.closed > 0:
-        total_closed = analysis_trades.total.closed
-        won = analysis_trades.won.total
-        win_rate = won / total_closed * 100
-        print(f"总交易笔数: {total_closed}")
-        print(f"胜率: {win_rate:.2f}%")
-        print(f"最大回撤: {strat.analyzers.drawdown.get_analysis().max.drawdown:.2f}%")
+            # 3. 添加策略与分析器
+            cerebro.addstrategy(ThreeBuyVariantStrategy)
+            cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
+            cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+            cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
+
+            # 4. 运行回测
+            strat_runs = cerebro.run()
+            strat = strat_runs[0]
+
+            # 5. 提取统计指标
+            analysis_trades = strat.analyzers.trades.get_analysis()
+            analysis_dd = strat.analyzers.drawdown.get_analysis()
+            analysis_ret = strat.analyzers.returns.get_analysis()
+
+            res = {
+                "代码": symbol,
+                "期末资产": round(cerebro.broker.get_value(), 2),
+                "总收益率(%)": round(analysis_ret.get('rtot', 0) * 100, 2),
+                "最大回撤(%)": round(analysis_dd.max.drawdown, 2),
+                "交易次数": 0,
+                "胜率(%)": 0.0,
+                "平均盈利": 0.0,
+            }
+
+            if 'total' in analysis_trades and analysis_trades.total.closed > 0:
+                total_closed = analysis_trades.total.closed
+                won = analysis_trades.won.total
+                res["交易次数"] = total_closed
+                res["胜率(%)"] = round(won / total_closed * 100, 2)
+                res["平均盈利"] = round(analysis_trades.pnl.net.average, 2)
+
+            all_results.append(res)
+            print(f"完成 {symbol}: 收益 {res['总收益率(%)']}%")
+
+        except Exception as e:
+            print(f"股票 {symbol} 回测期间发生错误: {str(e)}")
+            continue
+
+    # 6. 保存到文件
+    if all_results:
+        final_df = pd.DataFrame(all_results)
+        final_df.to_excel(output_file, engine="openpyxl")
+        print(f"\n{'#'*20} 所有回测完成 {'#'*20}")
+        print(f"结果已保存至: {os.path.abspath(output_file)}")
+        print(final_df)
     else:
-        print("无闭合交易记录。")
+        print("没有产生任何有效回测结果。")
 
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
+# --- 执行入口 ---
 if __name__ == '__main__':
-    run_backtrader(symbol='605555', tdx_path=r"D:\zd_hbzq", start_date='2022-12-01', end_date='2026-05-28')
+    # 你可以从 Excel 或 数据库读取股票列表
+    stock_list = parse_tdx_blk_file(BLOB_FILE_PATH)
+    
+    PATH_TDX = r"D:\zd_hbzq"  # 请确保路径正确
+    START = '2023-01-01'
+    END = '2026-04-15'
+    
+    run_batch_backtest(
+        symbols=stock_list, 
+        tdx_path=PATH_TDX, 
+        start_date=START, 
+        end_date=END,
+        output_file=f"回测结果_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    )

@@ -62,7 +62,7 @@ def filter_excel_by_date_and_time(file_path, date_ranges, target_times=None):
         print(f"成功保存: {new_file_name} (共 {len(buy_indices)} 笔交易)")
 
 # --- 配置区域 ---
-input_file = "板块回测汇总结果_含总笔数2026-04-17-16-25-06_30f起爆，日60均线限制，创业科创板.xlsx"  # 替换为你的文件路径
+input_file = "回测结果_20260419_1321_非主板.xlsx"  # 替换为你的文件路径
 
 # 1. 设定日期范围
 target_ranges = [
