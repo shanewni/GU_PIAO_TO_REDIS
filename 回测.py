@@ -521,7 +521,7 @@ class TdxStockBacktest:
         full_signals = [0.0] * total_length
         
         # 设定滑动窗口大小
-        LOOKBACK_WINDOW = 150
+        LOOKBACK_WINDOW = 350
         
         # 遍历每个数据点，逐步扩展窗口计算信号
         for window_end in range(1, total_length + 1):
@@ -576,6 +576,10 @@ class TdxStockBacktest:
                     
                 red = close_price <=  open_window[-1]
                 if red:
+                    window_signal[-1] = 0.0
+
+                # 新增：第一个中枢起爆限制校验
+                if not TdxStockBacktest.check_first_center_limit(frac_window, high_window, low_window):
                     window_signal[-1] = 0.0
             # 将窗口最后的计算结果映射回全量信号列表
             full_signals[window_end - 1] = window_signal[-1]
@@ -764,6 +768,74 @@ class TdxStockBacktest:
         }
         
         return metrics
+    
+    @staticmethod
+    def check_first_center_limit(frac, high, low):
+        """
+        检查是否符合第一个中枢内的起爆限制
+        规则：
+        1. 找到一买（当前向下笔低点 < 前一向下笔低点）
+        2. 一买后的第一根向下笔为二买
+        3. 二买及后续向下笔在高低点范围内波动构成中枢
+        4. 中枢内向下笔总数 <= 3 时起爆
+        """
+        # 1. 提取所有向下笔 (StartIdx, EndIdx, High, Low)
+        # 向下笔是指从顶分型(1.0)到底分型(-1.0)
+        down_strokes = []
+        turn_points = []
+        for i, val in enumerate(frac):
+            if val != 0:
+                turn_points.append((i, val))
+        
+        for i in range(len(turn_points) - 1):
+            p1_idx, p1_val = turn_points[i]
+            p2_idx, p2_val = turn_points[i+1]
+            if p1_val == 1.0 and p2_val == -1.0: # 顶到底，向下笔
+                down_strokes.append({
+                    'start': p1_idx,
+                    'end': p2_idx,
+                    'high': high[p1_idx],
+                    'low': low[p2_idx]
+                })
+
+        if len(down_strokes) < 2:
+            return False
+
+        # 2. 从后往前找最近的“一买”
+        # 定义：当前向下笔低点 < 前一向下笔低点
+        first_buy_idx = -1
+        for i in range(len(down_strokes) - 1, 0, -1):
+            if down_strokes[i]['low'] < down_strokes[i-1]['low']:
+                first_buy_idx = i
+                break
+        
+        if first_buy_idx == -1 or first_buy_idx == len(down_strokes) - 1:
+            return False # 没找到一买，或者一买就是最后一笔（没空间长出二买）
+
+        # 3. 确定二买（一买之后的下一根向下笔）
+        second_buy_idx = first_buy_idx + 1
+        second_buy_stroke = down_strokes[second_buy_idx]
+        center_high = second_buy_stroke['high']
+        center_low = second_buy_stroke['low']
+
+        # 4. 统计在中枢范围内的向下笔数量（包含二买本身）
+        count_in_center = 0
+        for i in range(second_buy_idx, len(down_strokes)):
+            curr_s = down_strokes[i]
+            # 判断是否在二买的高低点范围内 (重叠即可视为中枢组成)
+            if curr_s['low'] < center_high:
+                count_in_center += 1
+            else:
+                # 一旦走势离开中枢范围，之前的起爆点就不算“第一个中枢”内了
+                return False
+        
+        # 5. 限制：包括二买在内，最多三根向下笔内起爆
+        # 且起爆点必须紧跟在这些向下笔之后的向上段中
+        if 1 <= count_in_center <= 3:
+            return True
+            
+        return False
+    
     @staticmethod
     def check_dynamic_sell_condition(current_idx: int, high_full: List[float], low_full: List[float], 
                                     close_full: List[float], ma60_full: List[float],
