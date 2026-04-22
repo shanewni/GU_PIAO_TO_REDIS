@@ -9,6 +9,8 @@ import gupiaojichu
 import struct
 from mootdx.reader import Reader
 from collections import defaultdict, deque
+import os
+import glob
 
 # 忽略无关警告
 warnings.filterwarnings('ignore')
@@ -48,36 +50,100 @@ class TdxStockBacktest:
         except Exception as e:
             print(f"连接失败: {e}")
             return False
-    def get_exact_tdx_30min(self, symbol, tdx_path=DEFAULT_TDX_PATH, start_date=None, end_date=None):
-        """
-        从本地通达信数据读取并合成精准30分钟K线
-        :param symbol: 股票代码
-        :param tdx_path: 通达信安装路径
-        :return: 30分钟K线DataFrame
-        """
-        reader = Reader.factory(market='std', tdxdir=tdx_path)
-        df_5m = reader.fzline(symbol=symbol)
         
-        if df_5m is None or df_5m.empty:
-            print(f"未获取到{symbol}本地5分钟数据")
+    def read_tdx_export_txt(self, file_path, period='day'):
+        """
+        读取通达信导出的txt文件
+        :param file_path: 文件路径
+        :param period: 'day' 代表日线, '30min' 或 '5min' 代表分钟线
+        """
+        try:
+            # 通达信导出的文本通常是 GBK 编码，跳过第一行标题
+            # sep='\s+' 自动匹配空格或制表符
+            df = pd.read_csv(file_path, sep=r'\s+', encoding='gbk', skiprows=1, skipfooter=1, engine='python')
+            # print(df.tail(2))
+            if period == 'day':
+                # 日线格式通常只有：日期、开盘、最高、最低、收盘、成交量、成交额
+                df['datetime'] = pd.to_datetime(df['日期'].astype(str))
+            else:
+                # 分钟线格式（5min/30min）包含：日期、时间、开盘...
+                # 【修复】：强制转换为字符串 (astype(str)) 后再进行拼接
+                df['datetime'] = pd.to_datetime(df['日期'].astype(str) + ' ' + df['时间'].astype(str).str.zfill(4))
+            
+            # 3. 统一列名映射：全部转为中文
+            rename_dict = {
+                '开盘': '开盘价',
+                '最高': '最高价',
+                '最低': '最低价',
+                '收盘': '收盘价',
+                '成交量': '成交量',
+                '成交额': '成交额'
+            }
+            df = df.rename(columns=rename_dict)
+            
+            # 4. 提取标准列并设置索引
+            cols = ['datetime', '开盘价', '最高价', '最低价', '收盘价', '成交量', '成交额']
+            df = df[cols]
+            
+            # 设置索引并排序
+            df.set_index('datetime', inplace=True)
+            df.sort_index(inplace=True)
+            
+            return df
+        except Exception as e:
+            print(f"读取 {period} TXT失败: {e}")
             return pd.DataFrame()
+            
+    def find_txt_file(self,data_dir: str, code: str, period_hint: str) -> str:
+        """
+        在指定目录下根据股票代码和周期提示查找对应的 txt 文件
+        :param data_dir: txt 数据存放根目录
+        :param code: 股票代码（如 '600006'）
+        :param period_hint: 周期标识，用于模糊匹配，如 '日线' 或 '5分钟'
+        :return: 匹配到的第一个文件完整路径，若未找到返回 None
+        """
+        # 构造搜索模式，例如：D:/data/*600006*日线*.txt
+        pattern = os.path.join(data_dir, f"*{code}*.txt")
+        files = glob.glob(pattern)
+        if not files:
+            # 尝试更宽松的匹配（有些文件名可能不包含周期文字）
+            pattern = os.path.join(data_dir, f"*{code}*.txt")
+            files = glob.glob(pattern)
+            if files:
+                # 如果只有一个文件，直接返回
+                if len(files) == 1:
+                    return files[0]
+                # 否则尝试根据文件名中的周期关键词筛选
+                for f in files:
+                    if period_hint in os.path.basename(f):
+                        return f
+            return None
+        return files[0]  # 返回第一个匹配项
+    
+    def _resample_5min_to_30min(self ,df_5min: pd.DataFrame, start_date=None, end_date=None) -> pd.DataFrame:
+        """
+        将标准 5 分钟 K 线数据合成为 30 分钟 K 线
+        :param df_5min: 包含 'datetime' 索引及 OHLCV 列的 DataFrame
+        :return: 30 分钟 K 线 DataFrame
+        """
+        if df_5min.empty:
+            return df_5min
 
-        # 1. 基础清洗与重命名
-        df_5m = df_5m.rename(columns={
+        # 确保列名为中文，与框架保持一致
+        df = df_5min.rename(columns={
             'open': '开盘价', 'high': '最高价', 'low': '最低价',
             'close': '收盘价', 'volume': '成交量', 'amount': '成交额'
         })
-        
-        # 2. 预处理精度（解决 41.79999 问题）
-        price_cols = ['开盘价', '最高价', '最低价', '收盘价']
-        df_5m[price_cols] = df_5m[price_cols].round(2)
 
-        # 3. 核心合成逻辑：对齐通达信的 11:30 和 15:00
-        df_30m = df_5m.resample(
-            '30Min', 
-            closed='right',   # 每根K线包含右侧边界（如 10:00 包含 10:00 那一分钟）
-            label='right',    # 用右侧时间命名（显示为 10:00）
-            origin='start_day' # 从每日 00:00 开始计算偏移
+        price_cols = ['开盘价', '最高价', '最低价', '收盘价']
+        df[price_cols] = df[price_cols].round(2)
+
+        # 重采样为 30 分钟
+        df_30m = df.resample(
+            '30Min',
+            closed='right',
+            label='right',
+            origin='start_day'
         ).agg({
             '开盘价': 'first',
             '最高价': 'max',
@@ -87,22 +153,64 @@ class TdxStockBacktest:
             '成交额': 'sum'
         })
 
-        # 4. 剔除中午休市和非交易时段的空行
         df_30m = df_30m.dropna(subset=['开盘价'])
-        
-        # 过滤掉非正常的分钟点
+
+        # 过滤出有效交易时段（A股 30 分钟线时间点）
         valid_times = ['10:00', '10:30', '11:00', '11:30', '13:30', '14:00', '14:30', '15:00']
         df_30m = df_30m[df_30m.index.strftime('%H:%M').isin(valid_times)]
 
-        # 5. 最后修正一遍精度
         df_30m[price_cols] = df_30m[price_cols].round(2)
         df_30m.index.name = 'datetime'
-        # --- 新增：时间段过滤 ---
+
+        # 时间段过滤
         if start_date:
             df_30m = df_30m[df_30m.index >= pd.to_datetime(start_date)]
         if end_date:
             df_30m = df_30m[df_30m.index <= pd.to_datetime(end_date)]
-            
+
+        return df_30m
+
+    def get_txt_day_data(self, code: str, txt_day_dir: str, start_date=None, end_date=None) -> pd.DataFrame:
+        """
+        从 txt 文件读取日线数据
+        """
+        file_path = self.find_txt_file(txt_day_dir, code, "日线")
+        if file_path is None:
+            print(f"未找到 {code} 的日线 txt 文件")
+            return pd.DataFrame()
+        df = self.read_tdx_export_txt(file_path)
+        if df.empty:
+            return df
+        # 时间段过滤
+        if start_date:
+            df = df[df.index >= pd.to_datetime(start_date)]
+        if end_date:
+            df = df[df.index <= pd.to_datetime(end_date)]
+        print(f"成功读取 {code} txt日线({start_date or '起点'}至{end_date or '至今'})，共 {len(df)} 条")
+        return df
+
+    def get_txt_30min_data(self, code: str, txt_5min_dir: str, start_date=None, end_date=None) -> pd.DataFrame:
+        """
+        从 5 分钟 txt 文件合成 30 分钟数据
+        """
+        file_path = self.find_txt_file(txt_5min_dir, code, "5分钟")
+        if file_path is None:
+            print(f"未找到 {code} 的 5 分钟 txt 文件")
+            return pd.DataFrame()
+        df_5m = self.read_tdx_export_txt(file_path, period='5min')
+        if df_5m.empty:
+            return df_5m
+        df_30m = self._resample_5min_to_30min(df_5m, start_date, end_date)
+        print(f"成功由 txt 5分钟合成 {code} 30min数据，共 {len(df_30m)} 条")
+        return df_30m
+    
+    def get_exact_tdx_30min(self, symbol, tdx_path=DEFAULT_TDX_PATH, start_date=None, end_date=None):
+        reader = Reader.factory(market='std', tdxdir=tdx_path)
+        df_5m = reader.fzline(symbol=symbol)
+        if df_5m is None or df_5m.empty:
+            return pd.DataFrame()
+        # 直接调用合成函数
+        df_30m = self._resample_5min_to_30min(df_5m, start_date, end_date)
         print(f"成功合成 {symbol} 30min数据，时间段：{start_date or '不限'} - {end_date or '不限'}，共 {len(df_30m)} 条")
         return df_30m
     
@@ -198,48 +306,49 @@ class TdxStockBacktest:
         }
         return ktype_map.get(ktype, f'未知周期({ktype})')
     
-    def get_multi_period_data(self, code: str, count: int = 800, use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH, start_date=None, end_date=None) -> Dict[str, pd.DataFrame]:
+    def get_multi_period_data(self, code: str, count: int = 800,
+                          use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH,
+                          use_txt_files: bool = False,
+                          txt_day_dir: str = r"D:\zd_hbzq\daochushujuday",
+                          txt_5min_dir: str = r"D:\zd_hbzq\daochushuju5f",
+                          start_date=None, end_date=None) -> Dict[str, pd.DataFrame]:
         """
-        一键获取日线+30分钟线数据（支持本地/联网切换）
-        :param code: 股票代码
-        :param count: 各周期获取的数据条数（仅联网模式生效）
-        :param use_local: 是否使用本地数据（True=本地，False=联网）
-        :param tdx_path: 通达信本地路径（仅本地模式生效）
+        一键获取日线+30分钟线数据（支持本地通达信数据库、联网、txt文件三种模式）
+        :param use_txt_files: True 表示从 txt 文件读取
+        :param txt_day_dir: 日线 txt 存放目录
+        :param txt_5min_dir: 5 分钟 txt 存放目录
         :return: 多周期数据字典
         """
         result = {}
-        
-        if use_local:
-            # 本地模式：读取本地数据
+
+        if use_txt_files:
+            # 从 txt 文件读取
+            day_data = self.get_txt_day_data(code, txt_day_dir, start_date, end_date)
+            min30_data = self.get_txt_30min_data(code, txt_5min_dir, start_date, end_date)
+            # 提取高低价列表
+            min30_high = min30_data['最高价'].tolist() if not min30_data.empty else []
+            min30_low = min30_data['最低价'].tolist() if not min30_data.empty else []
+        elif use_local:
+            # 本地通达信数据库
             day_data = self.get_local_day_data(code, tdx_path, start_date, end_date)
             min30_data = self.get_exact_tdx_30min(code, tdx_path, start_date, end_date)
-            
-            # 提取高低价列表
-            min30_high = min30_data['最高价'].astype(float).tolist() if not min30_data.empty else []
-            min30_low = min30_data['最低价'].astype(float).tolist() if not min30_data.empty else []
-            
-            result = {
-                'day': day_data,
-                '30min_high_list': min30_high,
-                '30min_low_list': min30_low,
-                '30min': min30_data
-            }
+            min30_high = min30_data['最高价'].tolist() if not min30_data.empty else []
+            min30_low = min30_data['最低价'].tolist() if not min30_data.empty else []
         else:
-            # 联网模式：原有逻辑
-            day_data, day_high_list, day_low_list = self.get_stock_k_data(code, count=count, ktype=9)
-            min30_data, min30_high_list, min30_low_list = self.get_stock_k_data(code, count=count, ktype=2)
-            
-            result = {
-                'day': day_data,
-                '30min_high_list': min30_high_list,
-                '30min_low_list': min30_low_list,
-                '30min': min30_data
-            }
-        
-        # 存储到实例变量
+            # 联网模式
+            day_data, _, _ = self.get_stock_k_data(code, count=count, ktype=9)
+            min30_data, min30_high, min30_low = self.get_stock_k_data(code, count=count, ktype=2)
+
+        result = {
+            'day': day_data,
+            '30min_high_list': min30_high if 'min30_high' in locals() else [],
+            '30min_low_list': min30_low if 'min30_low' in locals() else [],
+            '30min': min30_data
+        }
+
         self.stock_data['day'] = result['day']
         self.stock_data['30min'] = result['30min']
-        
+
         return result
     
     @staticmethod
@@ -794,9 +903,14 @@ class TdxStockBacktest:
 
             return data
     
-    def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0, 
-                     commission: float = 0.0003, stop_loss_ratio: float = 0.01,
-                     use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH, start_date=None, end_date=None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+    def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0,
+                 commission: float = 0.0003, stop_loss_ratio: float = 0.01,
+                 use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH,
+                 use_txt_files: bool = False,
+                 txt_day_dir: str = r"D:\zd_hbzq\daochushujuday",
+                 txt_5min_dir: str = r"D:\zd_hbzq\daochushuju5f",
+                 start_date=None, end_date=None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+
         """
         执行三买变体策略回测（30分钟周期）
         升级：返回单股票交易明细列表，用于总笔数汇总
@@ -825,7 +939,13 @@ class TdxStockBacktest:
                 return pd.DataFrame(), {}, []
         
         # 获取多周期数据（自动切换本地/联网）
-        multi_data = self.get_multi_period_data(code, count=800, use_local=use_local, tdx_path=tdx_path, start_date=start_date, end_date=end_date)
+        multi_data = self.get_multi_period_data(
+        code, count=800,
+        use_local=use_local, tdx_path=tdx_path,
+        use_txt_files=use_txt_files,
+        txt_day_dir=txt_day_dir, txt_5min_dir=txt_5min_dir,
+        start_date=start_date, end_date=end_date
+                                         )
         day_data = multi_data['day']
         min30_data = multi_data['30min']
         min30_high = multi_data['30min_high_list']
@@ -1153,8 +1273,10 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 init_cash=init_cash,
                 commission=commission,
                 stop_loss_ratio=stop_loss_ratio,
-                use_local=True  ,# 统一使用联网模式获取数据
-                tdx_path=DEFAULT_TDX_PATH,
+                use_local=False,           # 关闭本地数据库模式
+                use_txt_files=True,        # 启用 txt 文件读取
+                txt_day_dir=r"D:\zd_hbzq\daochushujuday",
+                txt_5min_dir=r"D:\zd_hbzq\daochushuju5f",
                 start_date='2023-12-01',
                 end_date='2026-05-28'
             )
