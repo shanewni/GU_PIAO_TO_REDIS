@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 # 1. 加载数据
-file_path = '板块回测汇总结果_含总笔数2026-04-23-12-09-49_增加起爆位置.xlsx'  # 替换为你的文件路径
+file_path = '板块回测汇总结果_含总笔数2026-04-23-18-13-56_5fk最低点止损.xlsx'  # 替换为你的文件路径
 sheet_name = '所有交易明细' 
 
 try:

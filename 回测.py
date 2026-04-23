@@ -313,37 +313,53 @@ class TdxStockBacktest:
                           txt_5min_dir: str = r"D:\zd_hbzq\daochushuju5f",
                           start_date=None, end_date=None) -> Dict[str, pd.DataFrame]:
         """
-        一键获取日线+30分钟线数据（支持本地通达信数据库、联网、txt文件三种模式）
-        :param use_txt_files: True 表示从 txt 文件读取
-        :param txt_day_dir: 日线 txt 存放目录
-        :param txt_5min_dir: 5 分钟 txt 存放目录
-        :return: 多周期数据字典
+        一键获取日线+30分钟线+5分钟线数据
         """
         result = {}
+        df_5m = pd.DataFrame()
 
         if use_txt_files:
-            # 从 txt 文件读取
             day_data = self.get_txt_day_data(code, txt_day_dir, start_date, end_date)
-            min30_data = self.get_txt_30min_data(code, txt_5min_dir, start_date, end_date)
-            # 提取高低价列表
-            min30_high = min30_data['最高价'].tolist() if not min30_data.empty else []
-            min30_low = min30_data['最低价'].tolist() if not min30_data.empty else []
+            file_path = self.find_txt_file(txt_5min_dir, code, "5分钟")
+            if file_path:
+                df_5m = self.read_tdx_export_txt(file_path, period='5min')
+            min30_data = self._resample_5min_to_30min(df_5m, start_date, end_date) if not df_5m.empty else pd.DataFrame()
+            
         elif use_local:
-            # 本地通达信数据库
             day_data = self.get_local_day_data(code, tdx_path, start_date, end_date)
+            reader = Reader.factory(market='std', tdxdir=tdx_path)
+            df_5m = reader.fzline(symbol=code)
+            if df_5m is not None and not df_5m.empty:
+                df_5m = df_5m.rename(columns={
+                    'open': '开盘价', 'high': '最高价', 'low': '最低价',
+                    'close': '收盘价', 'volume': '成交量', 'amount': '成交额'
+                })
+            else:
+                df_5m = pd.DataFrame()
             min30_data = self.get_exact_tdx_30min(code, tdx_path, start_date, end_date)
-            min30_high = min30_data['最高价'].tolist() if not min30_data.empty else []
-            min30_low = min30_data['最低价'].tolist() if not min30_data.empty else []
+            
         else:
-            # 联网模式
             day_data, _, _ = self.get_stock_k_data(code, count=count, ktype=9)
-            min30_data, min30_high, min30_low = self.get_stock_k_data(code, count=count, ktype=2)
+            # 联网获取5分钟数据，数量设为30分钟的6倍以保证时间范围对齐
+            df_5m, _, _ = self.get_stock_k_data(code, count=count*6, ktype=0)
+            min30_data, _, _ = self.get_stock_k_data(code, count=count, ktype=2)
+
+        # 5分钟数据的时间段过滤
+        if not df_5m.empty:
+            if start_date:
+                df_5m = df_5m[df_5m.index >= pd.to_datetime(start_date)]
+            if end_date:
+                df_5m = df_5m[df_5m.index <= pd.to_datetime(end_date)]
+
+        min30_high = min30_data['最高价'].tolist() if not min30_data.empty else []
+        min30_low = min30_data['最低价'].tolist() if not min30_data.empty else []
 
         result = {
             'day': day_data,
-            '30min_high_list': min30_high if 'min30_high' in locals() else [],
-            '30min_low_list': min30_low if 'min30_low' in locals() else [],
-            '30min': min30_data
+            '30min_high_list': min30_high,
+            '30min_low_list': min30_low,
+            '30min': min30_data,
+            '5min': df_5m  # 新增返回 5分钟 数据
         }
 
         self.stock_data['day'] = result['day']
@@ -471,7 +487,7 @@ class TdxStockBacktest:
 
         # 条件：最后一根K线价格突破最近向下线段的起点高点
         last_k_idx = data_len - 1  # 最后一根K线的索引
-        if high[last_k_idx] <= latest_high:
+        if high[last_k_idx] < latest_high:
             return pf_out  # 未突破高点，不满足
         
         # 线段间隔条件判断
@@ -499,33 +515,31 @@ class TdxStockBacktest:
                         return pf_out  # 向上线段中有价格高于最近高点，不满足
                     i += 1
         
-        if last_k_idx -1 <= down_seg_end:
-            return pf_out  # 最后一根K线过近，不满足
+        # if last_k_idx -1 <= down_seg_end:
+        #     return pf_out  # 最后一根K线过近，不满足
         
         # 所有条件满足，标记信号
         pf_out[last_k_idx] = 1.0
         return pf_out
     
     @staticmethod
-    def calculate_three_buy_signals(high_full, low_full, close_full, open_full) -> List[float]:
+    def calculate_three_buy_signals(df_30m: pd.DataFrame, df_5m: pd.DataFrame) -> tuple[List[float], List[float]]:
         """
-        遍历完整数据序列，逐段计算三买变体买点信号
-        优化：每次计算仅使用最近 200 根 K 线以提升效率
+        遍历完整数据序列，计算三买变体买点信号及动态对应的5分钟精准止损位。
+        严格时间切片，杜绝未来函数。
         """
-        # 校验全量数据长度一致
-        if len(high_full) != len(low_full) or len(high_full) != len(close_full):
-            raise ValueError("high_full、low_full、close_full必须长度一致")
+        high_full = df_30m['最高价'].tolist()
+        low_full = df_30m['最低价'].tolist()
+        close_full = df_30m['收盘价'].tolist()
+        open_full = df_30m['开盘价'].tolist()
         
         total_length = len(high_full)
-        # 初始化全量信号数组（默认全为0）
         full_signals = [0.0] * total_length
+        full_stop_loss = [0.0] * total_length  # 记录每笔交易对应的止损价
         
-        # 设定滑动窗口大小
         LOOKBACK_WINDOW = 250
         
-        # 遍历每个数据点，逐步扩展窗口计算信号
         for window_end in range(1, total_length + 1):
-            # --- 核心优化：只取最后 200 根 K 线 ---
             start_idx = max(0, window_end - LOOKBACK_WINDOW)
             
             high_window = high_full[start_idx : window_end]
@@ -533,58 +547,99 @@ class TdxStockBacktest:
             close_window = close_full[start_idx : window_end]
             open_window = open_full[start_idx : window_end]
             
-            # 计算当前窗口内的转折点
-            # 注意：window_end 在 identify_turns 中通常作为长度参考
             frac_window = gupiaojichu.identify_turns(len(high_window), high_window, low_window)
             
-            # 调用三买变体函数
             try:
                 window_signal = TdxStockBacktest.three_buy_variant(frac_window, high_window, low_window)
             except Exception:
                 continue
                 
-            # 如果当前窗口最后一个位置有信号，执行收盘价确认逻辑
             if window_signal[-1] == 1.0:
                 current_close = close_window[-1]
                 
-                # 在当前 frac_window 中找最后一个顶分型（值为1.0）
-                # 寻找的是“突破K线”之前最近的一个顶
+                # 校验：收盘价必须高于前顶分型最高价
                 last_top_idx = -1
                 for i in range(len(frac_window) - 1, -1, -1):
                     if frac_window[i] == 1.0:
-                        # 排除掉当前K线本身（如果是顶的话）
                         if i < len(frac_window) - 1:
                             last_top_idx = i
                             break
                 
                 if last_top_idx != -1:
                     last_top_high = high_window[last_top_idx]
-                    # 条件：收盘价必须高于前顶分型最高价，否则撤销信号
                     if current_close <= last_top_high:
                         window_signal[-1] = 0.0
 
-                                # 3. 原有的止损价计算逻辑
-                
-                prev_close = close_window[-2]  # 前一根K线的收盘价
-                loss_price = min(low_window[-1], prev_close)
-                close_price = close_window[-1]
 
-                if (close_price-loss_price)/loss_price*100 > 3:
-                    window_signal[-1] = 0.0
-                elif (close_price-loss_price)/loss_price*100 < 0.5:
-                    window_signal[-1] = 0.0
-                    
-                red = close_price <=  open_window[-1]
+                red = close_window[-1] <= open_window[-1]
                 if red:
                     window_signal[-1] = 0.0
 
-                # 新增：第一个中枢起爆限制校验
-                # if TdxStockBacktest.check_first_center_limit(frac_window, high_window, low_window):
-                #     window_signal[-1] = 0.0
-            # 将窗口最后的计算结果映射回全量信号列表
+                # ================= 核心：调取时间相同的5f K线寻找止损位 =================
+                loss_price = 0.0
+                
+                # 只有 30f 信号通过了前面的校验，才去截取 5f 数据（极大地节省性能）
+            # 假设 30f 初步满足起爆条件 (window_signal[-1] == 1.0)
+            if window_signal[-1] == 1.0:
+                current_30f_close = close_full[window_end - 1]
+                current_time = df_30m.index[window_end - 1]
+                
+                loss_price = 0.0
+                if df_5m is not None and not df_5m.empty:
+                    # 1. 截取当前时刻及以前的 5f 数据
+                    df_5m_slice = df_5m[df_5m.index <= current_time].tail(LOOKBACK_WINDOW) # 取稍微多点保证有两个底分型
+                    if not df_5m_slice.empty:
+                        h_5 = df_5m_slice['最高价'].tolist()
+                        l_5 = df_5m_slice['最低价'].tolist()
+                        
+                        frac_5 = gupiaojichu.identify_turns(len(h_5), h_5, l_5)
+                        # 找到所有底分型索引
+                        bottom_indices = [i for i, val in enumerate(frac_5) if val == -1.0]
+                        
+                        # 2. 准备回溯最近的两个底分型
+                        # 我们按时间倒序取最后两个底分型索引，例如 [倒数第二个, 倒数第一个]
+                        target_bottoms = bottom_indices[-1] 
+    
+                        # 从当前选定的底分型位置 target_bottoms 开始，向后（正向）寻找起爆点
+                        # 搜索范围：从底分型到当前最末尾的一根5f K线
+                        for search_end in range(target_bottoms + 1, len(h_5) + 1):
+                            h5_sub = h_5[:search_end]
+                            l5_sub = l_5[:search_end]
+                            f5_sub = gupiaojichu.identify_turns(len(h5_sub), h5_sub, l5_sub)
+                            
+                            try:
+                                ws5 = TdxStockBacktest.three_buy_variant(f5_sub, h5_sub, l5_sub)
+                                if ws5[-1] == 1.0: # 5f 起爆！
+                                    # 计算候选止损位：5f起爆k最低点与前k最高点的最小值
+                                    candidate_loss = min(l5_sub[-1], h5_sub[-2]) if len(l5_sub) >= 2 else l5_sub[-1]
+                                    
+                                    # 校验：止损价格不能超过30分钟K的收盘价（必须在下方）
+                                    if candidate_loss < current_30f_close:
+                                        loss_price = candidate_loss
+                                        break # 找到该底分型后的第一个起爆点，跳出search_end循环
+                            except:
+                                continue
+                            if search_end== len(h_5):
+                                window_signal[-1] = 0.0
+
+            if window_signal[-1] == 1.0:    
+                # 3. 校验逻辑
+                close_price = current_30f_close
+                # 如果没找到符合条件的5f止损位，采用30f兜底
+                if loss_price == 0.0:
+                    prev_30f_close = close_full[window_end - 2] if window_end >= 2 else close_price
+                    loss_price = min(low_full[window_end - 1], prev_30f_close)
+
+                # 最终距离校验
+                dist_pct = (close_price - loss_price) / loss_price * 100
+                if dist_pct > 3 or dist_pct < 0.5:
+                    window_signal[-1] = 0.0
+                
+                full_stop_loss[window_end - 1] = loss_price
+
             full_signals[window_end - 1] = window_signal[-1]
-        
-        return full_signals
+            
+        return full_signals, full_stop_loss
     
     @staticmethod
     def calculate_mfi(df, n=14):
@@ -971,7 +1026,7 @@ class TdxStockBacktest:
         if cond_pattern: return True, pattern_reason
         return False, ""   
     
-    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
+    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float], df_5m: pd.DataFrame) -> pd.DataFrame:
             data = min30_data.copy()
             data.index.name = 'datetime'
             day_df.index.name = 'datetime'
@@ -992,8 +1047,9 @@ class TdxStockBacktest:
             ).set_index('datetime')
 
             # --- 2. 预计算基础指标 ---
-            buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist(), data['开盘价'].tolist())
+            buy_signals, stop_loss_list = self.calculate_three_buy_signals(data, df_5m)
             data['buy_signal'] = buy_signals
+            data['suggested_stop_loss'] = stop_loss_list  # 新增：记录每一根K线计算得出的止损价
             data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
 
             
@@ -1028,13 +1084,8 @@ class TdxStockBacktest:
                         in_pos = True
                         buy_price = close_list[i]
                         buy_idx = i
-                        # 设置初始止损价
-                        if i > 0:
-                            prev_high = high_list[i-1]
-                            initial_stop_loss = min(low_list[i], prev_high)
-                        else:
-                            initial_stop_loss = low_list[i]
-                        current_stop_loss = initial_stop_loss # 初始化实时止损
+                        # 直接提取当前K线计算好的止损价
+                        current_stop_loss = data['suggested_stop_loss'].iloc[i]
                         data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
                 else:       
                     # A. 止损检查 (优先级最高，使用 current_stop_loss)
@@ -1112,13 +1163,15 @@ class TdxStockBacktest:
         min30_data = multi_data['30min']
         min30_high = multi_data['30min_high_list']
         min30_low = multi_data['30min_low_list']
+        # --- 提取出刚刚新增的 5分钟 数据 ---
+        df_5m = multi_data.get('5min', pd.DataFrame())
         
         if min30_data.empty:
             print(f"股票 {code} 30分钟数据为空，无法回测")
             return pd.DataFrame(), {}, []
         
         # 生成策略信号
-        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low)
+        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low, df_5m)
         
         # 初始化止损百分比
         self.stop_loss_ratio = stop_loss_ratio
