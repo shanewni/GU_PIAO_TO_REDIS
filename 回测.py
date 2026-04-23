@@ -579,8 +579,8 @@ class TdxStockBacktest:
                     window_signal[-1] = 0.0
 
                 # 新增：第一个中枢起爆限制校验
-                if not TdxStockBacktest.check_first_center_limit(frac_window, high_window, low_window):
-                    window_signal[-1] = 0.0
+                # if TdxStockBacktest.check_first_center_limit(frac_window, high_window, low_window):
+                #     window_signal[-1] = 0.0
             # 将窗口最后的计算结果映射回全量信号列表
             full_signals[window_end - 1] = window_signal[-1]
         
