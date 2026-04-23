@@ -521,7 +521,7 @@ class TdxStockBacktest:
         full_signals = [0.0] * total_length
         
         # 设定滑动窗口大小
-        LOOKBACK_WINDOW = 350
+        LOOKBACK_WINDOW = 250
         
         # 遍历每个数据点，逐步扩展窗口计算信号
         for window_end in range(1, total_length + 1):
@@ -770,6 +770,89 @@ class TdxStockBacktest:
         return metrics
     
     @staticmethod
+    def classify_buy_position(frac, high, low) -> str:
+        turn_points = []
+        for i, val in enumerate(frac):
+            if val != 0:
+                turn_points.append((i, val))
+
+        down_strokes = []
+        for i in range(len(turn_points) - 1):
+            p1_idx, p1_val = turn_points[i]
+            p2_idx, p2_val = turn_points[i+1]
+            if p1_val == 1.0 and p2_val == -1.0:
+                down_strokes.append({'start': p1_idx, 'end': p2_idx, 'high': high[p1_idx], 'low': low[p2_idx]})
+
+        if not down_strokes: return "未知"
+        if len(down_strokes) == 1: return "一买"
+
+        # 状态机变量
+        state = "一买"
+        label = "一买"
+        b2_high = None
+        b3_high = None
+        b2_ext_count = 0
+        b3_ext_count = 0
+        b3_above_count = 0  # 独立维护三买之上计数
+
+        for i in range(1, len(down_strokes)):
+            curr = down_strokes[i]
+            prev = down_strokes[i-1]
+
+            # 核心规则：一旦跌破前笔最低点，强制重置为一买
+            if curr['low'] < prev['low']:
+                label = "一买"
+                state = "一买"
+                b2_high = None
+                b3_high = None
+                b2_ext_count = 0
+                b3_ext_count = 0
+                b3_above_count = 0
+                continue
+
+            # 逻辑递推
+            if state == "一买":
+                label = "二买"
+                state = "二买"
+                b2_high = curr['high']
+            
+            elif state.startswith("二买"):
+                if b2_high is not None and curr['low'] > b2_high:
+                    label = "三买"
+                    state = "三买"
+                    b3_high = curr['high'] # 记录三买这一笔的高点
+                else:
+                    b2_ext_count += 1
+                    label = f"二买延续{b2_ext_count}"
+                    state = "二买延续"
+
+            elif state.startswith("三买"):
+                # 判断是 延续 还是 之上
+                if b3_high is not None and curr['low'] <= b3_high:
+                    # 最低点在三买最高点之下 -> 延续
+                    b3_ext_count += 1
+                    label = f"三买延续{b3_ext_count}"
+                    state = "三买延续"
+                else:
+                    # 最低点依然在三买最高点之上 -> 之上
+                    b3_above_count += 1
+                    label = f"三买之上{b3_above_count}"
+                    state = "三买之上"
+            
+            # 如果已经是延续或之上状态，继续保持在三买大框架下判定
+            elif state.startswith("三买延续") or state.startswith("三买之上"):
+                if b3_high is not None and curr['low'] <= b3_high:
+                    b3_ext_count += 1
+                    label = f"三买延续{b3_ext_count}"
+                    state = "三买延续"
+                else:
+                    b3_above_count += 1
+                    label = f"三买之上{b3_above_count}"
+                    state = "三买之上"
+
+        return label
+    
+    @staticmethod
     def check_first_center_limit(frac, high, low):
         """
         检查是否符合第一个中枢内的起爆限制
@@ -922,6 +1005,7 @@ class TdxStockBacktest:
             # --- 3. 核心状态机循环 ---
             data['signal'] = 0
             data['sell_reason'] = ""
+            data['buy_position'] = ""  # 【新增】：初始化位置列
             in_pos = False
             buy_price = 0.0
             buy_idx = 0
@@ -935,6 +1019,12 @@ class TdxStockBacktest:
                     # 尝试买入
                     if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
                         data.loc[current_idx_time, 'signal'] = 1
+
+                        # 【新增】：计算当前起爆点所处的结构位置
+                        frac_up_to_now = gupiaojichu.identify_turns(i+1, high_list[:i+1], low_list[:i+1])
+                        buy_pos = self.classify_buy_position(frac_up_to_now, high_list[:i+1], low_list[:i+1])
+                        data.loc[current_idx_time, 'buy_position'] = buy_pos
+
                         in_pos = True
                         buy_price = close_list[i]
                         buy_idx = i
@@ -1084,6 +1174,9 @@ class TdxStockBacktest:
                         self.in_position = True
                         # buy_datetime = datetime
                         self.buy_kline_index = current_idx  # 【新增】记录买入时的全局 K 线索引
+
+                        # 【新增】：暂存当前的买点位置，以便卖出时读取
+                        self.current_buy_position = row.get('buy_position', '未知')
                         
                         trade_detail = {
                             '股票代码': code,
@@ -1129,6 +1222,7 @@ class TdxStockBacktest:
                 trade_detail = {
                     '股票代码': code,
                     '交易时间': datetime,
+                    '起爆点位置': getattr(self, 'current_buy_position', '未知'),  # 【新增字段】
                     '交易类型': '策略卖出',
                     '价格': close_price,
                     '数量': sell_num,
@@ -1349,7 +1443,7 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 use_txt_files=True,        # 启用 txt 文件读取
                 txt_day_dir=r"D:\zd_hbzq\daochushujuday",
                 txt_5min_dir=r"D:\zd_hbzq\daochushuju5f",
-                start_date='2023-12-01',
+                start_date='2024-12-01',
                 end_date='2026-05-28'
             )
             if metrics:  # 仅保留有有效指标的股票
