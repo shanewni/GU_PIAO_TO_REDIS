@@ -4,7 +4,7 @@ import random
 from datetime import datetime
 
 # 1. 加载数据
-file_path = "板块回测汇总结果_含总笔数2026-04-23-18-13-56_5fk最低点止损.xlsx"  # 替换为你的文件路径
+file_path = "板块回测汇总结果_含总笔数2026-04-24-17-46-35_30f起爆k线最低止损_周线笔一半以下.xlsx"  # 替换为你的文件路径
 df = pd.read_excel(file_path, sheet_name='所有交易明细')
 
 # 转换时间格式

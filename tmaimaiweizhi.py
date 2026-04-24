@@ -5,7 +5,7 @@ import numpy as np
 
 def analyze_trade_performance():
     # 1. 自动定位最新的回测结果文件
-    files = glob.glob("板块回测汇总结果_含总笔数2026-04-23-12-09-49_增加起爆位置_20251218_to_20260507_特定时段_10,14.xlsx")  # 替换为你的文件路径模式
+    files = glob.glob("板块回测汇总结果_含总笔数2026-04-24-10-20-45_5f最低点止损3%以内_5f反起爆_test_1%风险金_止损位置5f低.xlsx")  # 替换为你的文件路径模式
     if not files:
         print("错误：未找到回测结果 Excel 文件。")
         return

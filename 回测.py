@@ -616,11 +616,12 @@ class TdxStockBacktest:
                                     # 校验：止损价格不能超过30分钟K的收盘价（必须在下方）
                                     if candidate_loss < current_30f_close:
                                         loss_price = candidate_loss
+                                        # window_signal[-1] = 1.0
                                         break # 找到该底分型后的第一个起爆点，跳出search_end循环
                             except:
                                 continue
                             if search_end== len(h_5):
-                                window_signal[-1] = 0.0
+                                window_signal[-1] = 1.0
 
             if window_signal[-1] == 1.0:    
                 # 3. 校验逻辑
@@ -1496,7 +1497,7 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 use_txt_files=True,        # 启用 txt 文件读取
                 txt_day_dir=r"D:\zd_hbzq\daochushujuday",
                 txt_5min_dir=r"D:\zd_hbzq\daochushuju5f",
-                start_date='2024-12-01',
+                start_date='2023-12-01',
                 end_date='2026-05-28'
             )
             if metrics:  # 仅保留有有效指标的股票
