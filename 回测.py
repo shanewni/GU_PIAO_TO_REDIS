@@ -237,6 +237,7 @@ class TdxStockBacktest:
         df_day.index = pd.to_datetime(df_day.index)
             
         # --- 新增：时间段过滤逻辑 ---
+        start_date='2020-12-01'
         if start_date:
             df_day = df_day[df_day.index >= pd.to_datetime(start_date)]
         if end_date:
@@ -971,7 +972,7 @@ class TdxStockBacktest:
         if cond_pattern: return True, pattern_reason
         return False, ""   
     
-    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float]) -> pd.DataFrame:
+    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float],rps_series: pd.Series = None) -> pd.DataFrame:
             data = min30_data.copy()
             data.index.name = 'datetime'
             day_df.index.name = 'datetime'
@@ -990,6 +991,20 @@ class TdxStockBacktest:
                 on='date_only', 
                 how='left'
             ).set_index('datetime')
+
+            # 将日线级别的综合 RPS 过滤结果同步到 30 分钟数据上
+            if rps_series is not None:
+                data['date_only'] = data.index.date
+                # 此时 rps_series 里的值是 1 (符合RPS条件) 或 0 (不符合)
+                rps_df = rps_series.to_frame(name='rps_ok_flag')
+                rps_df['date_only'] = rps_df.index.date
+                data = data.reset_index().merge(
+                    rps_df[['date_only', 'rps_ok_flag']], 
+                    on='date_only', 
+                    how='left'
+                ).set_index('datetime')
+            else:
+                data['rps_ok_flag'] = 0 # 默认不限制
 
             # --- 2. 预计算基础指标 ---
             buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist(), data['开盘价'].tolist())
@@ -1017,7 +1032,8 @@ class TdxStockBacktest:
                 
                 if not in_pos:
                     # 尝试买入
-                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
+                    rps_is_strong = data['rps_ok_flag'].iloc[i] == 1
+                    if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i] and  rps_is_strong:
                         data.loc[current_idx_time, 'signal'] = 1
 
                         # 【新增】：计算当前起爆点所处的结构位置
@@ -1071,7 +1087,7 @@ class TdxStockBacktest:
                  use_txt_files: bool = False,
                  txt_day_dir: str = r"D:\zd_hbzq\daochushujuday",
                  txt_5min_dir: str = r"D:\zd_hbzq\daochushuju5f",
-                 start_date=None, end_date=None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+                 start_date=None, end_date=None,current_rps: pd.Series = None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
 
         """
         执行三买变体策略回测（30分钟周期）
@@ -1118,7 +1134,7 @@ class TdxStockBacktest:
             return pd.DataFrame(), {}, []
         
         # 生成策略信号
-        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low)
+        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low,current_rps)
         
         # 初始化止损百分比
         self.stop_loss_ratio = stop_loss_ratio
@@ -1430,10 +1446,34 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
     all_metrics = []
     all_trades_detail = []  # 存储所有股票的交易明细
 
+    all_day_data = {}
+    # 步骤 A: 预抓取所有日线数据用于计算全局 RPS
+    print("正在预取日线数据以计算 RPS 强度...")
+    for code in stock_codes:
+        df = backtest.get_local_day_data(code)
+        if not df.empty:
+            all_day_data[code] = df
+    # 步骤 B: 计算多周期 RPS 强度
+    print("正在计算 RPS60 和 RPS120 和 RPS250 强度矩阵...")
+    rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=60)
+    rps120_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=120)
+    rps250_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=250)
+
     # 逐只股票回测
     for idx, code in enumerate(stock_codes):
         print(f"\n------------------- 进度 {idx+1}/{len(stock_codes)} -------------------")
         try:
+            # --- 核心逻辑修改：提取该股的两个 RPS 序列并计算“或”逻辑 ---
+            s60 = rps60_matrix[code] if code in rps60_matrix else pd.Series(0, index=rps60_matrix.index)
+            s120 = rps120_matrix[code] if code in rps120_matrix else pd.Series(0, index=rps120_matrix.index)
+            s250 = rps250_matrix[code] if code in rps250_matrix else pd.Series(0, index=rps250_matrix.index)
+            
+            # 只要其中一个大于 80，该序列即为 True (1)，否则为 False (0)
+            # 这样传给策略函数时，策略只需要判断这个综合信号即可
+
+            combined_rps_filter = ((s60 >= 90) & (s120 >= 90) & (s250 >= 90)).astype(int)
+            combined_rps_filter = combined_rps_filter.shift(1).fillna(0)   # 改为用昨日RPS
+            
             _, metrics, trades_detail = backtest.run_backtest(
                 code=code,
                 init_cash=init_cash,
@@ -1444,7 +1484,8 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 txt_day_dir=r"D:\zd_hbzq\daochushujuday",
                 txt_5min_dir=r"D:\zd_hbzq\daochushuju5f",
                 start_date='2023-12-01',
-                end_date='2026-05-28'
+                end_date='2026-05-28',
+                current_rps=combined_rps_filter
             )
             if metrics:  # 仅保留有有效指标的股票
                 metrics['股票代码'] = code
