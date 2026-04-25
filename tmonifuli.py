@@ -4,7 +4,7 @@ import random
 from datetime import datetime
 
 # 1. 加载数据
-file_path = "板块回测汇总结果_含总笔数2026-04-25-12-00-08.xlsx"  # 替换为你的文件路径
+file_path = "板块回测汇总结果_含总笔数2026-04-25-12-00-08.xlsx"
 df = pd.read_excel(file_path, sheet_name='所有交易明细')
 
 # 转换时间格式
@@ -23,20 +23,22 @@ for code, group in df.groupby('股票代码'):
                 '股票代码': code,
                 '买入时间': temp_buy['交易时间'],
                 '卖出时间': row['交易时间'],
-                '单笔盈亏': row['单笔盈亏'],
-                '实际盈亏比例': row['实际盈亏比例']
+                # 核心：复利模拟必须依赖比例
+                '实际盈亏比例': row['实际盈亏比例'] 
             })
             temp_buy = None
 
 trades_df = pd.DataFrame(trades).sort_values('买入时间')
 
-def run_single_simulation(all_trades, initial_capital=100000):
+def run_single_simulation_compounding(all_trades, initial_capital=100000):
     """
-    执行单次模拟：同一时间只持有一只票
+    执行单次模拟：复利模式（同一时间只持有一只票，全仓滚动）
     """
     current_time = datetime(2000, 1, 1)
-    executed_trades_pnl = [] # 存储每笔交易的盈亏金额
-    executed_trades_list = []
+    current_balance = initial_capital # 账户初始余额
+    
+    pnl_ratios = []   # 存储每笔盈亏比例
+    balance_history = [initial_capital] # 存储净值曲线数据
     
     time_groups = all_trades.groupby('买入时间')
     unique_buy_times = sorted(all_trades['买入时间'].unique())
@@ -46,19 +48,28 @@ def run_single_simulation(all_trades, initial_capital=100000):
             available_signals = time_groups.get_group(buy_time)
             if len(available_signals) == 0:
                 continue
+                
             selected_trade = available_signals.sample(n=1).iloc[0]
             
-            # 记录数据
-            executed_trades_pnl.append(selected_trade['单笔盈亏'])
-            executed_trades_list.append(selected_trade)
+            # --- 复利核心逻辑 ---
+            ratio = selected_trade['实际盈亏比例'] / 100.0
             
-            # 更新当前时间为卖出时间，确保持仓不重叠
+            # 当前盈亏金额 = 当前本金 * 盈亏比例
+            pnl_amount = current_balance * ratio
+            # 更新账户总金额 (利滚利)
+            current_balance += pnl_amount
+            
+            # 记录数据
+            pnl_ratios.append(ratio)
+            balance_history.append(current_balance)
+            
+            # 更新当前时间为卖出时间
             current_time = selected_trade['卖出时间']
             
-    # --- 新增：计算单次模拟的各项指标 ---
-    pnl_array = np.array(executed_trades_pnl)
-    total_profit = pnl_array.sum()
-    trade_count = len(pnl_array)
+    # --- 计算复利模式下的各项指标 ---
+    trade_count = len(pnl_ratios)
+    total_profit = current_balance - initial_capital
+    pnl_array = np.array(pnl_ratios)
     
     win_rate = 0
     plt_ratio = 0
@@ -68,45 +79,43 @@ def run_single_simulation(all_trades, initial_capital=100000):
         # 1. 胜率
         win_rate = (pnl_array > 0).sum() / trade_count
         
-        # 2. 盈亏比 (平均盈利 / 平均亏损的绝对值)
+        # 2. 盈亏比 (基于比例的平均盈利 / 平均亏损)
         wins = pnl_array[pnl_array > 0]
         losses = pnl_array[pnl_array < 0]
         avg_win = wins.mean() if len(wins) > 0 else 0
         avg_loss = abs(losses.mean()) if len(losses) > 0 else 0
         plt_ratio = avg_win / avg_loss if avg_loss != 0 else 0
         
-        # 3. 夏普比率 (基于交易序列的简化版：日均收益率/波动率 * sqrt(交易频率))
-        # 这里使用单笔盈亏的均值和标准差来评估收益稳定性
+        # 3. 夏普比率 (针对净值曲线的稳定性评估)
+        # 使用对数收益率计算更准确，这里采用单笔比例简化计算
         if len(pnl_array) > 1 and pnl_array.std() != 0:
             sharpe = (pnl_array.mean() / pnl_array.std()) * np.sqrt(trade_count)
 
-    return total_profit, trade_count, win_rate, plt_ratio, sharpe
+    return total_profit, trade_count, win_rate, plt_ratio, sharpe, current_balance
 
 # 3. 开始随机模拟
 num_simulations = 500
-results = [] # 存储每次模拟的所有指标
+results = []
 
-print(f"正在进行 {num_simulations} 次随机模拟...")
+print(f"正在进行 {num_simulations} 次随机模拟（复利模式）...")
 for i in range(num_simulations):
-    # 接收新增的三个指标
-    profit, count, win_rate, plt_ratio, sharpe = run_single_simulation(trades_df)
+    profit, count, win_rate, plt_ratio, sharpe, final_balance = run_single_simulation_compounding(trades_df)
     results.append({
         'profits': profit,
         'counts': count,
         'win_rates': win_rate,
         'plt_ratios': plt_ratio,
-        'sharpes': sharpe
+        'sharpes': sharpe,
+        'final_balance': final_balance
     })
 
-# 转换成 DataFrame 方便做统计
 res_df = pd.DataFrame(results)
 
 # 4. 打印结果
 print("\n" + "="*40)
-print(f"统计指标 (基于 10w 初始本金，单仓位随机模拟)")
+print(f"统计指标 (初始本金 10w，单仓位全仓复利模拟)")
 print("="*40)
 
-# 辅助函数用于快速输出
 def print_metric(label, series, is_percent=False):
     fmt = ".2%" if is_percent else ",.2f"
     print(f"\n【{label}】")
@@ -116,8 +125,8 @@ def print_metric(label, series, is_percent=False):
     print(f"中位数: {series.median():{fmt}}")
     print(f"标准差: {series.std():.2f}")
 
-# 保留原有输出并增加新指标
-print_metric("总盈亏 (元)", res_df['profits'])
+print_metric("最终账户余额 (元)", res_df['final_balance'])
+print_metric("净利润 (元)", res_df['profits'])
 print(f"正收益概率: {(res_df['profits'] > 0).sum() / num_simulations * 100:.2f}%")
 
 print_metric("交易次数", res_df['counts'])

@@ -1443,7 +1443,7 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 use_txt_files=True,        # 启用 txt 文件读取
                 txt_day_dir=r"D:\zd_hbzq\daochushujuday",
                 txt_5min_dir=r"D:\zd_hbzq\daochushuju5f",
-                start_date='2024-12-01',
+                start_date='2023-12-01',
                 end_date='2026-05-28'
             )
             if metrics:  # 仅保留有有效指标的股票
