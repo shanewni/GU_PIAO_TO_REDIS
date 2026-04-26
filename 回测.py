@@ -237,7 +237,7 @@ class TdxStockBacktest:
         df_day.index = pd.to_datetime(df_day.index)
             
         # --- 新增：时间段过滤逻辑 ---
-        start_date='2020-12-01'
+        # start_date='2020-12-01'
         if start_date:
             df_day = df_day[df_day.index >= pd.to_datetime(start_date)]
         if end_date:
@@ -355,23 +355,29 @@ class TdxStockBacktest:
     @staticmethod
     def calculate_rps_matrix(all_stocks_data: Dict[str, pd.DataFrame], n: int = 250) -> pd.DataFrame:
         """
-        计算 30 分钟级别的 RPS 矩阵
-        :param n: 回测周期（如果是30分钟线，n=250 约等于 31 个交易日）
+        计算整个池子的 RPS 矩阵
+        :param all_stocks_data: {code: df} 字典，df 需包含收盘价
+        :param n: 回测周期 (250, 120, 60)
+        :return: 一个以时间为索引，股票代码为列的 RPS 评分表
         """
         extrs_dict = {}
         for code, df in all_stocks_data.items():
+            # 确保 DataFrame 不为空且包含必要列
             if df is None or df.empty or '收盘价' not in df.columns:
                 continue
-            # 计算 30 分钟 K 线跨度的涨幅
+            # 计算 EXTRS: (C - REF(C, N)) / REF(C, N)
             extrs_dict[code] = df['收盘价'].pct_change(n)
 
         if not extrs_dict:
             return pd.DataFrame()
         
         extrs_df = pd.DataFrame(extrs_dict)
-        # 每一行（每一个30分钟时间点）进行全成员排名
+        # 3. 关键：前 N 天的数据都是 NaN，不能参与排名
+        # axis=1 表示每一行（同一天）进行排名
+        # pct=True 得到 0-1 的分位数，再乘以 100
+        # min_periods=1 确保只要当天有数据的股票都参与排名
         rps_df = extrs_df.rank(axis=1, pct=True, ascending=True) * 100
-        return rps_df
+        return rps_df 
     
     def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
         """
@@ -500,8 +506,8 @@ class TdxStockBacktest:
                         return pf_out  # 向上线段中有价格高于最近高点，不满足
                     i += 1
         
-        if last_k_idx -1 <= down_seg_end:
-            return pf_out  # 最后一根K线过近，不满足
+        # if last_k_idx -1 <= down_seg_end:
+        #     return pf_out  # 最后一根K线过近，不满足
         
         # 所有条件满足，标记信号
         pf_out[last_k_idx] = 1.0
@@ -570,7 +576,7 @@ class TdxStockBacktest:
                 loss_price = min(low_window[-1], prev_close)
                 close_price = close_window[-1]
 
-                if (close_price-loss_price)/loss_price*100 > 3:
+                if (close_price-loss_price)/loss_price*100 > 6:
                     window_signal[-1] = 0.0
                 elif (close_price-loss_price)/loss_price*100 < 0.5:
                     window_signal[-1] = 0.0
@@ -1004,7 +1010,7 @@ class TdxStockBacktest:
                     how='left'
                 ).set_index('datetime')
             else:
-                data['rps_ok_flag'] = 0 # 默认不限制
+                data['rps_ok_flag'] = 0 # 默认限制
 
             # --- 2. 预计算基础指标 ---
             buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist(), data['开盘价'].tolist())
@@ -1455,9 +1461,9 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
             all_day_data[code] = df
     # 步骤 B: 计算多周期 RPS 强度
     print("正在计算 RPS60 和 RPS120 和 RPS250 强度矩阵...")
-    rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=60)
-    rps120_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=120)
-    rps250_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=250)
+    rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=5)
+    rps120_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=8)
+    rps250_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=13)
 
     # 逐只股票回测
     for idx, code in enumerate(stock_codes):
@@ -1473,7 +1479,7 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
 
             combined_rps_filter = ((s60 >= 90) & (s120 >= 90) & (s250 >= 90)).astype(int)
             combined_rps_filter = combined_rps_filter.shift(1).fillna(0)   # 改为用昨日RPS
-            
+
             _, metrics, trades_detail = backtest.run_backtest(
                 code=code,
                 init_cash=init_cash,
@@ -1483,7 +1489,7 @@ def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0,
                 use_txt_files=True,        # 启用 txt 文件读取
                 txt_day_dir=r"D:\zd_hbzq\daochushujuday",
                 txt_5min_dir=r"D:\zd_hbzq\daochushuju5f",
-                start_date='2023-12-01',
+                start_date='2025-11-01',
                 end_date='2026-05-28',
                 current_rps=combined_rps_filter
             )
@@ -1718,7 +1724,7 @@ if __name__ == "__main__":
             stock_codes=stock_list,
             init_cash=100000.0,    # 单股票初始资金10万
             commission=0.0003,     # 佣金0.03%
-            stop_loss_ratio=0.01   # 单笔止损1%
+            stop_loss_ratio=0.02   # 单笔止损1%
         )
         # ================== 执行理论复利计算 ==================
         trades_list = trades_detail_result.to_dict('records') if not trades_detail_result.empty else []

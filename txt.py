@@ -85,7 +85,7 @@ def convert_to_daily_signals(excel_file, sheet_name='Sheet1', output_file='tdx_s
 # ========== 使用示例 ==========
 if __name__ == "__main__":
     # 修改为你的实际文件名
-    excel_file = "板块回测汇总结果_含总笔数2026-04-22-12-50-17_前复权.xlsx"  # Excel文件名
+    excel_file = "板块回测汇总结果_含总笔数2026-04-26-17-12-50_rps13，8，5，30f起爆买入_2%风险金.xlsx"  # Excel文件名
     sheet_name = "所有交易明细"        # 工作表名称
     output_file = "tdx_signals.txt"  # 输出文件名
     
