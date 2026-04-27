@@ -5,7 +5,7 @@ import numpy as np
 
 def analyze_trade_performance():
     # 1. 自动定位最新的回测结果文件
-    files = glob.glob("板块回测汇总结果_含总笔数2026-04-26-12-34-06_rps60,120,250,90以上.xlsx")  # 替换为你的文件路径模式
+    files = glob.glob("板块回测汇总结果_含总笔数2026-04-27-17-00-38_正常_增加日线起爆位置.xlsx")  # 替换为你的文件路径模式
     if not files:
         print("错误：未找到回测结果 Excel 文件。")
         return
@@ -69,7 +69,7 @@ def analyze_trade_performance():
         })
 
     # 4. 分组并计算
-    result = df_sell.groupby('起爆点位置').apply(get_stats)
+    result = df_sell.groupby('起爆点位置(30分)').apply(get_stats)
 
     # 5. 按照性价比降序排列
     result = result.sort_values(by='性价比', ascending=False)

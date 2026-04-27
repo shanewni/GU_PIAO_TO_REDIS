@@ -3,9 +3,10 @@ import numpy as np
 from datetime import datetime
 
 # ================= 配置区 =================
-FILE_PATH = "板块回测汇总结果_含总笔数2026-04-23-12-09-49_增加起爆位置.xlsx" # 请确保路径正确
-ALLOWED_BUY_TIMES = ["10:00","10:30", "11:00", "11:30", "13:30", "14:00", "14:30", "15:00"] 
-# ALLOWED_BUY_TIMES = ["10:00","10:30", "14:00"] 
+FILE_PATH = "板块回测汇总结果_含总笔数2026-04-25-12-00-08_正常.xlsx" # 请确保路径正确
+# ALLOWED_BUY_TIMES = ["10:00","10:30", "11:00", "11:30", "13:30", "14:00", "14:30", "15:00"] 
+ALLOWED_BUY_TIMES = ["13:30", "14:00", "14:30"] # 
+# ALLOWED_BUY_TIMES = ["10:00","10:30", "11:00", "11:30"] # 
 
 # 从图片识别出的所有起爆点位列表（你可以按需删减）
 # ALLOWED_START_POINTS = [
@@ -21,12 +22,18 @@ ALLOWED_START_POINTS = [
 ]
 # ==========================================
 
-# 1. 加载数据并清洗列名
+# --- 新增：日期筛选配置 ---
+# 格式：YYYY-MM-DD，如果不想限制，可以设置为 None
+START_DATE = "2025-01-01" 
+END_DATE   = "2026-05-31" 
+# ==========================================
+
+# 1. 加载数据
 df = pd.read_excel(FILE_PATH, sheet_name='所有交易明细')
-df.columns = df.columns.str.strip() # 自动去除表头空格
+df.columns = df.columns.str.strip() 
 df['交易时间'] = pd.to_datetime(df['交易时间'])
 
-# 2. 预处理：将买入和卖出配对，并从卖出行提取“起爆点位置”
+# 2. 预处理
 trades = []
 for code, group in df.groupby('股票代码'):
     group = group.sort_values('交易时间')
@@ -34,30 +41,37 @@ for code, group in df.groupby('股票代码'):
     
     for _, row in group.iterrows():
         if row['交易类型'] == '买入':
-            temp_buy = row  # 暂时记录买入信息
+            temp_buy = row 
             
         elif row['交易类型'] == '策略卖出' and temp_buy is not None:
-            # --- 核心逻辑：在卖出这一行提取“起爆点位置” ---
-            # 请注意：根据你的截图，Excel 里的列名是 "起爆点位置"
             point_val = str(row['起爆点位置']).strip()
             
-            # 过滤 1：判断起爆点是否符合要求
+            # --- 过滤逻辑 ---
+            # 1. 起爆点过滤
             point_ok = (ALLOWED_START_POINTS is None) or (point_val in ALLOWED_START_POINTS)
             
-            # 过滤 2：判断买入行的时间是否符合要求
-            buy_hm = temp_buy['交易时间'].strftime('%H:%M')
+            # 2. 买入时间点过滤 (HH:MM)
+            buy_time_dt = temp_buy['交易时间']
+            buy_hm = buy_time_dt.strftime('%H:%M')
             time_ok = buy_hm in ALLOWED_BUY_TIMES
             
-            if point_ok and time_ok:
+            # 3. 新增：年月日时间段过滤
+            date_ok = True
+            if START_DATE:
+                date_ok = date_ok and (buy_time_dt >= pd.to_datetime(START_DATE))
+            if END_DATE:
+                # 为了包含结束当天，通常会比对到 23:59:59，或者直接对比日期
+                date_ok = date_ok and (buy_time_dt <= pd.to_datetime(END_DATE).replace(hour=23, minute=59, second=59))
+
+            if point_ok and time_ok and date_ok:
                 trades.append({
                     '股票代码': code,
-                    '买入时间': temp_buy['交易时间'],
+                    '买入时间': buy_time_dt,
                     '卖出时间': row['交易时间'],
                     '单笔盈亏': row['单笔盈亏'],
                     '实际盈亏比例': row['实际盈亏比例'],
-                    '起爆点位置': point_val # 记录一下方便核对
+                    '起爆点位置': point_val
                 })
-            # 处理完一对，重置买入信号
             temp_buy = None
 
 trades_df = pd.DataFrame(trades).sort_values('买入时间')
@@ -130,7 +144,7 @@ def print_metric(label, series, is_percent=False):
     print(f"平均: {series.mean():{fmt}} | 中位数: {series.median():{fmt}}")
 
 print("\n" + "="*50)
-print(f"策略回测报告 (买入时段: {ALLOWED_BUY_TIMES} | 起爆点: {ALLOWED_START_POINTS})")
+print(f"策略回测报告 (买入时段: {ALLOWED_BUY_TIMES} | 起爆点: {ALLOWED_START_POINTS}) | 日期范围: {START_DATE} ~ {END_DATE}")
 print("="*50)
 
 if not res_df.empty:
