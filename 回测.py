@@ -934,16 +934,6 @@ class TdxStockBacktest:
         针对单根K线判定是否触发动态卖出（含盈亏门槛校验）
         """
         current_close = close_full[current_idx]
-
-        # ===========================================================
-        # 核心新增：T+1 (第二根K线) 弱势快速切断逻辑
-        # ===========================================================
-        # 如果当前索引正好是买入索引的后一根
-        if current_idx == buy_idx + 1:
-            # 计算当前K线收盘价相对于买入价的涨跌幅
-            post_1k_change = (current_close - buy_price) / buy_price * 100
-            if post_1k_change <= -0.5:
-                return True, f"T+1弱势切断(涨幅:{post_1k_change:.2f}%)"
         
         # === 1. 均线条件判定 (满足涨幅 > 10% 或 持仓 > 30根) ===
         cond_ma60 = False
@@ -1025,17 +1015,17 @@ class TdxStockBacktest:
             how='left'
         ).set_index('datetime')
 
-        if rps_series is not None:
-            data['date_only'] = data.index.date
-            rps_df = rps_series.to_frame(name='rps_ok_flag')
-            rps_df['date_only'] = rps_df.index.date
-            data = data.reset_index().merge(
-                rps_df[['date_only', 'rps_ok_flag']], 
-                on='date_only', 
-                how='left'
-            ).set_index('datetime')
-        else:
-            data['rps_ok_flag'] = 1 
+        # if rps_series is not None:
+        #     data['date_only'] = data.index.date
+        #     rps_df = rps_series.to_frame(name='rps_ok_flag')
+        #     rps_df['date_only'] = rps_df.index.date
+        #     data = data.reset_index().merge(
+        #         rps_df[['date_only', 'rps_ok_flag']], 
+        #         on='date_only', 
+        #         how='left'
+        #     ).set_index('datetime')
+        # else:
+        #     data['rps_ok_flag'] = 1 
             
         data['day_buy_position'] = data['day_buy_position'].fillna('未知')
         # --- 新增：2. 预计算 30 分钟级别单根K线的涨跌幅 ---
@@ -1065,24 +1055,37 @@ class TdxStockBacktest:
             current_idx_time = data.index[i]
             
             if not in_pos:
-                rps_is_strong = data['rps_ok_flag'].iloc[i] == 1
-                if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i] and rps_is_strong:
-                    data.loc[current_idx_time, 'signal'] = 1
+                if i > 0: # 必须从第二根开始，才能往前追溯一根K线
+                    # 1. 检查【前一根K线(i-1)】是否满足所有的起爆信号和过滤条件
+                    prev_signal_ok = data['buy_signal'].iloc[i-1] == 1.0
+                    prev_day_valid = data['day_signal_valid'].iloc[i-1]
+                    # prev_rps_is_strong = data['rps_ok_flag'].iloc[i-1] == 1
+                    # rps_is_strong = data['rps_ok_flag'].iloc[i] == 1
+                    if prev_signal_ok and prev_day_valid: 
+                        # 2. 检查【当前K线(i)】的动能是否达标 (涨幅 > 0.5%)
+                        current_pct_chg = (close_list[i] - close_list[i-1]) / close_list[i-1] * 100
+                        if current_pct_chg > 0.5:
+                            # 确认买入信号落在当前K线上
+                            data.loc[current_idx_time, 'signal'] = 1
 
-                    frac_up_to_now = gupiaojichu.identify_turns(i+1, high_list[:i+1], low_list[:i+1])
-                    buy_pos = self.classify_buy_position(frac_up_to_now, high_list[:i+1], low_list[:i+1])
-                    data.loc[current_idx_time, 'buy_position'] = buy_pos
-
-                    in_pos = True
-                    buy_price = close_list[i]
-                    buy_idx = i
-                    if i > 0:
-                        prev_high = high_list[i-1]
-                        initial_stop_loss = min(low_list[i], prev_high)
-                    else:
-                        initial_stop_loss = low_list[i]
-                    current_stop_loss = initial_stop_loss 
-                    data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
+                            # 3. 结构位置的分类依然基于【前一根(i-1)】起爆K线来判定
+                            # 传入长度为 i，切片 [:i] 刚好取到 0 到 i-1 的数据
+                            frac_up_to_prev = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
+                            buy_pos = self.classify_buy_position(frac_up_to_prev, high_list[:i], low_list[:i])
+                            data.loc[current_idx_time, 'buy_position'] = buy_pos
+                            
+                            # 4. 止损价沿用【前一根(i-1)】起爆K线的计算逻辑
+                            if i - 1 > 0:
+                                prev_prev_high = high_list[i-2] # 前一根的前一根的高点
+                                initial_stop_loss = min(low_list[i-1], prev_prev_high)
+                            else:
+                                initial_stop_loss = low_list[i-1]
+                                
+                            in_pos = True
+                            buy_price = close_list[i]
+                            buy_idx = i
+                            current_stop_loss = initial_stop_loss 
+                            data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
             else:       
                 if low_list[i] <= current_stop_loss:
                     data.loc[current_idx_time, 'signal'] = -1
