@@ -1051,41 +1051,52 @@ class TdxStockBacktest:
         initial_stop_loss = 0.0
         current_stop_loss = 0.0 
         
+        # 【新增：定义黄金白名单组合 (日线位置, 30分位置)】
+        GOLDEN_COMBINATIONS = {
+            ('二买延续4', '二买'), ('二买延续2', '二买延续3'), ('二买延续2', '二买延续1'),
+            ('一买', '三买'), ('一买', '三买延续2'), ('二买延续2', '三买'),
+            ('二买延续1', '三买'), ('三买之上1', '一买'), ('一买', '二买'),
+            ('二买', '三买'), ('三买延续2', '三买延续1'), ('二买', '二买延续1'),
+            ('一买', '三买之上1'), ('三买', '二买延续2'), ('二买延续1', '一买'),
+            ('三买', '二买'), ('二买延续2', '一买'), ('二买', '三买之上1'),
+            ('二买延续3', '二买'), ('三买之上2', '二买'), ('二买', '三买延续2'),
+            ('一买', '三买延续3'), ('二买', '二买延续3'), ('三买', '三买之上3'),
+            ('三买延续2', '二买延续1'), ('三买延续1', '二买延续3'), ('二买', '三买之上5'),
+            ('二买延续3', '三买延续1')
+        }
+
         for i in range(len(data)):
             current_idx_time = data.index[i]
             
-            if not in_pos:
-                if i > 0: # 必须从第二根开始，才能往前追溯一根K线
-                    # 1. 检查【前一根K线(i-1)】是否满足所有的起爆信号和过滤条件
-                    prev_signal_ok = data['buy_signal'].iloc[i-1] == 1.0
-                    prev_day_valid = data['day_signal_valid'].iloc[i-1]
-                    # prev_rps_is_strong = data['rps_ok_flag'].iloc[i-1] == 1
-                    # rps_is_strong = data['rps_ok_flag'].iloc[i] == 1
-                    if prev_signal_ok and prev_day_valid: 
-                        # 2. 检查【当前K线(i)】的动能是否达标 (涨幅 > 0.5%)
-                        current_pct_chg = (close_list[i] - close_list[i-1]) / close_list[i-1] * 100
-                        if current_pct_chg > 0.5:
-                            # 确认买入信号落在当前K线上
-                            data.loc[current_idx_time, 'signal'] = 1
-
-                            # 3. 结构位置的分类依然基于【前一根(i-1)】起爆K线来判定
-                            # 传入长度为 i，切片 [:i] 刚好取到 0 到 i-1 的数据
-                            frac_up_to_prev = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
-                            buy_pos = self.classify_buy_position(frac_up_to_prev, high_list[:i], low_list[:i])
-                            data.loc[current_idx_time, 'buy_position'] = buy_pos
+            if not in_pos:             
+                # 1. 基础信号满足
+                if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
+                    
+                    # 2. 提前计算当前的 30 分钟结构位置
+                    frac_up_to_now = gupiaojichu.identify_turns(i+1, high_list[:i+1], low_list[:i+1])
+                    buy_pos_30m = self.classify_buy_position(frac_up_to_now, high_list[:i+1], low_list[:i+1])
+                    
+                    # 3. 提取当前的日线结构位置
+                    buy_pos_day = data['day_buy_position'].iloc[i]
+                    
+                    # 4. 【核心过滤】：只有该组合存在于白名单中，才允许开仓
+                    if (buy_pos_day, buy_pos_30m) in GOLDEN_COMBINATIONS:
+                        data.loc[current_idx_time, 'signal'] = 1
+                        data.loc[current_idx_time, 'buy_position'] = buy_pos_30m
+                        
+                        in_pos = True
+                        buy_price = close_list[i]
+                        buy_idx = i
+                        
+                        # 5. 计算止损位
+                        if i > 0:
+                            prev_high = high_list[i-1]
+                            initial_stop_loss = min(low_list[i], prev_high)
+                        else:
+                            initial_stop_loss = low_list[i]
                             
-                            # 4. 止损价沿用【前一根(i-1)】起爆K线的计算逻辑
-                            if i - 1 > 0:
-                                prev_prev_high = high_list[i-2] # 前一根的前一根的高点
-                                initial_stop_loss = min(low_list[i-1], prev_prev_high)
-                            else:
-                                initial_stop_loss = low_list[i-1]
-                                
-                            in_pos = True
-                            buy_price = close_list[i]
-                            buy_idx = i
-                            current_stop_loss = initial_stop_loss 
-                            data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
+                        current_stop_loss = initial_stop_loss 
+                        data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
             else:       
                 if low_list[i] <= current_stop_loss:
                     data.loc[current_idx_time, 'signal'] = -1
