@@ -17,7 +17,7 @@ warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
 BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
-# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
+# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST2.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -182,6 +182,7 @@ class TdxStockBacktest:
         if df.empty:
             return df
         # 时间段过滤
+        start_date = '2020-11-01'
         if start_date:
             df = df[df.index >= pd.to_datetime(start_date)]
         if end_date:
@@ -998,6 +999,34 @@ class TdxStockBacktest:
             day_positions.append(pos)
             
         day_df['day_buy_position'] = day_positions
+
+        # ================== 【新增：计算周线级别的结构位置】 ==================
+        # 1. 由日线合成周线
+        week_df = day_df.resample('W-FRI').agg({
+            '开盘价': 'first', '最高价': 'max', '最低价': 'min', '收盘价': 'last'
+        }).dropna()
+
+        week_high_list = week_df['最高价'].tolist()
+        week_low_list = week_df['最低价'].tolist()
+        week_positions = []
+
+        # 2. 逐周推算周线结构位置
+        for i in range(len(week_df)):
+            if i < 3:
+                week_positions.append("未知")
+                continue
+            frac_up_to_now = gupiaojichu.identify_turns(i+1, week_high_list[:i+1], week_low_list[:i+1])
+            pos = self.classify_buy_position(frac_up_to_now, week_high_list[:i+1], week_low_list[:i+1])
+            week_positions.append(pos)
+
+        week_df['week_buy_position'] = week_positions
+        
+        # 3. 将周线状态映射回日线 (依据 year + week number 映射)
+        day_df['year_week'] = day_df.index.isocalendar().year.astype(str) + '-' + day_df.index.isocalendar().week.astype(str)
+        week_df['year_week'] = week_df.index.isocalendar().year.astype(str) + '-' + week_df.index.isocalendar().week.astype(str)
+        week_mapping = dict(zip(week_df['year_week'], week_df['week_buy_position']))
+        day_df['week_buy_position'] = day_df['year_week'].map(week_mapping).fillna('未知')
+        # ======================================================================
         
         # --- 1. 日线过滤条件 (保持原逻辑) ---
         day_df = day_df.copy()
@@ -1010,7 +1039,7 @@ class TdxStockBacktest:
         day_df['date_only'] = day_df.index.date
         data = data.reset_index().merge(
             # 【修改】将 day_buy_position 一并合并到30分钟数据中
-            day_df[['date_only', 'day_signal_valid', 'day_buy_position']], 
+            day_df[['date_only', 'day_signal_valid', 'day_buy_position', 'week_buy_position']],
             on='date_only', 
             how='left'
         ).set_index('datetime')
@@ -1066,24 +1095,24 @@ class TdxStockBacktest:
         # }
 
         # 【新增：定义黄金白名单组合 (日线位置, 30分位置)】
-        # GOLDEN_COMBINATIONS = {
-        #     ('二买延续4', '二买'), ('二买延续2', '二买延续3'), ('二买延续2', '二买延续1'),
-        #     ('一买', '三买'), ('一买', '三买延续2'), ('二买延续2', '三买'),
-        #     ('二买延续1', '三买'), ('三买之上1', '一买'),
-        #     ('二买', '三买'), ('三买延续2', '三买延续1'),
-        #     ('一买', '三买之上1'), ('三买', '二买延续2'), 
-        #      ('二买延续2', '一买'), ('二买', '三买之上1'),
-        #     ('二买延续3', '二买')
-        # }
-        
-        # 【新增：定义黄金白名单组合 (日线位置, 30分位置)】
         GOLDEN_COMBINATIONS = {
             ('二买延续4', '二买'), ('二买延续2', '二买延续3'), ('二买延续2', '二买延续1'),
             ('一买', '三买'), ('一买', '三买延续2'), ('二买延续2', '三买'),
-            ('二买延续1', '三买'), 
-            ('一买', '三买之上1'), ('二买延续1', '一买'),('二买', '三买之上1'),
-            ('二买延续3', '二买'),('二买', '三买延续2'),('二买', '二买延续3')
+            ('二买延续1', '三买'), ('三买之上1', '一买'),
+            ('二买', '三买'), ('三买延续2', '三买延续1'),
+            ('一买', '三买之上1'), ('三买', '二买延续2'), 
+             ('二买延续2', '一买'), ('二买', '三买之上1'),
+            ('二买延续3', '二买')
         }
+        
+        # 【新增：定义黄金白名单组合 (日线位置, 30分位置)】
+        # GOLDEN_COMBINATIONS = {
+        #     ('二买延续4', '二买'), ('二买延续2', '二买延续3'), ('二买延续2', '二买延续1'),
+        #     ('一买', '三买'), ('一买', '三买延续2'), ('二买延续2', '三买'),
+        #     ('二买延续1', '三买'), 
+        #     ('一买', '三买之上1'), ('二买延续1', '一买'),('二买', '三买之上1'),
+        #     ('二买延续3', '二买'),('二买', '三买延续2'),('二买', '二买延续3')
+        # }
         for i in range(len(data)):
             current_idx_time = data.index[i]
             
@@ -1250,16 +1279,20 @@ class TdxStockBacktest:
                         # 暂存当前的结构位置
                         self.current_buy_position = row.get('buy_position', '未知')
                         self.current_day_buy_position = row.get('day_buy_position', '未知')  # 【新增记录日线】
+                        self.current_week_buy_position = row.get('week_buy_position', '未知') # 【新增：记录周线】
                         
                         trade_detail = {
                             '股票代码': code,
                             '交易时间': datetime,
                             '起爆点位置(30分)': self.current_buy_position,
                             '起爆点位置(日线)': self.current_day_buy_position,
+                            '起爆点位置(周线)': self.current_week_buy_position, # 【新增】
                             '交易类型': '买入',
                             '价格': close_price,
                             '数量': buy_num,
                             '费用': fee,
+                            '总资金': round(current_total_asset, 2),  # 【新增】买入前的总资产
+                            '剩余总资金': round(cash, 2),             # 【新增】买入扣款后的可用现金
                             '单笔盈亏': 0.0,
                             '是否盈利': None,
                             '设置止损价': self.stop_loss_price,
@@ -1311,10 +1344,13 @@ class TdxStockBacktest:
                     '交易时间': datetime,
                     '起爆点位置(30分)': getattr(self, 'current_buy_position', '未知'), 
                     '起爆点位置(日线)': getattr(self, 'current_day_buy_position', '未知'),  # 【新增】
+                    '起爆点位置(周线)': getattr(self, 'current_week_buy_position', '未知'), # 【新增】
                     '交易类型': '策略卖出',
                     '价格': close_price,
                     '数量': sell_num,
                     '费用': fee,
+                    '总资金': round(cash, 2),     # 【新增】由于单股回测全仓卖出，卖出后的总资产即为当前现金
+                    '剩余总资金': round(cash, 2),  # 【新增】同上，即变现后的可用资金
                     '单笔盈亏': pnl,
                     '是否盈利': pnl > 0,
                     '卖出原因': sell_reason,

@@ -5,7 +5,7 @@ import numpy as np
 
 def analyze_advanced_performance():
     # 1. 自动定位最新的回测结果文件 (请根据实际情况修改匹配字符串)
-    files = glob.glob("板块回测汇总结果_含总笔数2026-04-30-19-15-21_正常15组合_跌破底分型真正.xlsx")  
+    files = glob.glob("板块回测汇总结果_含总笔数2026-04-30-15-12-31_正常_增加周线起爆位置.xlsx")  
     if not files:
         print("错误：未找到回测结果 Excel 文件。")
         return
@@ -75,39 +75,42 @@ def analyze_advanced_performance():
     pd.set_option('display.unicode.east_asian_width', True)
 
     # ==========================================
-    # 维度一：多周期位置共振统计 (升级排序版)
+    # 维度一：三周期位置共振统计 (周+日+30分)
     # ==========================================
-    print("=" * 120)
-    print(f"{'维度一：多周期位置共振统计 (按【性价比】降序，仅展示交易>5笔的组合)':^120}")
+    print("\n" + "=" * 120)
+    print(f"{'维度一：三周期 (周线-日线-30分) 位置共振统计 (按【性价比】降序)':^120}")
+    print("解读：寻找跨周期共振的最优选，例如：周线转折 + 日线底分 + 30分三买")
     print("-" * 120)
-    if '起爆点位置(日线)' in df_sell.columns and '起爆点位置(30分)' in df_sell.columns:
-        res_multi = df_sell.groupby(['起爆点位置(日线)', '起爆点位置(30分)']).apply(get_stats).reset_index()
+    
+    # 检查所有必要的周期字段
+    required_cols = ['起爆点位置(周线)', '起爆点位置(日线)', '起爆点位置(30分)']
+    if all(col in df_sell.columns for col in required_cols):
+        # 进行三维度聚合计算
+        res_three_cycle = df_sell.groupby(required_cols).apply(get_stats).reset_index()
         
-        # 过滤掉偶然样本
-        res_multi = res_multi[res_multi['交易笔数'] >= 5]
+        # 过滤掉极小样本，保证结论可靠性
+        res_three_cycle = res_three_cycle[res_three_cycle['交易笔数'] >= 3]
         
-        # 【核心修改】按照性价比排序
-        res_multi = res_multi.sort_values(by='性价比', ascending=False)
+        # 按性价比降序排列
+        res_three_cycle = res_three_cycle.sort_values(by='性价比', ascending=False)
         
-        print(res_multi.to_string(index=False))
+        print(res_three_cycle.to_string(index=False))
     else:
-        print("未检测到日线或30分位置字段，请确保回测代码已更新。")
+        missing = [c for c in required_cols if c not in df_sell.columns]
+        print(f"缺失字段: {missing}，请确保回测代码已写入周线数据。")
 
     # ==========================================
-    # 维度二：起爆前后微观动能特征 (盈利组 vs 亏损组)
+    # 维度二：周线级别的“底色”过滤效应
     # ==========================================
     print("\n" + "=" * 100)
-    print(f"{'维度二：起爆前后 K线涨跌幅特征画像 (盈利单 vs 亏损单)':^100}")
-    print("解读：对比成功的突破和失败的突破，在买入前后几根K线上有什么不同表现？")
+    print(f"{'维度二：周线大环境对小级别交易的“降维打击”效应':^100}")
+    print("解读：当周线处于不同位置时，即使30分钟出现起爆点，其平均胜率和盈亏比有何差异？")
     print("-" * 100)
     
-    # 将结果分为盈利和亏损两组，计算这几根K线的平均涨跌幅
-    if all(c in df_sell.columns for c in k_cols):
-        df_sell['是否盈利标签'] = np.where(df_sell['单笔盈亏'] > 0, '✅ 盈利组 (赚钱出局)', '❌ 亏损组 (止损/失败)')
-        k_features = df_sell.groupby('是否盈利标签')[k_cols].mean().round(2)
-        print(k_features.to_string())
-    else:
-        print("未检测到完整的买点前后K线涨跌幅字段。")
+    if '起爆点位置(周线)' in df_sell.columns:
+        res_week_only = df_sell.groupby('起爆点位置(周线)').apply(get_stats).reset_index()
+        res_week_only = res_week_only.sort_values(by='胜率(%)', ascending=False)
+        print(res_week_only.to_string(index=False))
 
     # ==========================================
     # 维度三：起爆后第1根K线（确认K）强度对最终胜率的指引

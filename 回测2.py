@@ -1,324 +1,412 @@
-import backtrader as bt
+import time
+import warnings
 import pandas as pd
 import numpy as np
-import datetime
-from mootdx.reader import Reader
-import gupiaojichu  # 你的自定义模块
-import os
-from datetime import datetime
+import matplotlib.pyplot as plt
+from pytdx.hq import TdxHq_API
 from typing import Callable, Dict, List, Tuple
+import gupiaojichu
+import struct
+from mootdx.reader import Reader
+from collections import defaultdict, deque
+import os
+import glob
 
-def get_exact_tdx_30min(symbol, tdx_path="", start_date=None, end_date=None):
-    reader = Reader.factory(market='std', tdxdir=tdx_path)
-    df_5m = reader.fzline(symbol=symbol)
-    
-    if df_5m is None or df_5m.empty:
-        print(f"未获取到{symbol}本地5分钟数据")
-        return pd.DataFrame()
+# 忽略无关警告
+warnings.filterwarnings('ignore')
 
-    df_5m = df_5m.rename(columns={
-        'open': '开盘价', 'high': '最高价', 'low': '最低价',
-        'close': '收盘价', 'volume': '成交量', 'amount': '成交额'
-    })
-    
-    price_cols = ['开盘价', '最高价', '最低价', '收盘价']
-    df_5m[price_cols] = df_5m[price_cols].round(2)
+# 通达信板块文件路径
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
+# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST2.blk"
+# 本地通达信数据默认路径
+DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
-    df_30m = df_5m.resample(
-        '30Min', 
-        closed='right',
-        label='right',
-        origin='start_day'
-    ).agg({
-        '开盘价': 'first',
-        '最高价': 'max',
-        '最低价': 'min',
-        '收盘价': 'last',
-        '成交量': 'sum',
-        '成交额': 'sum'
-    })
-
-    df_30m = df_30m.dropna(subset=['开盘价'])
+class TdxStockBacktest:
+    """基于pytdx的股票回测框架（支持多周期K线+止损策略+以损定量+三买变体买点）"""
     
-    valid_times = ['10:00', '10:30', '11:00', '11:30', '13:30', '14:00', '14:30', '15:00']
-    df_30m = df_30m[df_30m.index.strftime('%H:%M').isin(valid_times)]
-
-    df_30m[price_cols] = df_30m[price_cols].round(2)
-    df_30m.index.name = 'datetime'
-    
-    if start_date:
-        df_30m = df_30m[df_30m.index >= pd.to_datetime(start_date)]
-    if end_date:
-        df_30m = df_30m[df_30m.index <= pd.to_datetime(end_date)]
-        
-    print(f"成功合成 {symbol} 30min数据，时间段：{start_date or '不限'} - {end_date or '不限'}，共 {len(df_30m)} 条")
-    return df_30m
-    
-def get_local_day_data(symbol, tdx_path="", start_date=None, end_date=None):
-    reader = Reader.factory(market='std', tdxdir=tdx_path)
-    df_day = reader.daily(symbol=symbol)
-    
-    if df_day is None or df_day.empty:
-        print(f"未获取到{symbol}本地日线数据")
-        return pd.DataFrame()
-    
-    df_day = df_day.rename(columns={
-        'open': '开盘价', 'high': '最高价', 'low': '最低价',
-        'close': '收盘价', 'volume': '成交量', 'amount': '成交额'
-    })
-    
-    df_day.index = pd.to_datetime(df_day.index)
-        
-    if start_date:
-        df_day = df_day[df_day.index >= pd.to_datetime(start_date)]
-    if end_date:
-        df_day = df_day[df_day.index <= pd.to_datetime(end_date)]
-    
-    price_cols = ['开盘价', '最高价', '最低价', '收盘价']
-    df_day[price_cols] = df_day[price_cols].round(2)
-    
-    print(f"成功读取 {symbol} 日线({start_date or '起点'}至{end_date or '至今'})，共 {len(df_day)} 条")
-    return df_day
-
-class TDXPandasData(bt.feeds.PandasData):
-    lines = ('amount',)
-    params = (
-        ('datetime', None),
-        ('open', '开盘价'),
-        ('high', '最高价'),
-        ('low', '最低价'),
-        ('close', '收盘价'),
-        ('volume', '成交量'),
-        ('amount', '成交额'),
-        ('openinterest', -1),
-    )
-
-class ThreeBuyVariantStrategy(bt.Strategy):
-    params = (
-        ('symbol', ''),  # --- 新增: 传递股票代码 ---
-        ('ma_period', 60),
-        ('stop_loss_ratio', 0.01),
-        ('lookback_window', 250),
-    )
-
     def __init__(self):
-        self.data_30m = self.datas[0]
-        self.data_day = self.datas[1]
-
-        self.ma60_30m = bt.indicators.SMA(self.data_30m.close, period=self.p.ma_period)
-        self.ma60_day = bt.indicators.SMA(self.data_day.close, period=self.p.ma_period)
+        self.api = TdxHq_API()
+        self.stock_data = {}  # 改为字典存储多周期数据: {'day': 日线数据, '30min': 30分钟数据}
+        self.backtest_result = None  # 存储回测结果
+        self.trade_records = None  # 交易记录
+        self.stop_loss_price = 0.0  # 止损价格（买入K线的最低点）
+        self.in_position = False    # 是否持仓标记
+        self.stop_loss_ratio = 0.02 # 新增：总资金止损百分比（默认2%）
+        self.risk_per_trade = 0.0   # 新增：单笔交易可承受的最大亏损金额
+        # 新增：存储30分钟周期的frac（转折点）数据，用于顶分型判断
+        self.all_trades_detail = [] # 新增：存储单股票所有交易明细（用于总笔数汇总）
+    
+    def connect_tdx(self, ip: str = "152.136.167.10", port: int = 7709) -> bool:
+        """
+        连接通达信服务器
+        :param ip: 通达信服务器IP
+        :param port: 端口
+        :return: 连接成功返回True，失败返回False
+        """
+        try:
+            self.api.connect(ip, port)
+            print(f"成功连接通达信服务器 {ip}:{port}")
+            return True
+        except Exception as e:
+            print(f"连接失败: {e}")
+            return False
         
-        self.order = None               
-        self.active_stop_loss = None
-        self.buy_price = None
-        self.buy_bar_index = 0
-        self.risk_per_trade = 0.0
-        
-        # --- 新增: 交易明细记录相关属性 ---
-        self.trades_detail = []
-        self.sell_reason = ""
-        self.buy_in_total_asset = 0.0
-
-    def next(self):
-        # 1. 如果有未完成的订单，直接跳过，防止重复下单
-        if self.order:
-            return
+    def read_tdx_export_txt(self, file_path, period='day'):
+        """
+        读取通达信导出的txt文件
+        :param file_path: 文件路径
+        :param period: 'day' 代表日线, '30min' 或 '5min' 代表分钟线
+        """
+        try:
+            # 通达信导出的文本通常是 GBK 编码，跳过第一行标题
+            # sep='\s+' 自动匹配空格或制表符
+            df = pd.read_csv(file_path, sep=r'\s+', encoding='gbk', skiprows=1, skipfooter=1, engine='python')
+            # print(df.tail(2))
+            if period == 'day':
+                # 日线格式通常只有：日期、开盘、最高、最低、收盘、成交量、成交额
+                df['datetime'] = pd.to_datetime(df['日期'].astype(str))
+            else:
+                # 分钟线格式（5min/30min）包含：日期、时间、开盘...
+                # 【修复】：强制转换为字符串 (astype(str)) 后再进行拼接
+                df['datetime'] = pd.to_datetime(df['日期'].astype(str) + ' ' + df['时间'].astype(str).str.zfill(4))
             
-        if len(self.data_day) < 60:
-            return
+            # 3. 统一列名映射：全部转为中文
+            rename_dict = {
+                '开盘': '开盘价',
+                '最高': '最高价',
+                '最低': '最低价',
+                '收盘': '收盘价',
+                '成交量': '成交量',
+                '成交额': '成交额'
+            }
+            df = df.rename(columns=rename_dict)
+            
+            # 4. 提取标准列并设置索引
+            cols = ['datetime', '开盘价', '最高价', '最低价', '收盘价', '成交量', '成交额']
+            df = df[cols]
+            
+            # 设置索引并排序
+            df.set_index('datetime', inplace=True)
+            df.sort_index(inplace=True)
+            
+            return df
+        except Exception as e:
+            print(f"读取 {period} TXT失败: {e}")
+            return pd.DataFrame()
+            
+    def find_txt_file(self,data_dir: str, code: str, period_hint: str) -> str:
+        """
+        在指定目录下根据股票代码和周期提示查找对应的 txt 文件
+        :param data_dir: txt 数据存放根目录
+        :param code: 股票代码（如 '600006'）
+        :param period_hint: 周期标识，用于模糊匹配，如 '日线' 或 '5分钟'
+        :return: 匹配到的第一个文件完整路径，若未找到返回 None
+        """
+        # 构造搜索模式，例如：D:/data/*600006*日线*.txt
+        pattern = os.path.join(data_dir, f"*{code}*.txt")
+        files = glob.glob(pattern)
+        if not files:
+            # 尝试更宽松的匹配（有些文件名可能不包含周期文字）
+            pattern = os.path.join(data_dir, f"*{code}*.txt")
+            files = glob.glob(pattern)
+            if files:
+                # 如果只有一个文件，直接返回
+                if len(files) == 1:
+                    return files[0]
+                # 否则尝试根据文件名中的周期关键词筛选
+                for f in files:
+                    if period_hint in os.path.basename(f):
+                        return f
+            return None
+        return files[0]  # 返回第一个匹配项
+    
+    def _resample_5min_to_30min(self ,df_5min: pd.DataFrame, start_date=None, end_date=None) -> pd.DataFrame:
+        """
+        将标准 5 分钟 K 线数据合成为 30 分钟 K 线
+        :param df_5min: 包含 'datetime' 索引及 OHLCV 列的 DataFrame
+        :return: 30 分钟 K 线 DataFrame
+        """
+        if df_5min.empty:
+            return df_5min
 
-        current_idx = len(self)
-        current_close = self.data_30m.close[0]
-        current_low = self.data_30m.low[0]
+        # 确保列名为中文，与框架保持一致
+        df = df_5min.rename(columns={
+            'open': '开盘价', 'high': '最高价', 'low': '最低价',
+            'close': '收盘价', 'volume': '成交量', 'amount': '成交额'
+        })
 
-        # --- A. 持仓状态下的卖出逻辑 ---
-        if self.position:
-            hold_count = current_idx - self.buy_bar_index
-            profit_ratio = (current_close - self.buy_price) / self.buy_price
+        price_cols = ['开盘价', '最高价', '最低价', '收盘价']
+        df[price_cols] = df[price_cols].round(2)
 
-            # 1. 硬止损检查
-            if current_low <= self.active_stop_loss:
-                self.sell_reason = f"触发硬止损，止损价: {self.active_stop_loss:.2f}"
-                self.order = self.sell(size=self.position.size)
-                self.log(f"触发硬止损，止损价: {self.active_stop_loss:.2f}")
-                return
+        # 重采样为 30 分钟
+        df_30m = df.resample(
+            '30Min',
+            closed='right',
+            label='right',
+            origin='start_day'
+        ).agg({
+            '开盘价': 'first',
+            '最高价': 'max',
+            '最低价': 'min',
+            '收盘价': 'last',
+            '成交量': 'sum',
+            '成交额': 'sum'
+        })
 
-            # 2. 均线动态止盈/止损
-            if (self.data_30m.close[0] < self.ma60_30m[0] and 
-                self.data_30m.close[-1] < self.ma60_30m[-1]):
-                if profit_ratio >= 0.10 or hold_count >= 30:
-                    self.sell_reason = f"跌破60均线(收益{profit_ratio:.1%}/持仓{hold_count}线)"
-                    self.order = self.sell(size=self.position.size)
-                    self.log(f"均线平仓: 收益 {profit_ratio:.1%}, 持仓 {hold_count} 根")
-                    return
+        df_30m = df_30m.dropna(subset=['开盘价'])
 
-            # 3. 形态平仓判断
-            if hold_count > 3:
-                high_full = self.data_30m.high.get(size=self.p.lookback_window)
-                low_full = self.data_30m.low.get(size=self.p.lookback_window)
-                
-                if len(high_full) >= self.p.lookback_window:
-                    frac_window = gupiaojichu.identify_turns(len(high_full), list(high_full), list(low_full))
-                    bottom_indices = [i for i, val in enumerate(frac_window) if val == -1.0]
-                    top_indices = [i for i, val in enumerate(frac_window) if val == 1.0]
-                    
-                    if bottom_indices:
-                        last_bottom_idx = bottom_indices[-1]
-                        
-                        # 逻辑 2：跌破最后底分型最低价
-                        if low_full[-1] < low_full[last_bottom_idx]:
-                            self.sell_reason = "跌破最后底分型最低价"
-                            self.order = self.sell(size=self.position.size)
-                            self.log(f"形态平仓: 跌破最后底分型最低价({low_full[last_bottom_idx]:.2f})")
-                            return
+        # 过滤出有效交易时段（A股 30 分钟线时间点）
+        valid_times = ['10:00', '10:30', '11:00', '11:30', '13:30', '14:00', '14:30', '15:00']
+        df_30m = df_30m[df_30m.index.strftime('%H:%M').isin(valid_times)]
 
-                        # --- 核心修复 2：优化底分型后反弹无力的逻辑，防止过早卖出 ---
-                        valid_tops = [i for i in top_indices if i < last_bottom_idx]
-                        if valid_tops:
-                            prev_top_idx = valid_tops[-1]
-                            current_win_idx = len(high_full) - 1
-                            
-                            drop_time = last_bottom_idx - prev_top_idx
-                            rebound_time = current_win_idx - last_bottom_idx
-                            
-                            time_cond = rebound_time >= max(drop_time, 1) 
-                            dist_cond = drop_time >= 3
-                            
-                            if time_cond and dist_cond:
-                                if max(high_full[last_bottom_idx:]) <= high_full[prev_top_idx]:
-                                    self.sell_reason = "底分型后未突破前高且距离达标"
-                                    self.order = self.sell(size=self.position.size)
-                                    self.log(f"形态平仓: 底分型后反弹无力(未过前高 {high_full[prev_top_idx]:.2f})")
-                                    return
+        df_30m[price_cols] = df_30m[price_cols].round(2)
+        df_30m.index.name = 'datetime'
 
-        # --- B. 空仓状态下的买入逻辑 ---
+        # 时间段过滤
+        if start_date:
+            df_30m = df_30m[df_30m.index >= pd.to_datetime(start_date)]
+        if end_date:
+            df_30m = df_30m[df_30m.index <= pd.to_datetime(end_date)]
+
+        return df_30m
+
+    def get_txt_day_data(self, code: str, txt_day_dir: str, start_date=None, end_date=None) -> pd.DataFrame:
+        """
+        从 txt 文件读取日线数据
+        """
+        file_path = self.find_txt_file(txt_day_dir, code, "日线")
+        if file_path is None:
+            print(f"未找到 {code} 的日线 txt 文件")
+            return pd.DataFrame()
+        df = self.read_tdx_export_txt(file_path)
+        if df.empty:
+            return df
+        # 时间段过滤
+        start_date = '2020-11-01'
+        if start_date:
+            df = df[df.index >= pd.to_datetime(start_date)]
+        if end_date:
+            df = df[df.index <= pd.to_datetime(end_date)]
+        print(f"成功读取 {code} txt日线({start_date or '起点'}至{end_date or '至今'})，共 {len(df)} 条")
+        return df
+
+    def get_txt_30min_data(self, code: str, txt_5min_dir: str, start_date=None, end_date=None) -> pd.DataFrame:
+        """
+        从 5 分钟 txt 文件合成 30 分钟数据
+        """
+        file_path = self.find_txt_file(txt_5min_dir, code, "5分钟")
+        if file_path is None:
+            print(f"未找到 {code} 的 5 分钟 txt 文件")
+            return pd.DataFrame()
+        df_5m = self.read_tdx_export_txt(file_path, period='5min')
+        if df_5m.empty:
+            return df_5m
+        df_30m = self._resample_5min_to_30min(df_5m, start_date, end_date)
+        print(f"成功由 txt 5分钟合成 {code} 30min数据，共 {len(df_30m)} 条")
+        return df_30m
+    
+    def get_exact_tdx_30min(self, symbol, tdx_path=DEFAULT_TDX_PATH, start_date=None, end_date=None):
+        reader = Reader.factory(market='std', tdxdir=tdx_path)
+        df_5m = reader.fzline(symbol=symbol)
+        if df_5m is None or df_5m.empty:
+            return pd.DataFrame()
+        # 直接调用合成函数
+        df_30m = self._resample_5min_to_30min(df_5m, start_date, end_date)
+        print(f"成功合成 {symbol} 30min数据，时间段：{start_date or '不限'} - {end_date or '不限'}，共 {len(df_30m)} 条")
+        return df_30m
+    
+    def get_local_day_data(self, symbol, tdx_path=DEFAULT_TDX_PATH, start_date=None, end_date=None):
+        """
+        从本地通达信数据读取日线
+        :param symbol: 股票代码
+        :param tdx_path: 通达信安装路径
+        :return: 日线DataFrame
+        """
+        reader = Reader.factory(market='std', tdxdir=tdx_path)
+        df_day = reader.daily(symbol=symbol)
+        
+        if df_day is None or df_day.empty:
+            print(f"未获取到{symbol}本地日线数据")
+            return pd.DataFrame()
+        
+        # 数据清洗与重命名
+        df_day = df_day.rename(columns={
+            'open': '开盘价', 'high': '最高价', 'low': '最低价',
+            'close': '收盘价', 'volume': '成交量', 'amount': '成交额'
+        })
+        
+        df_day.index = pd.to_datetime(df_day.index)
+            
+        # --- 新增：时间段过滤逻辑 ---
+        # start_date='2020-12-01'
+        if start_date:
+            df_day = df_day[df_day.index >= pd.to_datetime(start_date)]
+        if end_date:
+            df_day = df_day[df_day.index <= pd.to_datetime(end_date)]
+        
+        price_cols = ['开盘价', '最高价', '最低价', '收盘价']
+        df_day[price_cols] = df_day[price_cols].round(2)
+        
+        print(f"成功读取 {symbol} 日线({start_date or '起点'}至{end_date or '至今'})，共 {len(df_day)} 条")
+        return df_day
+        
+    def get_stock_k_data(self, code: str, start: int = 0, count: int = 1000, ktype: int = 9) -> pd.DataFrame:
+        """
+        获取指定周期的股票K线数据
+        :param code: 股票代码（深市0开头，沪市6开头）
+        :param start: 起始位置（0表示最新数据）
+        :param count: 获取数据条数
+        :param ktype: K线类型 2=30分钟, 9=日线, 8=周线, 7=月线
+        :return: 格式化后的K线DataFrame + 最高价列表 + 最低价列表
+        """
+        # 判断市场（沪市1，深市0）
+        market = 1 if code.startswith('6') else 0
+        
+        try:
+            # 获取原始数据
+            data = self.api.get_security_bars(ktype, market, code, start, count)
+            # 转换为DataFrame并格式化
+            df = pd.DataFrame(data)
+            if df.empty:
+                print(f"未获取到{self._ktype2name(ktype)}数据")
+                return df, [], []
+            
+            # 提取最高价和最低价列表
+            result_list_high = df['high'].astype(float).tolist()
+            result_list_low = df['low'].astype(float).tolist()
+            
+            # 格式化字段
+            df['datetime'] = pd.to_datetime(df['datetime'])
+            df = df.rename(columns={
+                'open': '开盘价', 'high': '最高价', 'low': '最低价', 
+                'close': '收盘价', 'vol': '成交量', 'amount': '成交额'
+            })
+            # 设置日期时间为索引
+            df = df.set_index('datetime')
+            # 保留核心字段
+            result_df = df[['开盘价', '最高价', '最低价', '收盘价', '成交量', '成交额']]
+            
+            # 按周期存储数据
+            period = self._ktype2name(ktype)
+            self.stock_data[period] = result_df
+            print(f"成功获取 {code} {period} 数据，共 {len(result_df)} 条")
+            return result_df, result_list_high, result_list_low
+        except Exception as e:
+            print(f"获取{self._ktype2name(ktype)}数据失败: {e}")
+            return pd.DataFrame(), [], []
+    
+    def _ktype2name(self, ktype: int) -> str:
+        """将ktype数值转换为周期名称"""
+        ktype_map = {
+            0: '5min',
+            1: '15min',
+            2: '30min',
+            3: '60min',
+            9: 'day',
+            8: 'week',
+            7: 'month'
+        }
+        return ktype_map.get(ktype, f'未知周期({ktype})')
+    
+    def get_multi_period_data(self, code: str, count: int = 800,
+                          use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH,
+                          use_txt_files: bool = False,
+                          txt_day_dir: str = r"D:\zd_hbzq\daochushujuday",
+                          txt_5min_dir: str = r"D:\zd_hbzq\daochushuju5f",
+                          start_date=None, end_date=None) -> Dict[str, pd.DataFrame]:
+        """
+        一键获取日线+30分钟线数据（支持本地通达信数据库、联网、txt文件三种模式）
+        :param use_txt_files: True 表示从 txt 文件读取
+        :param txt_day_dir: 日线 txt 存放目录
+        :param txt_5min_dir: 5 分钟 txt 存放目录
+        :return: 多周期数据字典
+        """
+        result = {}
+
+        if use_txt_files:
+            # 从 txt 文件读取
+            day_data = self.get_txt_day_data(code, txt_day_dir, start_date, end_date)
+            min30_data = self.get_txt_30min_data(code, txt_5min_dir, start_date, end_date)
+            # 提取高低价列表
+            min30_high = min30_data['最高价'].tolist() if not min30_data.empty else []
+            min30_low = min30_data['最低价'].tolist() if not min30_data.empty else []
+        elif use_local:
+            # 本地通达信数据库
+            day_data = self.get_local_day_data(code, tdx_path, start_date, end_date)
+            min30_data = self.get_exact_tdx_30min(code, tdx_path, start_date, end_date)
+            min30_high = min30_data['最高价'].tolist() if not min30_data.empty else []
+            min30_low = min30_data['最低价'].tolist() if not min30_data.empty else []
         else:
-            day_cond = (self.data_day.close[-1] > self.ma60_day[-1] and 
-                        self.ma60_day[-1] > self.ma60_day[-4])
-            
-            if not day_cond:
-                return
+            # 联网模式
+            day_data, _, _ = self.get_stock_k_data(code, count=count, ktype=9)
+            min30_data, min30_high, min30_low = self.get_stock_k_data(code, count=count, ktype=2)
 
-            high_array = self.data_30m.high.get(size=self.p.lookback_window)
-            low_array = self.data_30m.low.get(size=self.p.lookback_window)
-            close_array = self.data_30m.close.get(size=self.p.lookback_window)
-            open_array = self.data_30m.open.get(size=self.p.lookback_window)
+        result = {
+            'day': day_data,
+            '30min_high_list': min30_high if 'min30_high' in locals() else [],
+            '30min_low_list': min30_low if 'min30_low' in locals() else [],
+            '30min': min30_data
+        }
 
-            if len(high_array) < self.p.lookback_window:
-                return
+        self.stock_data['day'] = result['day']
+        self.stock_data['30min'] = result['30min']
 
-            frac_window = gupiaojichu.identify_turns(len(high_array), list(high_array), list(low_array))
-            
-            try:
-                window_signal = self.three_buy_variant(frac_window, list(high_array), list(low_array))
-            except Exception as e:
-                self.log(f"信号计算异常: {e}")
-                return
+        return result
+    
+    @staticmethod
+    def calculate_rps_matrix(all_stocks_data: Dict[str, pd.DataFrame], n: int = 250) -> pd.DataFrame:
+        """
+        计算整个池子的 RPS 矩阵
+        :param all_stocks_data: {code: df} 字典，df 需包含收盘价
+        :param n: 回测周期 (250, 120, 60)
+        :return: 一个以时间为索引，股票代码为列的 RPS 评分表
+        """
+        extrs_dict = {}
+        for code, df in all_stocks_data.items():
+            # 确保 DataFrame 不为空且包含必要列
+            if df is None or df.empty or '收盘价' not in df.columns:
+                continue
+            # 计算 EXTRS: (C - REF(C, N)) / REF(C, N)
+            extrs_dict[code] = df['收盘价'].pct_change(n)
 
-            if window_signal[-1] == 1.0:
-                last_top_idx = -1
-                for i in range(len(frac_window) - 2, -1, -1):
-                    if frac_window[i] == 1.0:
-                        last_top_idx = i
-                        break
-                
-                if last_top_idx != -1 and current_close <= high_array[last_top_idx]:
-                    return
-                
-                loss_price = min(current_low, high_array[-2])
-                close_price = current_close
-                
-                price_diff_pct = (close_price - loss_price) / loss_price * 100
-                if price_diff_pct > 3 or price_diff_pct < 0.5:
-                    return
-                
-                if current_close <= open_array[-1]:
-                    return
-                
-                self.active_stop_loss = loss_price
-                
-                if current_close <= self.active_stop_loss:
-                    return
-
-                cash = self.broker.get_cash()
-                self.risk_per_trade = cash * self.p.stop_loss_ratio
-                loss_per_share = current_close - self.active_stop_loss
-                
-                max_shares = self.risk_per_trade / loss_per_share
-                buy_size = int(max_shares // 100 * 100)
-
-                comm_info = self.broker.getcommissioninfo(self.data_30m)
-                comm_rate = comm_info.p.commission
-                max_affordable = cash / (current_close * (1 + comm_rate))
-                buy_size = min(buy_size, int(max_affordable // 100 * 100))
-
-                if buy_size > 0:
-                    self.buy_in_total_asset = self.broker.get_value() # --- 新增: 记录买入前的总资产
-                    self.order = self.buy(size=buy_size)
-                    self.log(f"触发买入，数量: {buy_size}, 止损设定为: {self.active_stop_loss:.2f}")
-
-    def notify_order(self, order):
-        if order.status in [order.Submitted, order.Accepted]:
-            return
-
-        if order.status in [order.Completed]:
-            dt = self.data_30m.datetime.datetime(0)
-            if order.isbuy():
-                self.buy_price = order.executed.price
-                self.buy_bar_index = len(self)
-                self.log(f"买单成交, 价格: {order.executed.price:.2f}, 费用: {order.executed.comm:.2f}")
-                
-                # --- 新增: 记录完整买入明细 ---
-                trade_info = {
-                    '股票代码': self.p.symbol,
-                    '交易时间': dt,
-                    '交易类型': '买入',
-                    '价格': order.executed.price,
-                    '数量': order.executed.size,
-                    '费用': order.executed.comm,
-                    '单笔盈亏': 0.0,
-                    '是否盈利': None,
-                    '设置止损价': self.active_stop_loss,
-                    '单笔风险金额': self.risk_per_trade,
-                    '风险比例': self.p.stop_loss_ratio * 100,
-                    '单k涨幅': (order.executed.price - self.active_stop_loss) / self.active_stop_loss * 100 if self.active_stop_loss else 0.0
-                }
-                self.trades_detail.append(trade_info)
-                
-            elif order.issell():
-                pnl = order.executed.pnl
-                self.log(f"卖单成交, 价格: {order.executed.price:.2f}, 利润: {pnl:.2f}")
-                
-                # --- 新增: 记录完整卖出明细 ---
-                trade_info = {
-                    '股票代码': self.p.symbol,
-                    '交易时间': dt,
-                    '交易类型': '策略卖出',
-                    '价格': order.executed.price,
-                    '数量': abs(order.executed.size),
-                    '费用': order.executed.comm,
-                    '单笔盈亏': pnl,
-                    '是否盈利': pnl > 0,
-                    '卖出原因': self.sell_reason,
-                    '当前K线索引': len(self),
-                    '持仓K线数量': len(self) - self.buy_bar_index,
-                    '单笔风险金额': self.risk_per_trade,
-                    '实际盈亏比例': (pnl / self.buy_in_total_asset * 100) if self.buy_in_total_asset else 0.0
-                }
-                self.trades_detail.append(trade_info)
-                
-                self.buy_price = None
-                self.sell_reason = "" # 重置卖出原因
-            self.order = None
-
-        elif order.status in [order.Canceled, order.Margin, order.Rejected]:
-            self.log('订单取消/资金不足/被拒绝')
-            self.order = None
-
-    def log(self, txt, dt=None):
-        dt = dt or self.data_30m.datetime.datetime(0)
-        print(f'[{dt}] {txt}')
-
+        if not extrs_dict:
+            return pd.DataFrame()
+        
+        extrs_df = pd.DataFrame(extrs_dict)
+        # 3. 关键：前 N 天的数据都是 NaN，不能参与排名
+        # axis=1 表示每一行（同一天）进行排名
+        # pct=True 得到 0-1 的分位数，再乘以 100
+        # min_periods=1 确保只要当天有数据的股票都参与排名
+        rps_df = extrs_df.rank(axis=1, pct=True, ascending=True) * 100
+        return rps_df 
+    
+    def calculate_position_size(self, current_cash: float, entry_price: float, stop_loss_price: float) -> int:
+        """
+        以损定量核心计算：根据止损百分比计算可买数量
+        :param current_cash: 当前可用总资金
+        :param entry_price: 买入价格
+        :param stop_loss_price: 止损价格
+        :return: 可买数量（100的整数倍，整手）
+        """
+        if entry_price <= stop_loss_price:
+            return 0  # 止损价不能大于等于买入价
+        
+        # 单笔可承受的最大亏损金额 = 当前总资金 * 止损百分比
+        self.risk_per_trade = current_cash * self.stop_loss_ratio
+        
+        # 每股亏损 = 买入价 - 止损价
+        loss_per_share = entry_price - stop_loss_price
+        
+        # 可买数量 = 可承受亏损金额 / 每股亏损（取整手）
+        max_shares = self.risk_per_trade / loss_per_share
+        position_size = int(max_shares // 100 * 100)  # 转换为100的整数倍
+        
+        # 安全校验：确保买入金额不超过可用资金（含手续费）
+        max_affordable = current_cash / (entry_price * 1.001)  # 预留手续费空间
+        position_size = min(position_size, int(max_affordable // 100 * 100))
+        
+        return max(position_size, 0)  # 确保数量非负
+    
     @staticmethod
     def three_buy_variant(frac, high, low):
         """
@@ -425,118 +513,1363 @@ class ThreeBuyVariantStrategy(bt.Strategy):
         # 所有条件满足，标记信号
         pf_out[last_k_idx] = 1.0
         return pf_out
+    
+    @staticmethod
+    def calculate_three_buy_signals(high_full, low_full, close_full, open_full) -> List[float]:
+        """
+        遍历完整数据序列，逐段计算三买变体买点信号
+        优化：每次计算仅使用最近 200 根 K 线以提升效率
+        """
+        # 校验全量数据长度一致
+        if len(high_full) != len(low_full) or len(high_full) != len(close_full):
+            raise ValueError("high_full、low_full、close_full必须长度一致")
+        
+        total_length = len(high_full)
+        # 初始化全量信号数组（默认全为0）
+        full_signals = [0.0] * total_length
+        
+        # 设定滑动窗口大小
+        LOOKBACK_WINDOW = 250
+        
+        # 遍历每个数据点，逐步扩展窗口计算信号
+        for window_end in range(1, total_length + 1):
+            # --- 核心优化：只取最后 200 根 K 线 ---
+            start_idx = max(0, window_end - LOOKBACK_WINDOW)
+            
+            high_window = high_full[start_idx : window_end]
+            low_window = low_full[start_idx : window_end]
+            close_window = close_full[start_idx : window_end]
+            open_window = open_full[start_idx : window_end]
+            
+            # 计算当前窗口内的转折点
+            # 注意：window_end 在 identify_turns 中通常作为长度参考
+            frac_window = gupiaojichu.identify_turns(len(high_window), high_window, low_window)
+            
+            # 调用三买变体函数
+            try:
+                window_signal = TdxStockBacktest.three_buy_variant(frac_window, high_window, low_window)
+            except Exception:
+                continue
+                
+            # 如果当前窗口最后一个位置有信号，执行收盘价确认逻辑
+            if window_signal[-1] == 1.0:
+                current_close = close_window[-1]
+                
+                # 在当前 frac_window 中找最后一个顶分型（值为1.0）
+                # 寻找的是“突破K线”之前最近的一个顶
+                last_top_idx = -1
+                for i in range(len(frac_window) - 1, -1, -1):
+                    if frac_window[i] == 1.0:
+                        # 排除掉当前K线本身（如果是顶的话）
+                        if i < len(frac_window) - 1:
+                            last_top_idx = i
+                            break
+                
+                if last_top_idx != -1:
+                    last_top_high = high_window[last_top_idx]
+                    # 条件：收盘价必须高于前顶分型最高价，否则撤销信号
+                    if current_close <= last_top_high:
+                        window_signal[-1] = 0.0
+
+                                # 3. 原有的止损价计算逻辑
+                
+                prev_close = close_window[-2]  # 前一根K线的收盘价
+                loss_price = min(low_window[-1], prev_close)
+                close_price = close_window[-1]
+
+                if (close_price-loss_price)/loss_price*100 > 3:
+                    window_signal[-1] = 0.0
+                elif (close_price-loss_price)/loss_price*100 < 0.5:
+                    window_signal[-1] = 0.0
+                    
+                red = close_price <=  open_window[-1]
+                if red:
+                    window_signal[-1] = 0.0
+
+                # 新增：第一个中枢起爆限制校验
+                # if TdxStockBacktest.check_first_center_limit(frac_window, high_window, low_window):
+                #     window_signal[-1] = 0.0
+            # 将窗口最后的计算结果映射回全量信号列表
+            full_signals[window_end - 1] = window_signal[-1]
+        
+        return full_signals
+    
+    @staticmethod
+    def calculate_mfi(df, n=14):
+        """
+        修正后的 MFI 计算
+        传入整个 df 自动识别字段
+        """
+        # 自动适配列名：有些数据是 '收盘价'，有些是 'close'
+        c = df['收盘价'] if '收盘价' in df.columns else df['close']
+        h = df['最高价'] if '最高价' in df.columns else df['high']
+        l = df['最低价'] if '最低价' in df.columns else df['low']
+        v = df['成交量'] if '成交量' in df.columns else df['vol']
+
+        # 确保数据是浮点数且填充 0
+        v = v.fillna(0).astype(float)
+        
+        typ = (h + l + c) / 3
+        mf = typ * v  # 资金流量
+        
+        typ_shift = typ.shift(1)
+        
+        # 辅助序列：上涨流量和下跌流量
+        pos_mf = pd.Series(np.where(typ > typ_shift, mf, 0), index=df.index)
+        neg_mf = pd.Series(np.where(typ < typ_shift, mf, 0), index=df.index)
+        
+        # 计算 N 日滚动和
+        sum_pos_mf = pos_mf.rolling(window=n, min_periods=n).sum()
+        sum_neg_mf = neg_mf.rolling(window=n, min_periods=n).sum()
+        
+        # 计算 MFI
+        # 加上一个小值 1e-10 避免除以 0
+        mfi = 100 - (100 / (1 + (sum_pos_mf / (sum_neg_mf + 1e-10))))
+        
+        return mfi
+
+    @staticmethod
+    def calculate_dynamic_sell_signals(high_full: List[float], low_full: List[float], 
+                                     close_full: List[float], ma60_full: pd.Series,
+                                     buy_price: float = None, buy_idx: int = None) -> tuple[List[bool], List[str]]:
+        """
+        逐K线模拟动态出现，计算动态卖出条件。
+        增加逻辑：针对MA60卖出条件，需满足涨幅>10%或持仓>30根K线。
+        """
+        total_length = len(high_full)
+        sell_signals = [False] * total_length
+        sell_reasons = [""] * total_length
+        ma60_list = ma60_full.tolist()
+        
+        for window_end in range(1, total_length + 1):
+            if window_end < 60:
+                continue
+                
+            current_idx = window_end - 1
+            current_close = close_full[current_idx]
+            
+            # === 1. 均线条件判定 (含门槛校验) ===
+            cond_ma60 = False
+            ma60_reason = ""
+            
+            # 基础条件：连续两根收盘价小于MA60
+            if current_idx >= 1:
+                if current_close < ma60_list[current_idx] and close_full[current_idx-1] < ma60_list[current_idx-1]:
+                    # 检查是否处于持仓状态且满足门槛
+                    if buy_price is not None and buy_idx is not None:
+                        # 计算当前涨幅和持仓K线数
+                        profit_ratio = (current_close - buy_price) / buy_price
+                        # 持仓K线数 = 当前索引 - 买入索引
+                        hold_count = current_idx - buy_idx
+                        
+                        # 执行门槛检查
+                        if profit_ratio >= 0.10 or hold_count >= 30:
+                            cond_ma60 = True
+                            ma60_reason = f"连续2根低于MA60(达标:收益{profit_ratio:.1%}/持仓{hold_count}线)"
+                    else:
+                        # 如果没有传入买入信息（初始化阶段），默认不触发均线卖出
+                        cond_ma60 = False
+
+            # === 2. 分型条件判定 (不设门槛，作为硬止损) ===
+            high_window = high_full[:window_end]
+            frac_window = gupiaojichu.identify_turns(window_end, high_window, low_full[:window_end])
+            
+            top_indices = [i for i, val in enumerate(frac_window) if val == 1.0]
+            bottom_indices = [i for i, val in enumerate(frac_window) if val == -1.0]
+            
+            cond_pattern1 = False # 顶分型后未突破前高且距离达标
+            cond_pattern2 = False # 跌破底分型
+            
+            if bottom_indices:
+                last_bottom_idx = bottom_indices[-1]
+                if low_full[current_idx] < low_full[last_bottom_idx]:
+                    cond_pattern2 = True
+                    
+                valid_tops = [i for i in top_indices if i < last_bottom_idx]
+                if valid_tops:
+                    prev_top_idx = valid_tops[-1]
+                    if (current_idx - last_bottom_idx) >= (last_bottom_idx - prev_top_idx):
+                        if max(high_window[last_bottom_idx:]) <= high_window[prev_top_idx]:
+                            cond_pattern1 = True
+            
+            # === 3. 综合信号 ===
+            reasons = []
+            if cond_ma60: reasons.append(ma60_reason)
+            if cond_pattern1: reasons.append("底分型后未突破前高且距离达标")
+            if cond_pattern2: reasons.append("跌破最后底分型最低价")
+            
+            if reasons:
+                sell_signals[current_idx] = True
+                sell_reasons[current_idx] = "；".join(reasons)
+                
+        return sell_signals, sell_reasons
+    
+    @staticmethod
+    def calc_max_drawdown(asset_values: np.ndarray) -> float:
+        """
+        计算最大回撤
+        :param asset_values: 总资产序列
+        :return: 最大回撤百分比（负数表示回撤）
+        """
+        if len(asset_values) == 0:
+            return 0.0
+        
+        # 计算累计最大值
+        running_max = np.maximum.accumulate(asset_values)
+        # 计算回撤
+        drawdown = (asset_values - running_max) / running_max
+        # 最大回撤
+        max_dd = np.min(drawdown) * 100
+        return max_dd
+    
+    def calc_backtest_metrics(self, init_cash: float) -> Dict:
+        """计算回测核心指标（包含盈亏比）"""
+        if self.backtest_result is None or len(getattr(self, 'trade_pnl', [])) == 0:
+            return {}
+        
+        # 累计收益
+        total_profit = self.backtest_result['总资产'].iloc[-1] - init_cash
+        total_return = total_profit / init_cash * 100
+        
+        # 年化收益
+        time_delta = (self.backtest_result.index[-1] - self.backtest_result.index[0])
+        if '30min' in self.stock_data and not self.stock_data['30min'].empty:
+            total_periods = time_delta.total_seconds() / 1800  # 总30分钟数
+            annual_return = (pow((self.backtest_result['总资产'].iloc[-1] / init_cash), 1440/total_periods) - 1) * 100 if total_periods !=0 else 0
+        else:
+            days = time_delta.days
+            annual_return = (pow((self.backtest_result['总资产'].iloc[-1] / init_cash), 365/days) - 1) * 100 if days !=0 else 0
+        
+        # 最大回撤
+        max_drawdown = self.calc_max_drawdown(self.backtest_result['总资产'].values)
+        
+        # 胜率
+        total_trades = len(self.trade_pnl)
+        win_trades = sum(1 for pnl in self.trade_pnl if pnl > 0)
+        win_rate = win_trades / total_trades * 100 if total_trades > 0 else 0
+        
+        # 盈亏比：平均盈利 / 平均亏损（取绝对值）
+        profits = [pnl for pnl in self.trade_pnl if pnl > 0]
+        losses = [abs(pnl) for pnl in self.trade_pnl if pnl < 0]
+        avg_profit = np.mean(profits) if profits else 0.0
+        avg_loss = np.mean(losses) if losses else 0.0
+        profit_loss_ratio = avg_profit / avg_loss if avg_loss != 0 else 0.0
+        
+        # 夏普比率（简化版，无风险利率取0）
+        returns = self.backtest_result['总资产'].pct_change().dropna()
+        sharpe_ratio = np.sqrt(252) * returns.mean() / returns.std() if returns.std() != 0 else 0.0
+        
+        metrics = {
+            '初始资金': init_cash,
+            '最终总资产': self.backtest_result['总资产'].iloc[-1],
+            '累计收益': total_profit,
+            '累计收益率(%)': total_return,
+            '年化收益率(%)': annual_return,
+            '最大回撤(%)': max_drawdown,
+            '总交易次数': total_trades,
+            '盈利交易次数': win_trades,
+            '胜率(%)': win_rate,
+            '平均盈利': avg_profit,
+            '平均亏损': avg_loss,
+            '盈亏比': profit_loss_ratio,
+            '夏普比率': sharpe_ratio
+        }
+        
+        return metrics
+    
+    @staticmethod
+    def classify_buy_position(frac, high, low) -> str:
+        turn_points = []
+        for i, val in enumerate(frac):
+            if val != 0:
+                turn_points.append((i, val))
+
+        down_strokes = []
+        for i in range(len(turn_points) - 1):
+            p1_idx, p1_val = turn_points[i]
+            p2_idx, p2_val = turn_points[i+1]
+            if p1_val == 1.0 and p2_val == -1.0:
+                down_strokes.append({'start': p1_idx, 'end': p2_idx, 'high': high[p1_idx], 'low': low[p2_idx]})
+
+        if not down_strokes: return "未知"
+        if len(down_strokes) == 1: return "一买"
+
+        # 状态机变量
+        state = "一买"
+        label = "一买"
+        b2_high = None
+        b3_high = None
+        b2_ext_count = 0
+        b3_ext_count = 0
+        b3_above_count = 0  # 独立维护三买之上计数
+
+        for i in range(1, len(down_strokes)):
+            curr = down_strokes[i]
+            prev = down_strokes[i-1]
+
+            # 核心规则：一旦跌破前笔最低点，强制重置为一买
+            if curr['low'] < prev['low']:
+                label = "一买"
+                state = "一买"
+                b2_high = None
+                b3_high = None
+                b2_ext_count = 0
+                b3_ext_count = 0
+                b3_above_count = 0
+                continue
+
+            # 逻辑递推
+            if state == "一买":
+                label = "二买"
+                state = "二买"
+                b2_high = curr['high']
+            
+            elif state.startswith("二买"):
+                if b2_high is not None and curr['low'] > b2_high:
+                    label = "三买"
+                    state = "三买"
+                    b3_high = curr['high'] # 记录三买这一笔的高点
+                else:
+                    b2_ext_count += 1
+                    label = f"二买延续{b2_ext_count}"
+                    state = "二买延续"
+
+            elif state.startswith("三买"):
+                # 判断是 延续 还是 之上
+                if b3_high is not None and curr['low'] <= b3_high:
+                    # 最低点在三买最高点之下 -> 延续
+                    b3_ext_count += 1
+                    label = f"三买延续{b3_ext_count}"
+                    state = "三买延续"
+                else:
+                    # 最低点依然在三买最高点之上 -> 之上
+                    b3_above_count += 1
+                    label = f"三买之上{b3_above_count}"
+                    state = "三买之上"
+            
+            # 如果已经是延续或之上状态，继续保持在三买大框架下判定
+            elif state.startswith("三买延续") or state.startswith("三买之上"):
+                if b3_high is not None and curr['low'] <= b3_high:
+                    b3_ext_count += 1
+                    label = f"三买延续{b3_ext_count}"
+                    state = "三买延续"
+                else:
+                    b3_above_count += 1
+                    label = f"三买之上{b3_above_count}"
+                    state = "三买之上"
+
+        return label
+    
+    @staticmethod
+    def check_first_center_limit(frac, high, low):
+        """
+        检查是否符合第一个中枢内的起爆限制
+        规则：
+        1. 找到一买（当前向下笔低点 < 前一向下笔低点）
+        2. 一买后的第一根向下笔为二买
+        3. 二买及后续向下笔在高低点范围内波动构成中枢
+        4. 中枢内向下笔总数 <= 3 时起爆
+        """
+        # 1. 提取所有向下笔 (StartIdx, EndIdx, High, Low)
+        # 向下笔是指从顶分型(1.0)到底分型(-1.0)
+        down_strokes = []
+        turn_points = []
+        for i, val in enumerate(frac):
+            if val != 0:
+                turn_points.append((i, val))
+        
+        for i in range(len(turn_points) - 1):
+            p1_idx, p1_val = turn_points[i]
+            p2_idx, p2_val = turn_points[i+1]
+            if p1_val == 1.0 and p2_val == -1.0: # 顶到底，向下笔
+                down_strokes.append({
+                    'start': p1_idx,
+                    'end': p2_idx,
+                    'high': high[p1_idx],
+                    'low': low[p2_idx]
+                })
+
+        if len(down_strokes) < 2:
+            return False
+
+        # 2. 从后往前找最近的“一买”
+        # 定义：当前向下笔低点 < 前一向下笔低点
+        first_buy_idx = -1
+        for i in range(len(down_strokes) - 1, 0, -1):
+            if down_strokes[i]['low'] < down_strokes[i-1]['low']:
+                first_buy_idx = i
+                break
+        
+        if first_buy_idx == -1 or first_buy_idx == len(down_strokes) - 1:
+            return False # 没找到一买，或者一买就是最后一笔（没空间长出二买）
+
+        # 3. 确定二买（一买之后的下一根向下笔）
+        second_buy_idx = first_buy_idx + 1
+        second_buy_stroke = down_strokes[second_buy_idx]
+        center_high = second_buy_stroke['high']
+        center_low = second_buy_stroke['low']
+
+        # 4. 统计在中枢范围内的向下笔数量（包含二买本身）
+        count_in_center = 0
+        for i in range(second_buy_idx, len(down_strokes)):
+            curr_s = down_strokes[i]
+            # 判断是否在二买的高低点范围内 (重叠即可视为中枢组成)
+            if curr_s['low'] < center_high:
+                count_in_center += 1
+            else:
+                # 一旦走势离开中枢范围，之前的起爆点就不算“第一个中枢”内了
+                return False
+        
+        # 5. 限制：包括二买在内，最多三根向下笔内起爆
+        # 且起爆点必须紧跟在这些向下笔之后的向上段中
+        if 1 <= count_in_center <= 3:
+            return True
+            
+        return False
+    
+    @staticmethod
+    def check_dynamic_sell_condition(current_idx: int, high_full: List[float], low_full: List[float], 
+                                    close_full: List[float], ma60_full: List[float],
+                                    buy_price: float, buy_idx: int, min30_frac: List[float]) -> tuple[bool, str]:
+        """
+        针对单根K线判定是否触发动态卖出（含盈亏门槛校验）
+        """
+        current_close = close_full[current_idx]
+        
+        # === 1. 均线条件判定 (满足涨幅 > 10% 或 持仓 > 30根) ===
+        cond_ma60 = False
+        ma60_reason = ""
+        if current_idx >= 1:
+            # 基础条件：连续两根收盘价小于MA60
+            if current_close < ma60_full[current_idx] and close_full[current_idx-1] < ma60_full[current_idx-1]:
+                # 计算当前涨幅和持仓时长
+                profit_ratio = (current_close - buy_price) / buy_price
+                hold_count = current_idx - buy_idx
+                
+                # 门槛检查
+                if profit_ratio >= 0.10 or hold_count >= 30:
+                    cond_ma60 = True
+                    ma60_reason = f"跌破60均线(收益{profit_ratio:.1%}/持仓{hold_count}线)"
+
+        # === 2. 分型/形态条件 (作为硬性保护，不设门槛) ===
+        cond_pattern = False
+        pattern_reason = ""
+        # 截取到当前为止的转折点数据
+        frac_window = min30_frac[:current_idx+1]
+        top_indices = [i for i, val in enumerate(frac_window) if val == 1.0]
+        bottom_indices = [i for i, val in enumerate(frac_window) if val == -1.0]
+        
+        if bottom_indices:
+            last_bottom_idx = bottom_indices[-1]
+            last_top_idx = top_indices[-1]
+            last_top_idx2 = top_indices[-2]
+            # 跌破最近底分型最低价
+            if low_full[current_idx] < low_full[last_bottom_idx] and high_full[last_top_idx] < high_full[last_top_idx2] and last_top_idx > last_bottom_idx:
+                cond_pattern = True
+                pattern_reason = "跌破最后底分型最低价"
+                
+            # 顶分型后未创新高逻辑
+            valid_tops = [i for i in top_indices if i < last_bottom_idx]
+            if valid_tops:
+                prev_top_idx = valid_tops[-1]
+                if (current_idx - last_bottom_idx) >= (last_bottom_idx - prev_top_idx) and (last_bottom_idx - prev_top_idx) >= 3:
+                    if max(high_full[last_bottom_idx:current_idx+1]) <= high_full[prev_top_idx]:
+                        cond_pattern = True
+                        pattern_reason = "底分型后未突破前高且距离达标"
+        
+        if cond_ma60: return True, ma60_reason
+        if cond_pattern: return True, pattern_reason
+        return False, ""   
+    
+    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float],rps_series: pd.Series = None) -> pd.DataFrame:
+        data = min30_data.copy()
+        data.index.name = 'datetime'
+        day_df.index.name = 'datetime'
+        
+        # --- 新增：1. 计算日线级别的结构位置 ---
+        day_high_list = day_df['最高价'].tolist()
+        day_low_list = day_df['最低价'].tolist()
+        day_positions = []
+        
+        # 逐日推算日线结构位置
+        for i in range(len(day_df)):
+            if i < 3:
+                day_positions.append("未知")
+                continue
+            frac_up_to_now = gupiaojichu.identify_turns(i+1, day_high_list[:i+1], day_low_list[:i+1])
+            pos = self.classify_buy_position(frac_up_to_now, day_high_list[:i+1], day_low_list[:i+1])
+            day_positions.append(pos)
+            
+        day_df['day_buy_position'] = day_positions
+
+        # ================== 【新增：计算周线级别的结构位置】 ==================
+        # 1. 由日线合成周线
+        week_df = day_df.resample('W-FRI').agg({
+            '开盘价': 'first', '最高价': 'max', '最低价': 'min', '收盘价': 'last'
+        }).dropna()
+
+        week_high_list = week_df['最高价'].tolist()
+        week_low_list = week_df['最低价'].tolist()
+        week_positions = []
+
+        # 2. 逐周推算周线结构位置
+        for i in range(len(week_df)):
+            if i < 3:
+                week_positions.append("未知")
+                continue
+            frac_up_to_now = gupiaojichu.identify_turns(i+1, week_high_list[:i+1], week_low_list[:i+1])
+            pos = self.classify_buy_position(frac_up_to_now, week_high_list[:i+1], week_low_list[:i+1])
+            week_positions.append(pos)
+
+        week_df['week_buy_position'] = week_positions
+        
+        # 3. 将周线状态映射回日线 (依据 year + week number 映射)
+        day_df['year_week'] = day_df.index.isocalendar().year.astype(str) + '-' + day_df.index.isocalendar().week.astype(str)
+        week_df['year_week'] = week_df.index.isocalendar().year.astype(str) + '-' + week_df.index.isocalendar().week.astype(str)
+        week_mapping = dict(zip(week_df['year_week'], week_df['week_buy_position']))
+        day_df['week_buy_position'] = day_df['year_week'].map(week_mapping).fillna('未知')
+        # ======================================================================
+        
+        # --- 1. 日线过滤条件 (保持原逻辑) ---
+        day_df = day_df.copy()
+        day_df['ma60'] = day_df['收盘价'].rolling(window=60).mean()
+        day_df['ma60_shift3'] = day_df['ma60'].shift(3)
+        day_df['day_cond'] = (day_df['收盘价'] > day_df['ma60']) & (day_df['ma60'] > day_df['ma60_shift3'])
+        day_df['day_signal_valid'] = day_df['day_cond'].shift(1).fillna(False)
+
+        data['date_only'] = data.index.date
+        day_df['date_only'] = day_df.index.date
+        data = data.reset_index().merge(
+            # 【修改】将 day_buy_position 一并合并到30分钟数据中
+            day_df[['date_only', 'day_signal_valid', 'day_buy_position', 'week_buy_position']],
+            on='date_only', 
+            how='left'
+        ).set_index('datetime')
+
+        # if rps_series is not None:
+        #     data['date_only'] = data.index.date
+        #     rps_df = rps_series.to_frame(name='rps_ok_flag')
+        #     rps_df['date_only'] = rps_df.index.date
+        #     data = data.reset_index().merge(
+        #         rps_df[['date_only', 'rps_ok_flag']], 
+        #         on='date_only', 
+        #         how='left'
+        #     ).set_index('datetime')
+        # else:
+        #     data['rps_ok_flag'] = 1 
+            
+        data['day_buy_position'] = data['day_buy_position'].fillna('未知')
+        # --- 新增：2. 预计算 30 分钟级别单根K线的涨跌幅 ---
+        data['pct_chg'] = data['收盘价'].pct_change() * 100
+
+        # --- 2. 预计算基础指标 ---
+        buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist(), data['开盘价'].tolist())
+        data['buy_signal'] = buy_signals
+        data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
+        
+        close_list = data['收盘价'].tolist()
+        ma60_list = data['ma60'].tolist()
+        high_list = min30_high
+        low_list = min30_low
+        
+        # --- 3. 核心状态机循环 ---
+        data['signal'] = 0
+        data['sell_reason'] = ""
+        data['buy_position'] = ""  
+        in_pos = False
+        buy_price = 0.0
+        buy_idx = 0
+        initial_stop_loss = 0.0
+        current_stop_loss = 0.0 
+        
+        # # 【新增：定义黄金白名单组合 (日线位置, 30分位置)】
+        # GOLDEN_COMBINATIONS = {
+        #     ('二买延续4', '二买'), ('二买延续2', '二买延续3'), ('二买延续2', '二买延续1'),
+        #     ('一买', '三买'), ('一买', '三买延续2'), ('二买延续2', '三买'),
+        #     ('二买延续1', '三买'), ('三买之上1', '一买'), ('一买', '二买'),
+        #     ('二买', '三买'), ('三买延续2', '三买延续1'), ('二买', '二买延续1'),
+        #     ('一买', '三买之上1'), ('三买', '二买延续2'), ('二买延续1', '一买'),
+        #     ('三买', '二买'), ('二买延续2', '一买'), ('二买', '三买之上1'),
+        #     ('二买延续3', '二买'), ('三买之上2', '二买'), ('二买', '三买延续2'),
+        #     ('一买', '三买延续3'), ('二买', '二买延续3'), ('三买', '三买之上3'),
+        #     ('三买延续2', '二买延续1'), ('三买延续1', '二买延续3'), ('二买', '三买之上5'),
+        #     ('二买延续3', '三买延续1')
+        # }
+
+        # 【新增：定义黄金白名单组合 (日线位置, 30分位置)】
+        GOLDEN_COMBINATIONS = {
+            ('二买延续4', '二买'), ('二买延续2', '二买延续3'), ('二买延续2', '二买延续1'),
+            ('一买', '三买'), ('一买', '三买延续2'), ('二买延续2', '三买'),
+            ('二买延续1', '三买'), ('三买之上1', '一买'),
+            ('二买', '三买'), ('三买延续2', '三买延续1'),
+            ('一买', '三买之上1'), ('三买', '二买延续2'), 
+             ('二买延续2', '一买'), ('二买', '三买之上1'),
+            ('二买延续3', '二买')
+        }
+        
+        # 【新增：定义黄金白名单组合 (日线位置, 30分位置)】
+        # GOLDEN_COMBINATIONS = {
+        #     ('二买延续4', '二买'), ('二买延续2', '二买延续3'), ('二买延续2', '二买延续1'),
+        #     ('一买', '三买'), ('一买', '三买延续2'), ('二买延续2', '三买'),
+        #     ('二买延续1', '三买'), 
+        #     ('一买', '三买之上1'), ('二买延续1', '一买'),('二买', '三买之上1'),
+        #     ('二买延续3', '二买'),('二买', '三买延续2'),('二买', '二买延续3')
+        # }
+        for i in range(len(data)):
+            current_idx_time = data.index[i]
+            
+            if not in_pos:             
+                # 1. 基础信号满足
+                if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
+                    
+                    # 2. 提前计算当前的 30 分钟结构位置
+                    frac_up_to_now = gupiaojichu.identify_turns(i+1, high_list[:i+1], low_list[:i+1])
+                    buy_pos_30m = self.classify_buy_position(frac_up_to_now, high_list[:i+1], low_list[:i+1])
+                    
+                    # 3. 提取当前的日线结构位置
+                    buy_pos_day = data['day_buy_position'].iloc[i]
+                    
+                    # 4. 【核心过滤】：只有该组合存在于白名单中，才允许开仓
+                    # if (buy_pos_day, buy_pos_30m) in GOLDEN_COMBINATIONS:
+                    data.loc[current_idx_time, 'signal'] = 1
+                    data.loc[current_idx_time, 'buy_position'] = buy_pos_30m
+                    
+                    in_pos = True
+                    buy_price = close_list[i]
+                    buy_idx = i
+                    
+                    # 5. 计算止损位
+                    if i > 0:
+                        prev_high = high_list[i-1]
+                        initial_stop_loss = min(low_list[i], prev_high)
+                    else:
+                        initial_stop_loss = low_list[i]
+                        
+                    current_stop_loss = initial_stop_loss 
+                    data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
+            else:       
+                if low_list[i] <= current_stop_loss:
+                    data.loc[current_idx_time, 'signal'] = -1
+                    data.loc[current_idx_time, 'sell_reason'] = f"触发止损(当前止损价:{current_stop_loss})"
+                    in_pos = False
+                    continue
+
+                min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
+                data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss 
+                
+                is_sell, reason = self.check_dynamic_sell_condition(
+                    current_idx=i,
+                    high_full=high_list,
+                    low_full=low_list,
+                    close_full=close_list,
+                    ma60_full=ma60_list,
+                    buy_price=buy_price,
+                    buy_idx=buy_idx,
+                    min30_frac=min30_frac
+                )
+                
+                if is_sell:
+                    data.loc[current_idx_time, 'signal'] = -1
+                    data.loc[current_idx_time, 'sell_reason'] = reason
+                    in_pos = False
+
+        return data
+    
+    def run_backtest(self, code: str, period: str = '30min', init_cash: float = 100000.0,
+                 commission: float = 0.0003, stop_loss_ratio: float = 0.01,
+                 use_local: bool = False, tdx_path: str = DEFAULT_TDX_PATH,
+                 use_txt_files: bool = False,
+                 txt_day_dir: str = r"D:\zd_hbzq\daochushujuday",
+                 txt_5min_dir: str = r"D:\zd_hbzq\daochushuju5f",
+                 start_date=None, end_date=None,current_rps: pd.Series = None) -> Tuple[pd.DataFrame, Dict, List[Dict]]:
+
+        """
+        执行三买变体策略回测（30分钟周期）
+        升级：返回单股票交易明细列表，用于总笔数汇总
+        :param code: 股票代码
+        :param period: 回测周期（仅支持30min）
+        :param init_cash: 初始资金
+        :param commission: 交易佣金（默认0.03%）
+        :param stop_loss_ratio: 总资金止损百分比（默认2%）
+        :return: 回测结果DataFrame, 回测指标字典, 单股票交易明细列表
+        """
+        print(f"\n========== 开始回测股票 {code} ==========")
+        print(f"数据源模式：{'本地通达信数据' if use_local else '联网获取'}")
+   
+        # 重置单股票交易明细
+        self.all_trades_detail = []
+        
+        if period != '30min':
+            print("当前版本仅支持30分钟周期回测")
+            return pd.DataFrame(), {}, []
+        
+        # 联网模式需要先连接服务器
+        if not use_local:
+            connect_success = self.connect_tdx()
+            if not connect_success:
+                print("联网模式连接失败，终止回测")
+                return pd.DataFrame(), {}, []
+        
+        # 获取多周期数据（自动切换本地/联网）
+        multi_data = self.get_multi_period_data(
+        code, count=800,
+        use_local=use_local, tdx_path=tdx_path,
+        use_txt_files=use_txt_files,
+        txt_day_dir=txt_day_dir, txt_5min_dir=txt_5min_dir,
+        start_date=start_date, end_date=end_date
+                                         )
+        day_data = multi_data['day']
+        min30_data = multi_data['30min']
+        min30_high = multi_data['30min_high_list']
+        min30_low = multi_data['30min_low_list']
+        
+        if min30_data.empty:
+            print(f"股票 {code} 30分钟数据为空，无法回测")
+            return pd.DataFrame(), {}, []
+        
+        # 生成策略信号
+        data = self.three_buy_strategy(day_data, min30_data, min30_high, min30_low,current_rps)
+        
+        # 初始化止损百分比
+        self.stop_loss_ratio = stop_loss_ratio
+        print(f"\n以损定量配置：单笔交易最大亏损 = 总资金 × {stop_loss_ratio*100}%")
+        
+        # 初始化回测参数
+        cash = init_cash  # 可用资金
+        position = 0  # 持仓数量
+        total_asset = init_cash  # 总资产（现金+持仓市值）
+        trade_records = []  # 交易记录
+        daily_results = []  # 每30分钟结果
+        self.trade_pnl = []      # 记录每笔交易的盈亏
+        
+        # 止损相关初始化
+        self.stop_loss_price = 0.0
+        self.in_position = False
+        
+        # 逐行执行回测
+        buy_price = 0
+        buy_fee = 0
+        
+        for datetime, row in data.iterrows():
+            close_price = row['收盘价']
+            current_total_asset = cash + position * close_price
+            current_idx = data.index.get_loc(datetime) 
+
+            if row['signal'] == 1 or row['signal'] == -1:
+                self.stop_loss_price = row['active_stop_loss']
+            
+            # ===== 买入逻辑 =====
+            if row['signal'] == 1 and cash > close_price and not self.in_position:   
+                buy_num = self.calculate_position_size(
+                    current_cash=current_total_asset,
+                    entry_price=close_price,
+                    stop_loss_price=self.stop_loss_price
+                )
+                
+                if buy_num > 0:
+                    self.buy_in_total_asset = cash + position * close_price
+                    cost = buy_num * close_price * (1 + commission)
+                    fee = buy_num * close_price * commission
+                    if cash >= cost:
+                        position += buy_num
+                        cash -= cost
+                        buy_price = close_price
+                        buy_fee = fee
+                        self.in_position = True
+                        self.buy_kline_index = current_idx  
+
+                        # 暂存当前的结构位置
+                        self.current_buy_position = row.get('buy_position', '未知')
+                        self.current_day_buy_position = row.get('day_buy_position', '未知')  # 【新增记录日线】
+                        self.current_week_buy_position = row.get('week_buy_position', '未知') # 【新增：记录周线】
+                        
+                        trade_detail = {
+                            '股票代码': code,
+                            '交易时间': datetime,
+                            '起爆点位置(30分)': self.current_buy_position,
+                            '起爆点位置(日线)': self.current_day_buy_position,
+                            '起爆点位置(周线)': self.current_week_buy_position, # 【新增】
+                            '交易类型': '买入',
+                            '价格': close_price,
+                            '数量': buy_num,
+                            '费用': fee,
+                            '总资金': round(current_total_asset, 2),  # 【新增】买入前的总资产
+                            '剩余总资金': round(cash, 2),             # 【新增】买入扣款后的可用现金
+                            '单笔盈亏': 0.0,
+                            '是否盈利': None,
+                            '设置止损价': self.stop_loss_price,
+                            '单笔风险金额': self.risk_per_trade,
+                            '风险比例': self.stop_loss_ratio*100,
+                            '单k涨幅': (close_price - self.stop_loss_price)/self.stop_loss_price*100,
+                            # 占位保证格式对齐
+                            '买点前3K涨跌幅(%)': None, '买点前2K涨跌幅(%)': None, '买点前1K涨跌幅(%)': None,
+                            '买点后1K涨跌幅(%)': None, '买点后2K涨跌幅(%)': None, '买点后3K涨跌幅(%)': None
+                        }
+                        trade_records.append(trade_detail)
+                        self.all_trades_detail.append(trade_detail)  
+                        
+                        print(f"【买入开仓（以损定量）】{datetime} - 价格{close_price}，数量{buy_num}")
+                else:
+                    print(f"【买入失败】{datetime} - 以损定量计算可买数量为0")
+            
+            # ===== 卖出逻辑 =====
+            elif row['signal'] == -1 and position > 0:
+                current_kline_idx = data.index.get_loc(datetime) + 1  
+                sell_reason = row['sell_reason'] if 'sell_reason' in row else "未知原因"
+                
+                sell_num = position
+                fee = sell_num * close_price * commission
+                income = sell_num * close_price * (1 - commission)
+                total_buy_cost = sell_num * buy_price + buy_fee
+                total_sell_income = income - fee
+                pnl = total_sell_income - total_buy_cost
+                hold_k_count = current_idx - self.buy_kline_index + 1  
+                cash += income
+
+                # 【新增】：获取起爆K线前后三根的涨跌幅提取函数
+                def get_k_pct(idx):
+                    if 0 <= idx < len(data):
+                        val = data['pct_chg'].iloc[idx]
+                        return round(val, 2) if not pd.isna(val) else None
+                    return None
+
+                # 根据买入点的全局索引偏移提取前后三根K线的涨跌幅
+                t_minus_3 = get_k_pct(self.buy_kline_index - 3)
+                t_minus_2 = get_k_pct(self.buy_kline_index - 2)
+                t_minus_1 = get_k_pct(self.buy_kline_index - 1)
+                t_plus_1 = get_k_pct(self.buy_kline_index + 1)
+                t_plus_2 = get_k_pct(self.buy_kline_index + 2)
+                t_plus_3 = get_k_pct(self.buy_kline_index + 3)
+
+                trade_detail = {
+                    '股票代码': code,
+                    '交易时间': datetime,
+                    '起爆点位置(30分)': getattr(self, 'current_buy_position', '未知'), 
+                    '起爆点位置(日线)': getattr(self, 'current_day_buy_position', '未知'),  # 【新增】
+                    '起爆点位置(周线)': getattr(self, 'current_week_buy_position', '未知'), # 【新增】
+                    '交易类型': '策略卖出',
+                    '价格': close_price,
+                    '数量': sell_num,
+                    '费用': fee,
+                    '总资金': round(cash, 2),     # 【新增】由于单股回测全仓卖出，卖出后的总资产即为当前现金
+                    '剩余总资金': round(cash, 2),  # 【新增】同上，即变现后的可用资金
+                    '单笔盈亏': pnl,
+                    '是否盈利': pnl > 0,
+                    '卖出原因': sell_reason,
+                    '当前K线索引': current_kline_idx,
+                    '持仓K线数量': hold_k_count,  
+                    '单笔风险金额': self.risk_per_trade,
+                    '实际盈亏比例': pnl/self.buy_in_total_asset*100,
+                    # 【新增】：买点前后的单根涨跌幅数据
+                    '买点前3K涨跌幅(%)': t_minus_3,  
+                    '买点前2K涨跌幅(%)': t_minus_2,
+                    '买点前1K涨跌幅(%)': t_minus_1,
+                    '买点后1K涨跌幅(%)': t_plus_1,
+                    '买点后2K涨跌幅(%)': t_plus_2,
+                    '买点后3K涨跌幅(%)': t_plus_3
+                }
+                trade_records.append(trade_detail)
+                self.trade_pnl.append(pnl)
+                self.all_trades_detail.append(trade_detail)  
+                
+                # 重置持仓
+                position = 0
+                buy_price = 0
+                buy_fee = 0
+                self.stop_loss_price = 0.0
+                self.in_position = False
+                self.risk_per_trade = 0.0
+                               
+                # 新增：打印卖出原因和K线索引
+                print(f"【策略卖出】{datetime} - 第{current_kline_idx}根K线 | 价格{close_price}，数量{sell_num}，盈亏{pnl:.2f}")
+                print(f"          - 卖出原因：{sell_reason}")
+                print(f"          - 单笔风险金额:{self.risk_per_trade:.2f} | 实际盈亏比例:{pnl/self.buy_in_total_asset*100:.2f}%")
+            
+            # 计算当前总资产
+            total_asset = cash + position * close_price
+            daily_results.append({
+                '时间': datetime,
+                '收盘价': close_price,
+                '持仓数量': position,
+                '可用现金': cash,
+                '总资产': total_asset,
+                '累计收益': total_asset - init_cash,
+                '累计收益率': (total_asset - init_cash) / init_cash * 100,
+                '止损价格': self.stop_loss_price if self.in_position else 0.0,
+                '单笔风险金额': self.risk_per_trade if self.in_position else 0.0
+            })
+        
+        # 整理回测结果
+        self.backtest_result = pd.DataFrame(daily_results)
+        self.backtest_result = self.backtest_result.set_index('时间')
+        
+        # 添加交易记录
+        self.trade_records = pd.DataFrame(trade_records)
+        
+        # 计算核心指标
+        metrics = self.calc_backtest_metrics(init_cash)
+        
+        # 打印单股票回测指标
+        print(f"\n===== 股票 {code} 回测核心指标 =====")
+        for k, v in metrics.items():
+            print(f"{k}: {v:.2f}")
+        
+        print(f"\n========== 股票 {code} 回测完成 ==========\n")
+        return self.backtest_result, metrics, self.all_trades_detail
+
 
 def parse_tdx_blk_file(file_path: str) -> List[str]:
     stock_list = []
+    
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
+            
+        # 跳过第一行空白，从第二行开始处理
         for line in lines[1:]:
             line = line.strip()
             if line:
+                # 第一位是市场代码，后六位是股票代码
+                market_code = line[0]
                 stock_code = line[1:7]
+                
+                # 将市场代码转换为pytdx需要的格式
+                # 0: 深圳, 1: 上海
+                if market_code == '0':
+                    market = 0  # 深圳
+                    market_prefix = 'sz'
+                else:
+                    market = 1  # 上海
+                    market_prefix = 'sh'
+                
+                full_code = f"{market_prefix}{stock_code}"
+                # stock_list.append((market, stock_code, full_code))            
                 stock_list.append((stock_code))            
     except Exception as e:
         print(f"读取blk文件失败: {e}")
+        
     return stock_list
 
-def run_batch_backtest(symbols: List[str], tdx_path, start_date, end_date, output_file="backtest_results.xlsx"):
+def calculate_total_trades_metrics(all_trades_detail: List[Dict]) -> Dict:
     """
-    批量执行回测并将结果和所有明细保存到多Sheet Excel 文件
+    新增：按总交易笔数计算核心指标
+    :param all_trades_detail: 所有股票的交易明细列表
+    :return: 总笔数维度的汇总指标
     """
-    all_results = []
-    all_trades_detail = []  # --- 新增: 全局收集所有交易明细 ---
-
-    for symbol in symbols:
-        print(f"\n{'='*20} 正在回测: {symbol} {'='*20}")
-        
-        try:
-            df_30m = get_exact_tdx_30min(symbol, tdx_path, start_date, end_date)
-            df_day = get_local_day_data(symbol, tdx_path, start_date, end_date)
-            
-            if df_30m.empty or df_day.empty:
-                print(f"跳过 {symbol}: 数据获取失败")
-                continue
-
-            cerebro = bt.Cerebro()
-            cerebro.broker.setcash(100000.0)
-            cerebro.broker.setcommission(commission=0.0003)
-
-            data_30m = TDXPandasData(dataname=df_30m, timeframe=bt.TimeFrame.Minutes, compression=30)
-            data_day = TDXPandasData(dataname=df_day, timeframe=bt.TimeFrame.Days)
-
-            cerebro.adddata(data_30m, name='30m')
-            cerebro.adddata(data_day, name='day')
-
-            # --- 修改: 传递当前股票代码 ---
-            cerebro.addstrategy(ThreeBuyVariantStrategy, symbol=symbol)
-            cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='trades')
-            cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
-            cerebro.addanalyzer(bt.analyzers.Returns, _name='returns')
-
-            strat_runs = cerebro.run()
-            strat = strat_runs[0]
-
-            # --- 新增: 从策略实例中抽离当前股票的交易明细 ---
-            if hasattr(strat, 'trades_detail') and strat.trades_detail:
-                all_trades_detail.extend(strat.trades_detail)
-
-            analysis_trades = strat.analyzers.trades.get_analysis()
-            analysis_dd = strat.analyzers.drawdown.get_analysis()
-            analysis_ret = strat.analyzers.returns.get_analysis()
-
-            res = {
-                "代码": symbol,
-                "期末资产": round(cerebro.broker.get_value(), 2),
-                "总收益率(%)": round(analysis_ret.get('rtot', 0) * 100, 2),
-                "最大回撤(%)": round(analysis_dd.max.drawdown, 2),
-                "交易次数": 0,
-                "胜率(%)": 0.0,
-                "平均盈利": 0.0,
-            }
-
-            if 'total' in analysis_trades and analysis_trades.total.closed > 0:
-                total_closed = analysis_trades.total.closed
-                won = analysis_trades.won.total
-                res["交易次数"] = total_closed
-                res["胜率(%)"] = round(won / total_closed * 100, 2)
-                res["平均盈利"] = round(analysis_trades.pnl.net.average, 2)
-
-            all_results.append(res)
-            print(f"完成 {symbol}: 收益 {res['总收益率(%)']}%")
-
-        except Exception as e:
-            print(f"股票 {symbol} 回测期间发生错误: {str(e)}")
-            continue
-
-    # --- 修改: 按照多 Sheet 的方式保存 Excel ---
-    if all_results:
-        final_df = pd.DataFrame(all_results)
-        trades_df = pd.DataFrame(all_trades_detail)
-        
-        with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
-            final_df.to_excel(writer, sheet_name="单股票维度汇总", index=False)
-            if not trades_df.empty:
-                trades_df.to_excel(writer, sheet_name="所有交易明细", index=False)
-                
-        print(f"\n{'#'*20} 所有回测完成 {'#'*20}")
-        print(f"结果已保存至: {os.path.abspath(output_file)}")
-        print(final_df)
-    else:
-        print("没有产生任何有效回测结果。")
-
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\FZBCS.blk"
-
-if __name__ == '__main__':
-    stock_list = parse_tdx_blk_file(BLOB_FILE_PATH)
-    PATH_TDX = r"D:\zd_hbzq"
-    START = '2023-01-01'
-    END = '2026-04-15'
+    if not all_trades_detail:
+        return {}
     
-    run_batch_backtest(
-        symbols=stock_list, 
-        tdx_path=PATH_TDX, 
-        start_date=START, 
-        end_date=END,
-        output_file=f"回测结果_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-    )
+    # 过滤出有盈亏的交易（买入交易无盈亏，仅统计卖出/止损交易）
+    pnl_trades = [t for t in all_trades_detail if t.get('单笔盈亏', 0) != 0.0 and '持仓K线数量' in t]
+    if not pnl_trades:
+        return {
+            '总交易笔数（含买入）': len(all_trades_detail),
+            '有效交易笔数（有盈亏）': 0,
+            '盈利笔数': 0,
+            '亏损笔数': 0,
+            '总胜率(%)': 0.0,
+            '总盈利金额': 0.0,
+            '总亏损金额': 0.0,
+            '总净收益': 0.0,
+            '平均每笔盈利': 0.0,
+            '平均每笔亏损': 0.0,
+            '总盈亏比': 0.0,
+            '最大单笔盈利': 0.0,
+            '最大单笔亏损': 0.0
+        }
+
+    # 2. 提取不同类别的持仓数据
+    hold_periods = [t['持仓K线数量'] for t in pnl_trades]
+    win_hold_periods = [t['持仓K线数量'] for t in pnl_trades if t['是否盈利']]
+    loss_hold_periods = [t['持仓K线数量'] for t in pnl_trades if not t['是否盈利']]
+
+    # 基础指标计算...
+    total_pnl_trades = len(pnl_trades)
+    win_trades = [t for t in pnl_trades if t['是否盈利']]
+    loss_trades = [t for t in pnl_trades if not t['是否盈利']]
+    
+    # 3. 计算要求的指标
+    avg_hold_k = np.mean(hold_periods) if hold_periods else 0.0
+    avg_win_hold_k = np.mean(win_hold_periods) if win_hold_periods else 0.0
+    avg_loss_hold_k = np.mean(loss_hold_periods) if loss_hold_periods else 0.0
+    max_hold_k = np.max(hold_periods) if hold_periods else 0.0
+    
+    # 核心计算
+    total_trades_all = len(all_trades_detail)          # 所有交易笔数（含买入）
+    total_pnl_trades = len(pnl_trades)                 # 有效交易笔数（卖出/止损）
+    win_trades = [t for t in pnl_trades if t['是否盈利']] # 盈利笔数
+    loss_trades = [t for t in pnl_trades if not t['是否盈利']] # 亏损笔数
+    total_win_count = len(win_trades)
+    total_loss_count = len(loss_trades)
+    
+    # 金额类指标
+    total_profit = sum(t['单笔盈亏'] for t in win_trades)
+    total_loss = abs(sum(t['单笔盈亏'] for t in loss_trades))
+    total_net_profit = total_profit - total_loss
+    avg_win_per_trade = total_profit / total_win_count if total_win_count > 0 else 0.0
+    avg_loss_per_trade = total_loss / total_loss_count if total_loss_count > 0 else 0.0
+    total_profit_loss_ratio = avg_win_per_trade / avg_loss_per_trade if avg_loss_per_trade > 0 else 0.0
+    
+    # 极值指标
+    max_single_win = max([t['单笔盈亏'] for t in win_trades], default=0.0)
+    max_single_loss = min([t['单笔盈亏'] for t in loss_trades], default=0.0)
+    
+    # 胜率
+    total_win_rate = (total_win_count / total_pnl_trades) * 100 if total_pnl_trades > 0 else 0.0
+    
+    # 汇总结果
+    total_metrics = {
+        '总交易笔数（含买入）': total_trades_all,
+        '有效交易笔数（卖出/止损）': total_pnl_trades,
+        '盈利笔数': total_win_count,
+        '亏损笔数': total_loss_count,
+        '总胜率(%)': total_win_rate,
+        '总盈利金额': total_profit,
+        '总亏损金额': total_loss,
+        '总净收益': total_net_profit,
+        '平均每笔盈利': avg_win_per_trade,
+        '平均每笔亏损': avg_loss_per_trade,
+        '总盈亏比': total_profit_loss_ratio,
+        '最大单笔盈利': max_single_win,
+        '最大单笔亏损': max_single_loss,
+        # --- 暴露给前端的持仓时间指标 -----
+        '平均持仓K线数量': round(avg_hold_k, 2),
+        '盈利平均K线数量': round(avg_win_hold_k, 2),
+        '亏损平均K线数量': round(avg_loss_hold_k, 2),
+        '最高持仓K线数量': int(max_hold_k)
+    }
+    
+    return total_metrics
+
+def batch_backtest(stock_codes: List[str], init_cash: float = 100000.0, 
+                   commission: float = 0.0003, stop_loss_ratio: float = 0.01) -> Tuple[pd.DataFrame, pd.DataFrame, Dict]:
+    """
+    批量回测股票列表（升级：新增总笔数汇总）
+    :param stock_codes: 股票代码列表
+    :param init_cash: 单股票初始资金
+    :param commission: 佣金比例
+    :param stop_loss_ratio: 止损比例
+    :return: 单股票汇总结果DF, 所有交易明细DF, 总笔数汇总指标
+    """
+    # 初始化回测框架并连接通达信
+    backtest = TdxStockBacktest()
+    connect_success = backtest.connect_tdx()
+    if not connect_success:
+        print("通达信服务器连接失败，无法执行批量回测")
+        return pd.DataFrame(), pd.DataFrame(), {}
+    
+    # 存储所有股票的回测指标 + 所有交易明细
+    all_metrics = []
+    all_trades_detail = []  # 存储所有股票的交易明细
+
+    # all_day_data = {}
+    # # 步骤 A: 预抓取所有日线数据用于计算全局 RPS
+    # print("正在预取日线数据以计算 RPS 强度...")
+    # for code in stock_codes:
+    #     df = backtest.get_local_day_data(code)
+    #     if not df.empty:
+    #         all_day_data[code] = df
+    # # 步骤 B: 计算多周期 RPS 强度
+    # print("正在计算 RPS60 和 RPS120 和 RPS250 强度矩阵...")
+    # rps60_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=5)
+    # rps120_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=8)
+    # rps250_matrix = TdxStockBacktest.calculate_rps_matrix(all_day_data, n=13)
+
+    # 逐只股票回测
+    for idx, code in enumerate(stock_codes):
+        print(f"\n------------------- 进度 {idx+1}/{len(stock_codes)} -------------------")
+        try:
+            # # --- 核心逻辑修改：提取该股的两个 RPS 序列并计算“或”逻辑 ---
+            # s60 = rps60_matrix[code] if code in rps60_matrix else pd.Series(0, index=rps60_matrix.index)
+            # s120 = rps120_matrix[code] if code in rps120_matrix else pd.Series(0, index=rps120_matrix.index)
+            # s250 = rps250_matrix[code] if code in rps250_matrix else pd.Series(0, index=rps250_matrix.index)
+            
+            # # 只要其中一个大于 80，该序列即为 True (1)，否则为 False (0)
+            # # 这样传给策略函数时，策略只需要判断这个综合信号即可
+
+            # combined_rps_filter = ((s60 >= 90) & (s120 >= 90) & (s250 >= 90)).astype(int)
+            # combined_rps_filter = combined_rps_filter.shift(1).fillna(0)   # 改为用昨日RPS
+
+            _, metrics, trades_detail = backtest.run_backtest(
+                code=code,
+                init_cash=init_cash,
+                commission=commission,
+                stop_loss_ratio=stop_loss_ratio,
+                use_local=False,           # 关闭本地数据库模式
+                use_txt_files=True,        # 启用 txt 文件读取
+                txt_day_dir=r"D:\zd_hbzq\daochushujuday",
+                txt_5min_dir=r"D:\zd_hbzq\daochushuju5f",
+                start_date='2023-11-01',
+                end_date='2026-05-28',
+                current_rps=None
+            )
+            if metrics:  # 仅保留有有效指标的股票
+                metrics['股票代码'] = code
+                all_metrics.append(metrics)
+            if trades_detail:  # 收集交易明细
+                all_trades_detail.extend(trades_detail)
+            # 避免请求过快，休眠0.1秒
+            time.sleep(0.001)
+        except Exception as e:
+            print(f"股票 {code} 回测异常: {e}")
+            continue
+    
+    # ========== 原有：单股票维度汇总 ==========
+    if not all_metrics:
+        print("无有效回测结果")
+        return pd.DataFrame(), pd.DataFrame(), {}
+    
+    # 单股票汇总DF
+    stock_summary_df = pd.DataFrame(all_metrics)
+    # 调整列顺序，把股票代码放第一列
+    cols = ['股票代码'] + [col for col in stock_summary_df.columns if col != '股票代码']
+    stock_summary_df = stock_summary_df[cols]
+    
+    # 单股票维度汇总指标
+    print("\n" + "="*80)
+    print("                          板块回测（单股票维度）汇总")
+    print("="*80)
+    total_stocks = len(stock_summary_df)
+    profitable_stocks = len(stock_summary_df[stock_summary_df['累计收益'] > 0])
+    avg_return = stock_summary_df['累计收益率(%)'].mean()
+    avg_max_dd = stock_summary_df['最大回撤(%)'].mean()
+    avg_win_rate = stock_summary_df['胜率(%)'].mean()
+    avg_profit_loss_ratio = stock_summary_df['盈亏比'].mean()
+    total_profit_all = stock_summary_df['累计收益'].sum()
+    total_return_all = (total_profit_all / (init_cash * total_stocks)) * 100
+    
+    # 打印单股票维度汇总
+    print(f"1. 参与回测股票总数：{total_stocks} 只")
+    print(f"2. 盈利股票数量：{profitable_stocks} 只 | 盈利股票占比：{profitable_stocks/total_stocks*100:.2f}%")
+    print(f"3. 单股票平均累计收益率：{avg_return:.2f}%")
+    print(f"4. 单股票平均最大回撤：{avg_max_dd:.2f}%")
+    print(f"5. 单股票平均胜率：{avg_win_rate:.2f}%")
+    print(f"6. 单股票平均盈亏比：{avg_profit_loss_ratio:.2f}")
+    print(f"7. 板块总累计收益：{total_profit_all:.2f} 元 (等额资金分配下)")
+    print(f"8. 板块总累计收益率：{total_return_all:.2f}% (等额资金分配下)")
+    print("="*80)
+    
+    # ========== 新增：总交易笔数维度汇总 ==========
+    total_trades_metrics = calculate_total_trades_metrics(all_trades_detail)
+    print("\n" + "="*80)
+    print("                          板块回测（总交易笔数维度）汇总")
+    print("="*80)
+    for k, v in total_trades_metrics.items():
+        print(f"{k}: {v:.2f}")
+    print("="*80)
+    
+    # 交易明细DF（便于保存和分析）
+    trades_detail_df = pd.DataFrame(all_trades_detail)
+    
+    return stock_summary_df, trades_detail_df, total_trades_metrics
+
+def calculate_pure_compounding(all_trades_detail: List[Dict], init_cash: float = 100000.0) -> Dict:
+    """
+    纯理论复利计算：忽略资金重叠，将所有有效交易按时间排序，进行单队列资产滚动。
+    :param all_trades_detail: batch_backtest 返回的交易明细列表
+    :param init_cash: 模拟的账户初始总资金（默认100万）
+    """
+    if not all_trades_detail:
+        return {}
+
+    # 1. 过滤出平仓交易（只有卖出和止损才有实际的单笔盈亏结算）
+    closed_trades = [t for t in all_trades_detail if t.get('单笔盈亏', 0) != 0.0]
+    
+    if not closed_trades:
+        return {}
+
+    # 2. 严格按照交易时间（平仓时间）升序排列
+    closed_trades.sort(key=lambda x: pd.to_datetime(x['交易时间']))
+
+    # 3. 开始模拟资金滚动
+    current_capital = init_cash
+    capital_curve = [current_capital]  # 记录资金曲线用于算回撤
+    
+    for trade in closed_trades:
+        # 你原本代码里的 '实际盈亏比例' 是相对于单股10万资产的波动百分比
+        # 这里我们直接将这个净值波动率作用于全局总资金
+        # 注意：原代码 '实际盈亏比例' 是放大了100倍的百分比（如 1.5 表示 1.5%），所以这里要除以 100
+        trade_return_ratio = trade['实际盈亏比例'] / 100.0
+        
+        # 核心复利公式：新资金 = 老资金 * (1 + 单笔涨跌幅)
+        current_capital = current_capital * (1 + trade_return_ratio)
+        capital_curve.append(current_capital)
+
+    # 4. 计算复利曲线的最大回撤
+    capital_array = np.array(capital_curve)
+    running_max = np.maximum.accumulate(capital_array)
+    drawdowns = (capital_array - running_max) / running_max
+    max_dd = np.min(drawdowns) * 100
+
+    # 5. 汇总数据
+    total_return_pct = (current_capital - init_cash) / init_cash * 100
+
+    return {
+        "初始总资金": init_cash,
+        "最终总资金": current_capital,
+        "参与复利交易笔数": len(closed_trades),
+        "理论复利总收益率(%)": total_return_pct,
+        "复利资金曲线最大回撤(%)": max_dd
+    }
+
+def analyze_loss_periods(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    分析每日盈亏表现：左侧盈利排名，右侧亏损排名
+    """
+    if trades_df.empty:
+        return pd.DataFrame()
+    
+    df = trades_df.copy()
+    df['日期'] = pd.to_datetime(df['交易时间']).dt.date
+    
+    # 1. 基础按日汇总
+    daily_stats = df[df['单笔盈亏'] != 0].groupby('日期')['单笔盈亏'].agg(['count', 'sum']).reset_index()
+    daily_stats.columns = ['日期', '成交笔数', '当日净损益']
+
+    # 2. 提取盈利日并排序 (金额从大到小)
+    profit_days = daily_stats[daily_stats['当日净损益'] > 0].copy()
+    profit_days = profit_days.sort_values(by='当日净损益', ascending=False).reset_index(drop=True)
+    profit_days.columns = ['盈利日期', '盈利单数', '盈利金额']
+
+    # 3. 提取亏损日并排序 (金额从小到大，即亏得最多的在最上面)
+    loss_days = daily_stats[daily_stats['当日净损益'] < 0].copy()
+    loss_days = loss_days.sort_values(by='当日净损益', ascending=True).reset_index(drop=True)
+    loss_days.columns = ['亏损日期', '亏损单数', '亏损金额']
+
+    # 4. 左右强行合并 (通过 concat 横向拼接)
+    # 为了防止左右行数不一致，pandas 会自动补 NaN
+    combined_df = pd.concat([profit_days, loss_days], axis=1)
+
+    print(f"\n统计完成：盈利天数 {len(profit_days)}，亏损天数 {len(loss_days)}")
+    return combined_df
+
+def analyze_by_buy_date(trades_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    根据买入日期统计每日盈亏（将每笔卖出盈亏归属到对应的买入日期）
+    :param trades_df: 所有交易明细DataFrame（包含买入和卖出记录）
+    :return: 包含两列：左侧盈利日期、盈利单数、盈利金额；右侧亏损日期、亏损单数、亏损金额
+    """
+    if trades_df.empty:
+        return pd.DataFrame()
+
+    # 确保按时间排序
+    trades_df = trades_df.sort_values('交易时间').reset_index(drop=True)
+
+    # 使用队列记录每只股票的未匹配买入记录
+    buy_queue = defaultdict(deque)  # key: 股票代码, value: deque of (买入时间, 数量)
+
+    # 存储按买入日期汇总的盈亏数据
+    buy_date_summary = {}  # key: 买入日期, value: {'盈利金额':0, '盈利单数':0, '亏损金额':0, '亏损单数':0}
+
+    for _, row in trades_df.iterrows():
+        code = row['股票代码']
+        ttype = row['交易类型']
+
+        if ttype == '买入':
+            # 记录买入
+            buy_queue[code].append((row['交易时间'], row['数量']))
+        elif '卖出' in ttype:
+            # 卖出，匹配最近的买入（先进先出）
+            if code in buy_queue and buy_queue[code]:
+                buy_time, _ = buy_queue[code].popleft()
+                pnl = row['单笔盈亏']
+                buy_date = pd.to_datetime(buy_time).date()
+
+                if buy_date not in buy_date_summary:
+                    buy_date_summary[buy_date] = {
+                        '盈利金额': 0.0,
+                        '盈利单数': 0,
+                        '亏损金额': 0.0,
+                        '亏损单数': 0
+                    }
+
+                if pnl > 0:
+                    buy_date_summary[buy_date]['盈利金额'] += pnl
+                    buy_date_summary[buy_date]['盈利单数'] += 1
+                else:
+                    buy_date_summary[buy_date]['亏损金额'] += pnl  # 负数
+                    buy_date_summary[buy_date]['亏损单数'] += 1
+            else:
+                print(f"警告: 卖出记录 {row.to_dict()} 没有对应的买入记录")
+
+    # 构建 DataFrame
+    rows = []
+    for date, vals in buy_date_summary.items():
+        rows.append({
+            '日期': date,
+            '盈利单数': vals['盈利单数'],
+            '盈利金额': vals['盈利金额'],
+            '亏损单数': vals['亏损单数'],
+            '亏损金额': vals['亏损金额']  # 保留负数
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    # 分离盈利日和亏损日
+    profit_days = df[df['盈利金额'] > 0][['日期', '盈利单数', '盈利金额']].copy()
+    profit_days = profit_days.rename(columns={'日期': '盈利日期'})
+    profit_days = profit_days.sort_values('盈利金额', ascending=False).reset_index(drop=True)
+
+    loss_days = df[df['亏损金额'] < 0][['日期', '亏损单数', '亏损金额']].copy()
+    loss_days = loss_days.rename(columns={'日期': '亏损日期'})
+    loss_days = loss_days.sort_values('亏损金额', ascending=True).reset_index(drop=True)  # 亏损最多（负值最小）在前
+
+    # 左右合并
+    combined = pd.concat([profit_days, loss_days], axis=1)
+    return combined
+
+# ------------------- 主执行入口 -------------------
+if __name__ == "__main__":
+    # 1. 解析通达信板块文件
+    stock_list = parse_tdx_blk_file(BLOB_FILE_PATH)
+    # stock_list = stock_list[:10]  # 测试时可限制股票数量
+    
+    if not stock_list:
+        print("未提取到股票代码，退出程序")
+    else:
+        # 2. 执行批量回测
+        stock_summary_result, trades_detail_result, total_trades_metrics = batch_backtest(
+            stock_codes=stock_list,
+            init_cash=100000.0,    # 单股票初始资金10万
+            commission=0.0003,     # 佣金0.03%
+            stop_loss_ratio=0.01   # 单笔止损1%
+        )
+        # ================== 执行理论复利计算 ==================
+        trades_list = trades_detail_result.to_dict('records') if not trades_detail_result.empty else []
+        compounding_metrics = calculate_pure_compounding(trades_list, init_cash=100000.0)
+        
+        print("\n" + "="*80)
+        print("                    板块回测（无视重叠的极限复利）汇总")
+        print("="*80)
+        for k, v in compounding_metrics.items():
+            if "(%)" in k:
+                print(f"{k}: {v:.2f}%")
+            elif "资金" in k:
+                print(f"{k}: {v:,.2f} 元")
+            else:
+                print(f"{k}: {v}")
+        print("="*80)
+        
+        # ================== 执行亏损日期分析 ==================
+        loss_dates_df = analyze_loss_periods(trades_detail_result)
+        t = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime(time.time()))
+        buy_date_stats = analyze_by_buy_date(trades_detail_result)
+        # 3. 保存结果到Excel（多sheet）
+        if not stock_summary_result.empty:
+            with pd.ExcelWriter(f"板块回测汇总结果_含总笔数{t}.xlsx", engine="openpyxl") as writer:
+                # Sheet1：单股票汇总
+                stock_summary_result.to_excel(writer, sheet_name="单股票维度汇总", index=False)
+                # Sheet2：所有交易明细
+                trades_detail_result.to_excel(writer, sheet_name="所有交易明细", index=False)
+                # Sheet3：总笔数维度汇总
+                total_trades_df = pd.DataFrame([total_trades_metrics])
+                total_trades_df.to_excel(writer, sheet_name="总交易笔数维度汇总", index=False)
+                # Sheet4：提取的亏损明细表
+                if loss_dates_df is not None and not loss_dates_df.empty:
+                    loss_dates_df.to_excel(writer, sheet_name="亏损日期提取", index=False)
+                # 新增 sheet
+                if not buy_date_stats.empty:
+                    buy_date_stats.to_excel(writer, sheet_name="按买入日期统计", index=False)
+            print(f"\n汇总结果已保存到: 板块回测汇总结果_含总笔数.xlsx，请查看 '亏损日期提取' Sheet。")

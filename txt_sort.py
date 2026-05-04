@@ -26,4 +26,4 @@ def export_to_tdx_custom(excel_path, output_filename='to_tdx_sort.txt'):
     print(f"转换完成！请将 {output_filename} 导入通达信。")
 
 # 使用示例
-export_to_tdx_custom('板块回测汇总结果_含总笔数2026-04-26-17-12-50_rps13，8，5，30f起爆买入_2%风险金.xlsx')
+export_to_tdx_custom('板块回测汇总结果_含总笔数2026-04-28-21-30-30_正常15组合.xlsx')
