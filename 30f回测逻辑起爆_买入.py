@@ -6,7 +6,7 @@ import gupiaojichu
 import winsound
 
 # 假设你的策略逻辑封装在 TdxStockBacktest 类中
-from 回测 import TdxStockBacktest 
+from 回测供脚本使用 import TdxStockBacktest 
 
 class GoldenListMonitor:
     def __init__(self, stock_list):
@@ -98,6 +98,7 @@ class GoldenListMonitor:
         return window_signal
     
     def check_golden_signal(self):
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))} 30分钟信号循环开始...")
         for codes in self.stock_list:
             code = codes[1]
             market = 1 if code.startswith('6') else 0
@@ -120,7 +121,7 @@ class GoldenListMonitor:
 
             # 计算30分钟买入信号 (基于你代码中的 calculate_three_buy_signals)
             buy_signals_30 = self.calculate_three_buy_signals(code, high_30, low_30, close_30, open_30)
-            print(f"{code} 30分钟信号")
+            # print(f"{code} 30分钟信号")
             # 如果30分钟最新一根K线有基础买入信号
             if buy_signals_30[-1] == 1.0:
                 # 计算30分钟当前的结构位置 (buy_pos_30m)
@@ -129,7 +130,7 @@ class GoldenListMonitor:
 
                 # 3. 【白名单核心过滤】
                 combination = (buy_pos_day, buy_pos_30m)
-                
+                # print(f"{code} 进入白名单筛选: 日线位置={buy_pos_day}, 30分位置={buy_pos_30m}, 组合={combination}")
                 if combination in self.GOLDEN_COMBINATIONS:
                     self.trigger_alert(code, buy_pos_day, buy_pos_30m, close_30[-1])
 
@@ -141,7 +142,7 @@ class GoldenListMonitor:
             print(f"结构匹配: 日线({pos_day}) + 30分({pos_30})")
             print(f"状态: 满足白名单，建议关注！")
             winsound.PlaySound("SystemExit", winsound.SND_ALIAS) 
-            # winsound.Beep(800, 1500) # 警报音
+            winsound.Beep(800, 600) # 警报音
             self.warned_today.add(alert_id)
 
     def run(self):
@@ -150,8 +151,8 @@ class GoldenListMonitor:
             while True:
                 # 限制在交易时间
                 now = datetime.now().time()
-                if (now >= datetime.strptime("09:10", "%H:%M").time() and now <= datetime.strptime("11:30", "%H:%M").time()) or \
-                   (now >= datetime.strptime("13:00", "%H:%M").time() and now <= datetime.strptime("16:00", "%H:%M").time()):
+                if (now >= datetime.strptime("09:10", "%H:%M").time() and now <= datetime.strptime("11:40", "%H:%M").time()) or \
+                   (now >= datetime.strptime("12:50", "%H:%M").time() and now <= datetime.strptime("15:10", "%H:%M").time()):
                     self.check_golden_signal()
                 time.sleep(1) # 每20秒轮询一次
 
@@ -197,8 +198,8 @@ def load_stock_list(blk_file_path):
 
 if __name__ == "__main__":
     # 从你的 blk 文件解析自选股列表
-    # BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\60RJXS.blk"
-    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\ZB.blk"
+    BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\60RJXS.blk"
+    # BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\ZB.blk"
     stock_list = load_stock_list(BLOB_FILE_PATH)
     # stock_list = ['000001', '600000'] 
     monitor = GoldenListMonitor(stock_list)

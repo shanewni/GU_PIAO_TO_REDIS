@@ -10,11 +10,5 @@ pyinstaller --onefile 30分钟三段强势起爆回调.py
 pyinstaller --onefile 5分钟底分型预警.py
 pyinstaller --onefile 30分钟三段强势起爆.py
 pyinstaller --clean --onefile 30分钟v型起爆.py
-target_ranges = [
-    ("2004-05-01", "2004-09-20"),
-    ("2004-09-20", "2024-12-11"),
-    ("2024-12-11", "2025-04-08"),
-    ("2025-04-08", "2025-08-26"),
-    ("2025-08-26", "2025-12-18"),
-    ("2025-12-18", "2026-03-07")
-]
+pyinstaller --clean --onefile 30f回测逻辑起爆_买入.py
+pyinstaller --clean --onefile 30f回测逻辑起爆_卖出.py

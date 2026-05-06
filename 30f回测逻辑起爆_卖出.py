@@ -5,7 +5,7 @@ from pytdx.hq import TdxHq_API
 import gupiaojichu
 import winsound
 
-from 回测 import TdxStockBacktest 
+from 回测供脚本使用 import TdxStockBacktest 
 
 class SellWarningMonitor:
     def __init__(self, position_data: dict):
@@ -21,7 +21,7 @@ class SellWarningMonitor:
         self.strategy = TdxStockBacktest()
         self.sold_stocks = set() # 记录已发过卖出通知的股票
 
-    def connect(self, ip="152.136.167.10", port=7709):
+    def connect(self, ip="36.153.42.16", port=7709):
         if self.api.connect(ip, port):
             print("行情服务器连接成功，开启卖出监控...")
             return True
@@ -34,7 +34,7 @@ class SellWarningMonitor:
                 
             market = 1 if code.startswith('6') else 0
             # 获取数据，确保包含足够计算 MA60 的数量
-            data = self.api.get_security_bars(2, market, code, 0, 150)
+            data = self.api.get_security_bars(2, market, code, 0, 250)
             if not data: continue
             
             df = pd.DataFrame(data)
@@ -99,8 +99,7 @@ class SellWarningMonitor:
 if __name__ == "__main__":
     # 根据你当前的真实持仓手动输入：股票代码、买入价、目前已经持有的30分钟K线数量
     my_positions = {
-        '000001': {'buy_price': 10.20, 'hold_k_count': 12}, 
-        '600000': {'buy_price': 8.50, 'hold_k_count': 35}
+        '605198': {'buy_price': 46.67, 'hold_k_count': 12}
     }
     monitor = SellWarningMonitor(my_positions)
     monitor.run()
