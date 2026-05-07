@@ -4,13 +4,31 @@ from datetime import datetime
 from pytdx.hq import TdxHq_API
 import gupiaojichu
 import winsound
+import random
 
 # 假设你的策略逻辑封装在 TdxStockBacktest 类中
 from 回测供脚本使用 import TdxStockBacktest 
 
+# 通达信行情服务器列表 (常用且相对稳定)
+TDX_SERVERS = [
+    {'ip': '152.136.167.10', 'port': 7709},
+    {'ip': '36.153.42.16', 'port': 7709}
+]
+
+class IPManager:
+    def __init__(self, servers):
+        self.servers = servers
+        self.current_index = random.randint(0, len(servers) - 1)
+
+    def get_next_server(self):
+        """轮询或随机获取下一个服务器"""
+        self.current_index = (self.current_index + 1) % len(self.servers)
+        return self.servers[self.current_index]
+
 class GoldenListMonitor:
     def __init__(self, stock_list):
         self.api = TdxHq_API()
+        self.ip_manager = IPManager(TDX_SERVERS)
         self.stock_list = stock_list
         self.strategy = TdxStockBacktest()
         # 实时同步你代码中的白名单
@@ -25,6 +43,27 @@ class GoldenListMonitor:
         }
         self.warned_today = set()
 
+    def reconnect(self):
+        """断开当前连接并尝试连接新 IP"""
+        try:
+            self.api.disconnect()
+        except:
+            pass
+        
+        connected = False
+        while not connected:
+            server = self.ip_manager.get_next_server()
+            print(f"🔄 正在尝试切换服务器至: {server['ip']}:{server['port']}...")
+            try:
+                if self.api.connect(server['ip'], server['port'], time_out=5):
+                    print(f"✅ 连接成功！")
+                    connected = True
+                else:
+                    print(f"❌ 连接失败，尝试下一个...")
+            except Exception as e:
+                print(f"❌ 异常: {e}，正在重试...")
+                time.sleep(1)
+
     def is_30min_closing_time(self) -> bool:
         """判断当前是否正好是30分钟K线的收盘时间点"""
         now = datetime.now()
@@ -33,29 +72,31 @@ class GoldenListMonitor:
         return time_str in closing_times
     
     def get_realtime_data(self, market, code):
-        """同时获取日线和30分钟线数据，加入异常捕获机制"""
-        try:
-            # 获取日线 (9 表示日线)
-            day_data = self.api.get_security_bars(9, market, code, 0, 300)
-            # 获取30分钟线 (2 表示30分钟线)
-            min30_data = self.api.get_security_bars(2, market, code, 0, 300)
+        """获取数据，如果失败则触发切换 IP 逻辑"""
+        max_retries = 2
+        for _ in range(max_retries):
+            try:
+                # 获取日线
+                day_data = self.api.get_security_bars(9, market, code, 0, 300)
+                # 获取30分钟线
+                min30_data = self.api.get_security_bars(2, market, code, 0, 300)
 
-            # 数据校验：如果 API 返回 None 或数据量太少（无法计算 MA60 等），则视为无效[cite: 3, 4]
-            if not day_data or len(day_data) < 60:
-                print(f"⚠️  警告: [{code}] 日线数据获取失败或长度不足")
-                return None, None
-            
-            if not min30_data or len(min30_data) < 60:
-                print(f"⚠️  警告: [{code}] 30分钟线数据获取失败或长度不足")
-                return None, None
+                # 如果返回 None，通常是 API 连接失效
+                if day_data is None or min30_data is None:
+                    print(f"⚠️  [{code}] 数据返回为空，触发 IP 切换...")
+                    self.reconnect()
+                    continue
 
-            return day_data, min30_data
+                if len(day_data) < 60 or len(min30_data) < 60:
+                    return None, None
 
-        except Exception as e:
-            # 捕获网络异常、连接重置等未知错误
-            print(f"❌ 严重错误: 获取 [{code}] 实时数据时发生异常: {e}")
-            # 如果是连接断开，可以在这里标记需要重连
-            return None, None
+                return day_data, min30_data
+
+            except Exception as e:
+                print(f"❌ 严重错误: {code} 获取数据异常: {e}，准备更换 IP")
+                self.reconnect()
+                
+        return None, None
 
     def calculate_three_buy_signals(self,code,high_full, low_full, close_full, open_full):
         """
@@ -163,15 +204,20 @@ class GoldenListMonitor:
             self.warned_today.add(alert_id)
 
     def run(self):
-        if self.api.connect('152.136.167.10', 7709):
-            print("白名单实盘监控启动...")
-            while True:
-                # 限制在交易时间
-                now = datetime.now().time()
-                if (now >= datetime.strptime("09:10", "%H:%M").time() and now <= datetime.strptime("11:40", "%H:%M").time()) or \
-                   (now >= datetime.strptime("12:50", "%H:%M").time() and now <= datetime.strptime("15:10", "%H:%M").time()):
-                    self.check_golden_signal()
-                time.sleep(5) # 每20秒轮询一次
+        self.reconnect()
+        while True:
+            # 限制在交易时间
+            now = datetime.now().time()
+            # 交易时间判断
+            is_trade_time = (datetime.strptime("09:15", "%H:%M").time() <= now <= datetime.strptime("11:35", "%H:%M").time()) or \
+                            (datetime.strptime("13:00", "%H:%M").time() <= now <= datetime.strptime("15:05", "%H:%M").time())
+            
+            if is_trade_time:
+                self.check_golden_signal()
+                time.sleep(5) 
+            else:
+                # 非交易时间，休眠 60 秒
+                time.sleep(60)
 
 def load_stock_list(blk_file_path):
     """

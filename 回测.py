@@ -16,9 +16,9 @@ import glob
 warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
-# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
 # BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST2.blk"
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\GGZB.blk"
+# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\GGZB.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -1119,7 +1119,7 @@ class TdxStockBacktest:
             
             if not in_pos:             
                 # 1. 基础信号满足
-                if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
+                if data['buy_signal'].iloc[i] == 1.0:
                     
                     # 2. 提前计算当前的 30 分钟结构位置
                     frac_up_to_now = gupiaojichu.identify_turns(i+1, high_list[:i+1], low_list[:i+1])
