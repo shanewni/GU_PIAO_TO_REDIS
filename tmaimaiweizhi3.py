@@ -5,7 +5,7 @@ import numpy as np
 
 def analyze_advanced_performance():
     # 1. 自动定位最新的回测结果文件 (请根据实际情况修改匹配字符串)
-    files = glob.glob("板块回测汇总结果_含总笔数2026-04-30-15-12-31_正常_增加周线起爆位置.xlsx")  
+    files = glob.glob("板块回测汇总结果_含总笔数2026-05-04-18-21-42_港股.xlsx")  
     if not files:
         print("错误：未找到回测结果 Excel 文件。")
         return

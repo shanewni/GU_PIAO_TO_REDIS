@@ -33,12 +33,29 @@ class GoldenListMonitor:
         return time_str in closing_times
     
     def get_realtime_data(self, market, code):
-        """同时获取日线和30分钟线数据"""
-        # 获取日线 (用于判断 day_buy_position)
-        day_data = self.api.get_security_bars(9, market, code, 0, 300)
-        # 获取30分钟线 (用于判断 buy_signal 和 buy_pos_30m)
-        min30_data = self.api.get_security_bars(2, market, code, 0, 300)
-        return day_data, min30_data
+        """同时获取日线和30分钟线数据，加入异常捕获机制"""
+        try:
+            # 获取日线 (9 表示日线)
+            day_data = self.api.get_security_bars(9, market, code, 0, 300)
+            # 获取30分钟线 (2 表示30分钟线)
+            min30_data = self.api.get_security_bars(2, market, code, 0, 300)
+
+            # 数据校验：如果 API 返回 None 或数据量太少（无法计算 MA60 等），则视为无效[cite: 3, 4]
+            if not day_data or len(day_data) < 60:
+                print(f"⚠️  警告: [{code}] 日线数据获取失败或长度不足")
+                return None, None
+            
+            if not min30_data or len(min30_data) < 60:
+                print(f"⚠️  警告: [{code}] 30分钟线数据获取失败或长度不足")
+                return None, None
+
+            return day_data, min30_data
+
+        except Exception as e:
+            # 捕获网络异常、连接重置等未知错误
+            print(f"❌ 严重错误: 获取 [{code}] 实时数据时发生异常: {e}")
+            # 如果是连接断开，可以在这里标记需要重连
+            return None, None
 
     def calculate_three_buy_signals(self,code,high_full, low_full, close_full, open_full):
         """
@@ -154,7 +171,7 @@ class GoldenListMonitor:
                 if (now >= datetime.strptime("09:10", "%H:%M").time() and now <= datetime.strptime("11:40", "%H:%M").time()) or \
                    (now >= datetime.strptime("12:50", "%H:%M").time() and now <= datetime.strptime("15:10", "%H:%M").time()):
                     self.check_golden_signal()
-                time.sleep(1) # 每20秒轮询一次
+                time.sleep(5) # 每20秒轮询一次
 
 def load_stock_list(blk_file_path):
     """

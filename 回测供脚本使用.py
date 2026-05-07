@@ -157,7 +157,7 @@ class TdxStockBacktest:
         df_30m = df_30m.dropna(subset=['开盘价'])
 
         # 过滤出有效交易时段（A股 30 分钟线时间点）
-        valid_times = ['10:00', '10:30', '11:00', '11:30', '12:00', '13:30', '14:00', '14:30', '15:00', '15:30', '16:00']
+        valid_times = ['10:00', '10:30', '11:00', '11:30', '13:30', '14:00', '14:30', '15:00']
         df_30m = df_30m[df_30m.index.strftime('%H:%M').isin(valid_times)]
 
         df_30m[price_cols] = df_30m[price_cols].round(2)
@@ -1429,8 +1429,20 @@ def parse_tdx_blk_file(file_path: str) -> List[str]:
             line = line.strip()
             if line:
                 # 第一位是市场代码，后六位是股票代码
-                stock_code = line[3:8]
-                      
+                market_code = line[0]
+                stock_code = line[1:7]
+                
+                # 将市场代码转换为pytdx需要的格式
+                # 0: 深圳, 1: 上海
+                if market_code == '0':
+                    market = 0  # 深圳
+                    market_prefix = 'sz'
+                else:
+                    market = 1  # 上海
+                    market_prefix = 'sh'
+                
+                full_code = f"{market_prefix}{stock_code}"
+                # stock_list.append((market, stock_code, full_code))            
                 stock_list.append((stock_code))            
     except Exception as e:
         print(f"读取blk文件失败: {e}")
