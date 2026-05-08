@@ -1833,7 +1833,7 @@ if __name__ == "__main__":
             stock_codes=stock_list,
             init_cash=100000.0,    # 单股票初始资金10万
             commission=0.0003,     # 佣金0.03%
-            stop_loss_ratio=0.01   # 单笔止损1%
+            stop_loss_ratio=0.02   # 单笔止损1%
         )
         # ================== 执行理论复利计算 ==================
         trades_list = trades_detail_result.to_dict('records') if not trades_detail_result.empty else []

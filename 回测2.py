@@ -16,8 +16,9 @@ import glob
 warnings.filterwarnings('ignore')
 
 # 通达信板块文件路径
-BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
-# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST2.blk"
+# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\SSYNYS.blk"
+BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\TEST.blk"
+# BLOB_FILE_PATH = r"D:\zd_hbzq\T0002\blocknew\GGZB.blk"
 # 本地通达信数据默认路径
 DEFAULT_TDX_PATH = r"D:\zd_hbzq"
 
@@ -515,6 +516,91 @@ class TdxStockBacktest:
         return pf_out
     
     @staticmethod
+    def detect_daily_breakout_signals(day_df: pd.DataFrame) -> dict:
+        """
+        基于日线逐日计算底分型后的阳线突破信号（无未来函数）
+        返回：{ 突破阳线日期(date): 下一个交易日日期(date) }
+        """
+        if len(day_df) < 5:
+            return {}
+
+        high_arr = day_df['最高价'].values
+        low_arr  = day_df['最低价'].values
+        close_arr= day_df['收盘价'].values
+        open_arr = day_df['开盘价'].values
+        dates    = day_df.index
+        n        = len(day_df)
+
+        breakout_map = {}
+
+        for i in range(2, n):
+            frac = gupiaojichu.identify_turns(
+                i+1,
+                high_arr[:i+1].tolist(),
+                low_arr[:i+1].tolist()
+            )
+            last_bottom_idx = -1
+            for j in range(len(frac)-1, -1, -1):
+                if frac[j] == -1.0:
+                    last_bottom_idx = j
+                    break
+            if last_bottom_idx == -1:
+                continue
+
+            for k in range(last_bottom_idx+1, min(last_bottom_idx+5, n)):
+                if close_arr[k] <= open_arr[k]:
+                    continue
+                if k < 3:
+                    continue
+                # 最高价突破前三
+                if high_arr[k] <= max(high_arr[k-3], high_arr[k-2], high_arr[k-1]):
+                    continue
+                # 收盘价突破前三收盘价
+                if close_arr[k] <= max(close_arr[k-3], close_arr[k-2], close_arr[k-1]):
+                    continue
+                # ✅ 新增：收盘价突破前三开盘价
+                if close_arr[k] <= max(open_arr[k-3], open_arr[k-2], open_arr[k-1]):
+                    continue
+
+                breakout_date = dates[k].date()
+                if k + 1 < n:
+                    next_date = dates[k+1].date()
+                    breakout_map[breakout_date] = next_date
+
+        return breakout_map
+
+    @staticmethod
+    def check_30min_breakout(high_list, low_list, close_list, open_list, idx):
+        """
+        检查30分钟K线 idx 是否满足起爆条件
+        """
+        if idx < 3:
+            return False
+        # 阳线
+        if close_list[idx] <= open_list[idx]:
+            return False
+        # 最高价突破前三
+        if high_list[idx] <= max(high_list[idx-3], high_list[idx-2], high_list[idx-1]):
+            return False
+        # 收盘价突破前三收盘价
+        if close_list[idx] <= max(close_list[idx-3], close_list[idx-2], close_list[idx-1]):
+            return False
+        # ✅ 新增：收盘价突破前三开盘价
+        if close_list[idx] <= max(open_list[idx-3], open_list[idx-2], open_list[idx-1]):
+            return False
+
+        # ✅ 新增：低点到收盘涨幅 0.5% < 涨幅 < 8%
+        low_price = low_list[idx]
+        close_price = close_list[idx]
+        if low_price <= 0:
+            return False
+        pct_from_low = (close_price - low_price) / low_price * 100
+        if pct_from_low < 0.5 or pct_from_low > 8:
+            return False
+
+        return True
+    
+    @staticmethod
     def calculate_three_buy_signals(high_full, low_full, close_full, open_full) -> List[float]:
         """
         遍历完整数据序列，逐段计算三买变体买点信号
@@ -961,10 +1047,8 @@ class TdxStockBacktest:
         
         if bottom_indices:
             last_bottom_idx = bottom_indices[-1]
-            last_top_idx = top_indices[-1]
-            last_top_idx2 = top_indices[-2]
             # 跌破最近底分型最低价
-            if low_full[current_idx] < low_full[last_bottom_idx] and high_full[last_top_idx] < high_full[last_top_idx2] and last_top_idx > last_bottom_idx:
+            if low_full[current_idx] < low_full[last_bottom_idx] and current_idx > last_bottom_idx+1:
                 cond_pattern = True
                 pattern_reason = "跌破最后底分型最低价"
                 
@@ -981,182 +1065,85 @@ class TdxStockBacktest:
         if cond_pattern: return True, pattern_reason
         return False, ""   
     
-    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame, min30_high: List[float], min30_low: List[float],rps_series: pd.Series = None) -> pd.DataFrame:
+    def three_buy_strategy(self, day_df: pd.DataFrame, min30_data: pd.DataFrame,
+                        min30_high: List[float], min30_low: List[float],
+                        rps_series: pd.Series = None) -> pd.DataFrame:
         data = min30_data.copy()
         data.index.name = 'datetime'
-        day_df.index.name = 'datetime'
-        
-        # --- 新增：1. 计算日线级别的结构位置 ---
-        day_high_list = day_df['最高价'].tolist()
-        day_low_list = day_df['最低价'].tolist()
-        day_positions = []
-        
-        # 逐日推算日线结构位置
-        for i in range(len(day_df)):
-            if i < 3:
-                day_positions.append("未知")
-                continue
-            frac_up_to_now = gupiaojichu.identify_turns(i+1, day_high_list[:i+1], day_low_list[:i+1])
-            pos = self.classify_buy_position(frac_up_to_now, day_high_list[:i+1], day_low_list[:i+1])
-            day_positions.append(pos)
-            
-        day_df['day_buy_position'] = day_positions
-
-        # ================== 【新增：计算周线级别的结构位置】 ==================
-        # 1. 由日线合成周线
-        week_df = day_df.resample('W-FRI').agg({
-            '开盘价': 'first', '最高价': 'max', '最低价': 'min', '收盘价': 'last'
-        }).dropna()
-
-        week_high_list = week_df['最高价'].tolist()
-        week_low_list = week_df['最低价'].tolist()
-        week_positions = []
-
-        # 2. 逐周推算周线结构位置
-        for i in range(len(week_df)):
-            if i < 3:
-                week_positions.append("未知")
-                continue
-            frac_up_to_now = gupiaojichu.identify_turns(i+1, week_high_list[:i+1], week_low_list[:i+1])
-            pos = self.classify_buy_position(frac_up_to_now, week_high_list[:i+1], week_low_list[:i+1])
-            week_positions.append(pos)
-
-        week_df['week_buy_position'] = week_positions
-        
-        # 3. 将周线状态映射回日线 (依据 year + week number 映射)
-        day_df['year_week'] = day_df.index.isocalendar().year.astype(str) + '-' + day_df.index.isocalendar().week.astype(str)
-        week_df['year_week'] = week_df.index.isocalendar().year.astype(str) + '-' + week_df.index.isocalendar().week.astype(str)
-        week_mapping = dict(zip(week_df['year_week'], week_df['week_buy_position']))
-        day_df['week_buy_position'] = day_df['year_week'].map(week_mapping).fillna('未知')
-        # ======================================================================
-        
-        # --- 1. 日线过滤条件 (保持原逻辑) ---
         day_df = day_df.copy()
-        day_df['ma60'] = day_df['收盘价'].rolling(window=60).mean()
-        day_df['ma60_shift3'] = day_df['ma60'].shift(3)
-        day_df['day_cond'] = (day_df['收盘价'] > day_df['ma60']) & (day_df['ma60'] > day_df['ma60_shift3'])
-        day_df['day_signal_valid'] = day_df['day_cond'].shift(1).fillna(False)
+        day_df.index.name = 'datetime'
 
+        # --- 1. 获取日线底分型突破信号 ---
+        trigger_map = self.detect_daily_breakout_signals(day_df)
+        valid_buy_dates = set(trigger_map.values())       # 都是 datetime.date
+
+        if not valid_buy_dates:
+            data['signal'] = 0
+            data['sell_reason'] = ""
+            data['buy_position'] = ""
+            return data
+
+        # --- 2. 预处理30分钟数据 ---
         data['date_only'] = data.index.date
-        day_df['date_only'] = day_df.index.date
-        data = data.reset_index().merge(
-            # 【修改】将 day_buy_position 一并合并到30分钟数据中
-            day_df[['date_only', 'day_signal_valid', 'day_buy_position', 'week_buy_position']],
-            on='date_only', 
-            how='left'
-        ).set_index('datetime')
-
-        # if rps_series is not None:
-        #     data['date_only'] = data.index.date
-        #     rps_df = rps_series.to_frame(name='rps_ok_flag')
-        #     rps_df['date_only'] = rps_df.index.date
-        #     data = data.reset_index().merge(
-        #         rps_df[['date_only', 'rps_ok_flag']], 
-        #         on='date_only', 
-        #         how='left'
-        #     ).set_index('datetime')
-        # else:
-        #     data['rps_ok_flag'] = 1 
-            
-        data['day_buy_position'] = data['day_buy_position'].fillna('未知')
-        # --- 新增：2. 预计算 30 分钟级别单根K线的涨跌幅 ---
+        # 【修复】添加涨跌幅列，供交易记录使用
         data['pct_chg'] = data['收盘价'].pct_change() * 100
 
-        # --- 2. 预计算基础指标 ---
-        buy_signals = self.calculate_three_buy_signals(min30_high, min30_low, data['收盘价'].tolist(), data['开盘价'].tolist())
-        data['buy_signal'] = buy_signals
-        data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
-        
         close_list = data['收盘价'].tolist()
+        open_list  = data['开盘价'].tolist()
+        high_list  = min30_high
+        low_list   = min30_low
+        data['ma60'] = data['收盘价'].rolling(window=60).mean().bfill()
         ma60_list = data['ma60'].tolist()
-        high_list = min30_high
-        low_list = min30_low
-        
-        # --- 3. 核心状态机循环 ---
+
+        # --- 3. 状态机变量 ---
         data['signal'] = 0
         data['sell_reason'] = ""
-        data['buy_position'] = ""  
+        data['buy_position'] = ""
         in_pos = False
         buy_price = 0.0
         buy_idx = 0
-        initial_stop_loss = 0.0
-        current_stop_loss = 0.0 
-        
-        # # 【新增：定义黄金白名单组合 (日线位置, 30分位置)】
-        # GOLDEN_COMBINATIONS = {
-        #     ('二买延续4', '二买'), ('二买延续2', '二买延续3'), ('二买延续2', '二买延续1'),
-        #     ('一买', '三买'), ('一买', '三买延续2'), ('二买延续2', '三买'),
-        #     ('二买延续1', '三买'), ('三买之上1', '一买'), ('一买', '二买'),
-        #     ('二买', '三买'), ('三买延续2', '三买延续1'), ('二买', '二买延续1'),
-        #     ('一买', '三买之上1'), ('三买', '二买延续2'), ('二买延续1', '一买'),
-        #     ('三买', '二买'), ('二买延续2', '一买'), ('二买', '三买之上1'),
-        #     ('二买延续3', '二买'), ('三买之上2', '二买'), ('二买', '三买延续2'),
-        #     ('一买', '三买延续3'), ('二买', '二买延续3'), ('三买', '三买之上3'),
-        #     ('三买延续2', '二买延续1'), ('三买延续1', '二买延续3'), ('二买', '三买之上5'),
-        #     ('二买延续3', '三买延续1')
-        # }
+        current_stop_loss = 0.0
+        pending_date = None
+        last_date = None
 
-        # 【新增：定义黄金白名单组合 (日线位置, 30分位置)】
-        GOLDEN_COMBINATIONS = {
-            ('二买延续4', '二买'), ('二买延续2', '二买延续3'), ('二买延续2', '二买延续1'),
-            ('一买', '三买'), ('一买', '三买延续2'), ('二买延续2', '三买'),
-            ('二买延续1', '三买'), ('三买之上1', '一买'),
-            ('二买', '三买'), ('三买延续2', '三买延续1'),
-            ('一买', '三买之上1'), ('三买', '二买延续2'), 
-             ('二买延续2', '一买'), ('二买', '三买之上1'),
-            ('二买延续3', '二买')
-        }
-        
-        # 【新增：定义黄金白名单组合 (日线位置, 30分位置)】
-        # GOLDEN_COMBINATIONS = {
-        #     ('二买延续4', '二买'), ('二买延续2', '二买延续3'), ('二买延续2', '二买延续1'),
-        #     ('一买', '三买'), ('一买', '三买延续2'), ('二买延续2', '三买'),
-        #     ('二买延续1', '三买'), 
-        #     ('一买', '三买之上1'), ('二买延续1', '一买'),('二买', '三买之上1'),
-        #     ('二买延续3', '二买'),('二买', '三买延续2'),('二买', '二买延续3')
-        # }
         for i in range(len(data)):
-            current_idx_time = data.index[i]
-            
-            if not in_pos:             
-                # 1. 基础信号满足
-                if data['buy_signal'].iloc[i] == 1.0 and data['day_signal_valid'].iloc[i]:
-                    
-                    # 2. 提前计算当前的 30 分钟结构位置
-                    frac_up_to_now = gupiaojichu.identify_turns(i+1, high_list[:i+1], low_list[:i+1])
-                    buy_pos_30m = self.classify_buy_position(frac_up_to_now, high_list[:i+1], low_list[:i+1])
-                    
-                    # 3. 提取当前的日线结构位置
-                    buy_pos_day = data['day_buy_position'].iloc[i]
-                    
-                    # 4. 【核心过滤】：只有该组合存在于白名单中，才允许开仓
-                    # if (buy_pos_day, buy_pos_30m) in GOLDEN_COMBINATIONS:
-                    data.loc[current_idx_time, 'signal'] = 1
-                    data.loc[current_idx_time, 'buy_position'] = buy_pos_30m
-                    
+            current_time = data.index[i]
+            current_date = current_time.date()
+
+            # ----- 日期切换处理 -----
+            if current_date != last_date:
+                if not in_pos and pending_date is not None:
+                    pending_date = None
+                if not in_pos and pending_date is None and current_date in valid_buy_dates:
+                    pending_date = current_date
+                last_date = current_date
+
+            # ----- 买入逻辑 -----
+            if not in_pos and pending_date == current_date:
+                if self.check_30min_breakout(high_list, low_list, close_list, open_list, i):
+                    data.loc[current_time, 'signal'] = 1
+                    data.loc[current_time, 'buy_position'] = "底分型突破起爆"
                     in_pos = True
                     buy_price = close_list[i]
                     buy_idx = i
-                    
-                    # 5. 计算止损位
-                    if i > 0:
-                        prev_high = high_list[i-1]
-                        initial_stop_loss = min(low_list[i], prev_high)
-                    else:
-                        initial_stop_loss = low_list[i]
-                        
-                    current_stop_loss = initial_stop_loss 
-                    data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss
-            else:       
+                    current_stop_loss = low_list[i]
+                    data.loc[current_time, 'active_stop_loss'] = current_stop_loss
+                    pending_date = None
+                    continue
+
+            # ----- 持仓期逻辑 -----
+            if in_pos:
+                data.loc[current_time, 'active_stop_loss'] = current_stop_loss
+
+                # 硬止损
                 if low_list[i] <= current_stop_loss:
-                    data.loc[current_idx_time, 'signal'] = -1
-                    data.loc[current_idx_time, 'sell_reason'] = f"触发止损(当前止损价:{current_stop_loss})"
+                    data.loc[current_time, 'signal'] = -1
+                    data.loc[current_time, 'sell_reason'] = "触发止损(起爆K最低点)"
                     in_pos = False
                     continue
 
+                # 动态卖出
                 min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
-                data.loc[current_idx_time, 'active_stop_loss'] = current_stop_loss 
-                
                 is_sell, reason = self.check_dynamic_sell_condition(
                     current_idx=i,
                     high_full=high_list,
@@ -1167,10 +1154,9 @@ class TdxStockBacktest:
                     buy_idx=buy_idx,
                     min30_frac=min30_frac
                 )
-                
                 if is_sell:
-                    data.loc[current_idx_time, 'signal'] = -1
-                    data.loc[current_idx_time, 'sell_reason'] = reason
+                    data.loc[current_time, 'signal'] = -1
+                    data.loc[current_time, 'sell_reason'] = reason
                     in_pos = False
 
         return data
