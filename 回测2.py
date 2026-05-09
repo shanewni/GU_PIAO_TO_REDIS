@@ -1012,7 +1012,70 @@ class TdxStockBacktest:
             return True
             
         return False
-    
+    @staticmethod
+    def check_daily_sell_condition(day_df_slice: pd.DataFrame, buy_price: float, 
+                                buy_date: pd.Timestamp) -> tuple[bool, str]:
+        """
+        基于日线切片判断动态卖出条件（无未来数据）
+        :param day_df_slice: 截止到当前日期的日线DataFrame（已包含ma60列）
+        :param buy_price: 买入价格
+        :param buy_date: 买入日期（pd.Timestamp或date）
+        :return: (是否卖出, 卖出原因)
+        """
+        if len(day_df_slice) < 2:
+            return False, ""
+        
+        high = day_df_slice['最高价'].values
+        low = day_df_slice['最低价'].values
+        close = day_df_slice['收盘价'].values
+        ma60 = day_df_slice['ma60'].values
+        n = len(day_df_slice)
+        current_idx = n - 1
+        
+        # ===== 1. MA60连续跌破 + 门槛 =====
+        cond_ma60 = False
+        reason_ma60 = ""
+        if n >= 2 and ma60[current_idx] is not None and not np.isnan(ma60[current_idx]):
+            if close[current_idx] < ma60[current_idx] and close[current_idx-1] < ma60[current_idx-1]:
+                # 计算持仓天数（按自然日）
+                current_date = day_df_slice.index[current_idx]
+                hold_days = (current_date - pd.to_datetime(buy_date)).days
+                profit_ratio = (close[current_idx] - buy_price) / buy_price
+                if profit_ratio >= 0.10 or hold_days >= 30:
+                    cond_ma60 = True
+                    reason_ma60 = f"日线连续2日低于MA60(收益{profit_ratio:.1%}/持仓{hold_days}天)"
+        
+        # ===== 2. 分型形态破坏 =====
+        cond_frac = False
+        reason_frac = ""
+        # 计算截至当前日线的转折点
+        frac = gupiaojichu.identify_turns(n, high.tolist(), low.tolist())
+        top_idx = [i for i, v in enumerate(frac) if v == 1.0]
+        bottom_idx = [i for i, v in enumerate(frac) if v == -1.0]
+        
+        if bottom_idx:
+            last_bottom = bottom_idx[-1]
+            # 跌破最近底分型最低价
+            if low[current_idx] < low[last_bottom] and current_idx > last_bottom + 1:
+                cond_frac = True
+                reason_frac = "日线跌破最后底分型最低价"
+            
+            if not cond_frac:
+                # 顶分型后未创新高且距离达标
+                valid_tops = [i for i in top_idx if i < last_bottom]
+                if valid_tops:
+                    prev_top = valid_tops[-1]
+                    if (current_idx - last_bottom) >= (last_bottom - prev_top) and (last_bottom - prev_top) >= 3:
+                        if max(high[last_bottom:current_idx+1]) <= high[prev_top]:
+                            cond_frac = True
+                            reason_frac = "日线底分型后未突破前高且距离达标"
+        
+        if cond_ma60:
+            return True, reason_ma60
+        if cond_frac:
+            return True, reason_frac
+        return False, ""
+
     @staticmethod
     def check_dynamic_sell_condition(current_idx: int, high_full: List[float], low_full: List[float], 
                                     close_full: List[float], ma60_full: List[float],
@@ -1082,7 +1145,10 @@ class TdxStockBacktest:
             data['sell_reason'] = ""
             data['buy_position'] = ""
             return data
-
+        
+        day_df = self.stock_data['day']
+        day_df['ma60'] = day_df['收盘价'].rolling(60).mean()
+        
         # --- 2. 预处理30分钟数据 ---
         data['date_only'] = data.index.date
         # 【修复】添加涨跌幅列，供交易记录使用
@@ -1102,6 +1168,7 @@ class TdxStockBacktest:
         in_pos = False
         buy_price = 0.0
         buy_idx = 0
+        buy_date = None   # ✅ 新增
         current_stop_loss = 0.0
         pending_date = None
         last_date = None
@@ -1126,6 +1193,7 @@ class TdxStockBacktest:
                     in_pos = True
                     buy_price = close_list[i]
                     buy_idx = i
+                    buy_date = current_time.date()   # ✅ 新增：记录买入日期
                     current_stop_loss = low_list[i]
                     data.loc[current_time, 'active_stop_loss'] = current_stop_loss
                     pending_date = None
@@ -1142,22 +1210,22 @@ class TdxStockBacktest:
                     in_pos = False
                     continue
 
-                # 动态卖出
-                min30_frac = gupiaojichu.identify_turns(i, high_list[:i], low_list[:i])
-                is_sell, reason = self.check_dynamic_sell_condition(
-                    current_idx=i,
-                    high_full=high_list,
-                    low_full=low_list,
-                    close_full=close_list,
-                    ma60_full=ma60_list,
-                    buy_price=buy_price,
-                    buy_idx=buy_idx,
-                    min30_frac=min30_frac
-                )
-                if is_sell:
-                    data.loc[current_time, 'signal'] = -1
-                    data.loc[current_time, 'sell_reason'] = reason
-                    in_pos = False
+                 # 动态卖出：切换为日线判断
+                current_date = current_time.date()
+                # 获取截止到当前日期的日线数据切片（确保无未来）
+                day_data = self.stock_data['day']
+                day_data['ma60'] = day_data['收盘价'].rolling(60).mean()   # 每次重新计算确保序列完整
+                day_slice = day_data[day_data.index.date <= current_date]
+                if len(day_slice) >= 2:
+                    is_sell, reason = self.check_daily_sell_condition(
+                        day_df_slice=day_slice,
+                        buy_price=buy_price,
+                        buy_date=buy_date   # buy_date 需在买入时记录（见下方补充）
+                    )
+                    if is_sell:
+                        data.loc[current_time, 'signal'] = -1
+                        data.loc[current_time, 'sell_reason'] = f"日线动态卖出: {reason}"
+                        in_pos = False
 
         return data
     
